@@ -25,7 +25,6 @@ namespace corodb {
                         } else if constexpr (std::is_same_v<T, std::string>) {
                             return "'" + val + "'";
                         }
-                        return "?";
                     },
                     v);
         }
@@ -81,7 +80,10 @@ namespace corodb {
                         }
                         if constexpr (std::is_same_v<T, std::shared_ptr<BinaryExpr>>) return to_string(node);
                         if constexpr (std::is_same_v<T, AggregateExpr>) return to_string(node);
-                        return std::string("<unknown>");
+                        if constexpr (std::is_same_v<T, std::shared_ptr<FunctionExpr>>) {
+                            if (node) return node->to_string();
+                            return std::string("<null>");
+                        }
                     },
                     expr);
         }

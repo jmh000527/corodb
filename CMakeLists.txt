@@ -158,6 +158,9 @@ function(add_module_test MODULE_NAME)
         PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock
     )
     target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(${TARGET_NAME} PRIVATE /wd4834)
+    endif()
     gtest_discover_tests(${TARGET_NAME})
 endfunction()
 
@@ -183,6 +186,9 @@ target_link_libraries(corodb_tests
     PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock
 )
 target_include_directories(corodb_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(MSVC)
+    target_compile_options(corodb_tests PRIVATE /wd4834)
+endif()
 gtest_discover_tests(corodb_tests)
 
 # ============================================================================
@@ -197,6 +203,9 @@ target_include_directories(bench_concurrency PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/include
 )
+if(MSVC)
+    target_compile_options(bench_concurrency PRIVATE /wd4834)
+endif()
 
 # ============================================================================
 # 安装规则
