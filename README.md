@@ -55,47 +55,42 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 
 ## 核心特性
 
-| 类别 | 特性 | 描述 |
-|------|------|------|
-| **存储** | LSM-Tree 引擎 | MemTable（红黑树）+ SSTable L0-L3 + WAL，Leveled Compaction + Tombstone GC |
-| | Buffer Pool | Clock 替换算法，16 路分片锁，FNV-1a 页面校验和 |
-| | 原子写入 | SSTable 先写 `.tmp` → fsync → 原子 rename，崩溃安全 |
-| | Bloom Filter | SSTable V2 页脚含 Bloom + key range，点查跳过无关 SSTable |
-| | 增量索引 | 追加式 chunk 写入 + 去重合并 + 定期压缩 |
-| **持久性** | 内核级 fsync | WAL 写入后调用 `::fsync` / `::_commit` 确保持久化 |
-| | WAL 组提交 | Leader-Follower 模式批量 fsync，可配置延迟与批次大小 |
-| | 校验和 | 所有页面 FNV-1a 校验，读取时验证，损坏即报错 |
-| **MVCC** | 快照隔离 | 每行携带 commit_ts，查询按 snapshot_ts 过滤可见版本 |
-| | commit_ts 保留 | 已提交事务的 commit_ts 保留至无活跃快照引用后被 GC 裁剪 |
-| | 全层级 GC | GC 在所有 Compaction 层级运行，及时回收过时版本 |
-| **事务** | 四种隔离级别 | READ UNCOMMITTED / READ COMMITTED / REPEATABLE READ / SERIALIZABLE |
-| | Serializable 幻读防护 | 表级 SIREAD 锁 + 写计数器冲突检测 |
-| | 行级写写冲突 | first-committer-wins 行级锁，并发写自动检测并中止 |
-| | 表级锁超时 | 所有锁路径 5s 超时，无永久阻塞 |
-| | 断连回滚 | 客户端断开自动回滚活跃事务，释放行锁 |
-| **查询** | Volcano 执行器 | C++23 `std::generator` 协程，惰性求值 |
-| | 物理算子 | SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit |
-| | Float64 类型 | IEEE 754 双精度，AVG() 返回浮点，int↔float 隐式提升 |
-| | 查询超时 | `statement_timeout_ms`，每算子 co_yield 超时检查 |
-| **优化器** | 两段式 | LogicalPlanner → RuleSet → PhysicalPlanner |
-| | 重写规则 | 谓词下推 / 列裁剪 / JoinReorder / IndexScan 升级 / LimitPushdown |
-| | 计划缓存 | LRU 缓存（标准化 SQL → 物理计划），DDL 自动失效 |
-| | MergeJoin 优化 | 输入已排序时跳过重排 |
-| **SQL** | DDL | CREATE/DROP TABLE, CREATE/DROP INDEX |
-| | DML | INSERT/UPDATE/DELETE |
-| | 查询 | SELECT/JOIN/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET |
-| | EXPLAIN | PostgreSQL 风格计划树 |
-| | EXPLAIN ANALYZE | 计划 + 算子级行数与耗时 |
-| | PREPARE/EXECUTE | 预处理语句 + 会话级计划注册 |
-| | 管理命令 | CHECKPOINT / SHOW STATUS |
-| **网络** | Reactor 模式 | Main Reactor + Sub Reactor I/O 线程池 + Worker 线程池 |
-| | 跨平台 | epoll (Linux) / WSAPoll (Windows) |
-| | 缓冲限制 | 64MB 输入/输出上限，防止 OOM DoS |
-| | 空闲超时 | 可配置超时自动断开 |
-| | 批量 accept | 单事件最多 64 连接 |
-| **安全** | 密码认证 | AUTH 命令 + SHA-256 哈希 + UserManager |
-| **运维** | 结构化日志 | ERROR/WARN/INFO/DEBUG + 时间戳 + 文件输出 |
-| | CHECKPOINT | 强制刷盘 + 压缩 + 截断 WAL，在线备份 |
+### 存储引擎
+- **LSM-Tree**: MemTable（`std::map` 红黑树）+ SSTable L0-L3 + WAL，Leveled Compaction + Tombstone GC
+- **Buffer Pool**: Clock 替换算法，16 路分片锁降低竞争，FNV-1a 页面校验
+- **Bloom Filter**: SSTable 页脚含 Bloom + key range，点查跳过无关 SSTable
+- **原子写入**: `.tmp` → `fsync` → `rename`，崩溃安全；SSTable 解码 LRU 缓存
+- **扫描缓存**: 全表扫描结果按写入版本号缓存，无写入时共享锁并发读取
+
+### 查询引擎
+- **Volcano 协程执行器**: C++23 `std::generator` 惰性求值，数据在算子间流水传递
+- **9 种物理算子**: SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit
+- **两段式优化器**: LogicalPlanner → 5 条重写规则定点迭代（最多 16 轮）→ PhysicalPlanner
+- **算子选择**: 等值索引条件 → IndexScan 升级；等值 JOIN → HashJoin / MergeJoin（预排序跳过重排）；GROUP BY 匹配排序 → SortAggregate 吸收 Sort
+- **LRU 计划缓存**: 标准化 SQL 到物理计划的缓存（默认 128 条），DDL 自动失效
+
+### 事务系统
+- **MVCC 快照隔离**: 每行携带 `commit_ts`，查询按 `snapshot_ts` 过滤可见版本，Compaction 全层级 GC
+- **四种隔离级别**: READ UNCOMMITTED / READ COMMITTED / REPEATABLE READ / SERIALIZABLE
+- **Serializable 冲突检测**: 表级 SIREAD 锁 + 写计数器 + 行级读集验证，提交时检测幻读
+- **行级写写冲突**: first-committer-wins 行级写意图锁，表级锁 32 路分片，全局 5s 超时
+- **断连回滚**: 客户端断开自动回滚活跃事务并释放所有行锁
+
+### SQL 支持
+- **DDL**: CREATE/DROP TABLE, CREATE/DROP INDEX
+- **DML**: INSERT/UPDATE/DELETE
+- **查询**: SELECT / DISTINCT / INNER JOIN / LEFT JOIN / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET
+- **聚合**: COUNT / SUM / AVG / MIN / MAX，AVG() 返回 IEEE 754 Float64
+- **表达式**: 算术（`+ - * / %`）、字符串拼接（`||`）、COALESCE / NULLIF / UPPER / LOWER / SUBSTR / TRIM / LENGTH / ABS
+- **诊断**: EXPLAIN / EXPLAIN ANALYZE（PostgreSQL 风格计划树 + 算子级耗时与行数）
+- **预处理**: PREPARE / EXECUTE / DEALLOCATE PREPARE（会话级计划注册）
+- **管理**: CHECKPOINT（强制刷盘+全层级压缩+截断 WAL）、SHOW STATUS
+
+### 网络与持久性
+- **Multi-Reactor 模式**: Main Reactor 接受连接 → Sub Reactor I/O 线程池（Round-Robin）处理读写 → Worker 线程池执行 SQL
+- **跨平台**: epoll 边沿触发 (Linux) / WSAPoll (Windows)
+- **WAL 组提交**: Leader-Follower 模式批量 fsync，可配置延迟与批次大小
+- **连接管理**: 非阻塞 socket + 64MB 单连接缓冲区上限（防 OOM DoS）+ 空闲超时 + 单事件批量 accept（64）
 
 ---
 
@@ -801,7 +796,7 @@ WAL 记录 (9+N bytes):
 ### SSTable 格式
 
 ```
-SSTable V2 文件:
+SSTable 文件格式:
 +--------+----------+----------+--------+--------+----------+
 | LSM2(4)|SchBytes(4)|Schema(var)|Padding|Pages...|Footer   |
 +--------+----------+----------+--------+--------+----------+

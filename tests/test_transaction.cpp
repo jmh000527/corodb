@@ -421,7 +421,7 @@ TEST_F(MvccBootstrapTest, MaxObservedCommitTsScansWalAndSstable) {
     {
         auto eng = std::make_unique<LSMTreeEngine>(dir->path());
         const uint64_t max_ts = eng->max_observed_commit_ts();
-        EXPECT_GT(max_ts, 0u) << "WAL/SSTable should carry persisted commit_ts after V2 plumbing";
+        EXPECT_GT(max_ts, 0u) << "WAL/SSTable should carry persisted commit_ts";
     }
 
     // 3) 二次启动：Database 构造时必然 bootstrap，next_ts > 已观察值。

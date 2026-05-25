@@ -346,7 +346,7 @@ namespace corodb {
                 int64_t pk = row.values.empty() ? 0 : extract_int_key(row);
                 rows.emplace_back(MemEntry{ pk, std::move(row), false, commit_ts });
             } else if (type == 2) {
-                // V2 tombstone now stores [8B pk] in record bytes; legacy may have len=0.
+                // Tombstone stores [8B pk] in record bytes; legacy may have len=0.
                 int64_t pk = 0;
                 if (rec.size() >= sizeof(int64_t)) {
                     std::memcpy(&pk, rec.data(), sizeof(int64_t));
@@ -699,7 +699,7 @@ namespace corodb {
         state->memtable_bytes += rec_size;
         state->write_version.fetch_add(1, std::memory_order_release);
 
-        // WAL：commit_ts > 0 走 V2 类型 11（payload 前置 8B ts），否则维持类型 1。
+        // WAL：commit_ts > 0 走类型 11（payload 前置 8B ts），否则维持类型 1。
         const auto wpath = wal_path(name);
         if (commit_ts != 0) {
             std::string ext_payload(sizeof(uint64_t), '\0');
@@ -740,7 +740,7 @@ namespace corodb {
 
         const auto wpath = wal_path(name);
         if (commit_ts != 0) {
-            // V2 墓碑：payload = [8B ts][8B key]
+            // 墓碑：payload = [8B ts][8B key]
             std::string payload(sizeof(uint64_t) + sizeof(int64_t), '\0');
             std::memcpy(payload.data(), &commit_ts, sizeof(uint64_t));
             std::memcpy(payload.data() + sizeof(uint64_t), &key, sizeof(int64_t));
@@ -853,7 +853,7 @@ namespace corodb {
             }
         }
 
-        // SSTable: 扫描全部层级（V2），过滤同 pk
+        // SSTable: 扫描全部层级，过滤同 pk
         int max_level = 0;
         while (std::filesystem::exists(level_path(name, max_level + 1)))
             ++max_level;

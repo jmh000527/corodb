@@ -55,47 +55,42 @@ Mature databases span millions of lines. CoroDB stays around 20,000 lines of C++
 
 ## Core Features
 
-| Area | Feature | Description |
-|------|---------|-------------|
-| **Storage** | LSM-Tree Engine | MemTable (red-black tree) + SSTable L0-L3 + WAL, Leveled Compaction + Tombstone GC |
-| | Buffer Pool | Clock replacement, 16-shard locking, FNV-1a page checksums |
-| | Atomic Writes | SSTable via `.tmp` → fsync → atomic rename, crash-safe |
-| | Bloom Filter | SSTable V2 footer with bloom + key range; skip irrelevant SSTables |
-| | Incremental Indexes | Append-based chunks + dedup on read + periodic compaction |
-| **Durability** | Kernel fsync | `::fsync` / `::_commit` after every WAL write |
-| | Group Commit | Leader-follower batch fsync, configurable delay/batch size |
-| | Checksums | FNV-1a per page, verified on every read |
-| **MVCC** | Snapshot Isolation | Per-row commit_ts, snapshot_ts filtering |
-| | commit_ts Retention | Retained until no active snapshot references it, then GC prunes |
-| | All-level GC | GC runs at every compaction level |
-| **Transactions** | 4 Isolation Levels | READ UNCOMMITTED / READ COMMITTED / REPEATABLE READ / SERIALIZABLE |
-| | Serializable Phantoms | Table-level SIREAD locks + write-counter detection |
-| | Row-level Conflicts | First-committer-wins, auto-detect and abort |
-| | Lock Timeouts | All lock paths have 5-second timeout, no indefinite blocking |
-| | Disconnect Rollback | Auto-rollback active txns on client disconnect |
-| **Query** | Volcano Executor | C++23 `std::generator` coroutines, lazy evaluation |
-| | Operators | SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit |
-| | Float64 Type | IEEE 754 double, AVG() returns float, implicit int↔float promotion |
-| | Query Timeout | Per-statement timeout, checked at each co_yield |
-| **Optimizer** | Two-Phase | LogicalPlanner → RuleSet → PhysicalPlanner |
-| | Rewrite Rules | Predicate pushdown / column pruning / JoinReorder / IndexScan upgrade / LimitPushdown |
-| | Plan Cache | LRU cache (normalized SQL → physical plan), DDL auto-invalidates |
-| | MergeJoin Opt | Skip re-sort when inputs already ordered |
-| **SQL** | DDL | CREATE/DROP TABLE, CREATE/DROP INDEX |
-| | DML | INSERT/UPDATE/DELETE |
-| | Query | SELECT/JOIN/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET |
-| | EXPLAIN | PostgreSQL-style plan tree |
-| | EXPLAIN ANALYZE | Plan + per-operator row count & timing |
-| | PREPARE/EXECUTE | Prepared statements + session-level registry |
-| | Admin | CHECKPOINT / SHOW STATUS |
-| **Networking** | Reactor Pattern | Main Reactor + Sub Reactor I/O pool + Worker pool |
-| | Cross-platform | epoll (Linux) / WSAPoll (Windows) |
-| | Buffer Limits | 64 MB input/output caps, OOM DoS prevention |
-| | Idle Timeout | Configurable auto-disconnect |
-| | Batch Accept | Up to 64 connections per event |
-| **Security** | Password Auth | AUTH command + SHA-256 hashing + UserManager |
-| **Operations** | Structured Logging | ERROR/WARN/INFO/DEBUG + timestamps + file output |
-| | CHECKPOINT | Force flush + compact + truncate WALs, online backup |
+### Storage Engine
+- **LSM-Tree**: MemTable (`std::map` red-black tree) + SSTable L0-L3 + WAL, Leveled Compaction + Tombstone GC
+- **Buffer Pool**: Clock replacement algorithm, 16-shard locking, FNV-1a page checksums
+- **Bloom Filter**: SSTable footer with bloom + key range; skip irrelevant SSTables on point queries
+- **Atomic Writes**: `.tmp` → `fsync` → `rename`, crash-safe; SSTable decode LRU cache
+- **Scan Cache**: full table scan results cached by write version; shared-lock concurrent reads when no writes
+
+### Query Engine
+- **Volcano Executor**: C++23 `std::generator` coroutines with lazy evaluation, data flows between operators
+- **11 Physical Operators**: SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit
+- **Two-Phase Optimizer**: LogicalPlanner → 5-rule fixed-point iteration (max 16 rounds) → PhysicalPlanner
+- **Operator Selection**: equi-index predicate → IndexScan; equi-join → HashJoin / MergeJoin (skip re-sort when pre-sorted); GROUP BY matching sort → SortAggregate absorbs Sort
+- **LRU Plan Cache**: normalized SQL → physical plan (default 128 entries), auto-invalidated on DDL
+
+### Transaction System
+- **MVCC Snapshot Isolation**: per-row `commit_ts`, `snapshot_ts` filtering, all-level Compaction GC
+- **Four Isolation Levels**: READ UNCOMMITTED / READ COMMITTED / REPEATABLE READ / SERIALIZABLE
+- **Serializable Detection**: table-level SIREAD locks + write counter + row-level read-set validation at commit time
+- **Row-Level Conflicts**: first-committer-wins write-intent locks, table locks 32-shard, global 5s timeout
+- **Disconnect Rollback**: auto-rollback active transactions and release all row locks on client disconnect
+
+### SQL Support
+- **DDL**: CREATE/DROP TABLE, CREATE/DROP INDEX
+- **DML**: INSERT/UPDATE/DELETE
+- **Query**: SELECT / DISTINCT / INNER JOIN / LEFT JOIN / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET
+- **Aggregates**: COUNT / SUM / AVG / MIN / MAX; AVG() returns IEEE 754 Float64
+- **Expressions**: arithmetic (`+ - * / %`), string concat (`||`), COALESCE / NULLIF / UPPER / LOWER / SUBSTR / TRIM / LENGTH / ABS
+- **Diagnostics**: EXPLAIN / EXPLAIN ANALYZE (PostgreSQL-style plan tree + per-operator timing & row count)
+- **Prepared Statements**: PREPARE / EXECUTE / DEALLOCATE PREPARE (session-level plan registry)
+- **Administration**: CHECKPOINT (force flush + full compaction + truncate WAL), SHOW STATUS
+
+### Networking & Durability
+- **Multi-Reactor Pattern**: Main Reactor accepts → Sub Reactor I/O pool (Round-Robin) handles I/O → Worker pool executes SQL
+- **Cross-Platform**: epoll edge-triggered (Linux) / WSAPoll (Windows)
+- **WAL Group Commit**: leader-follower batched fsync, configurable delay and batch size
+- **Connection Management**: non-blocking sockets + 64 MB per-connection buffer cap (OOM DoS prevention) + idle timeout + batched accept (64 per event)
 
 ---
 
@@ -753,7 +748,7 @@ Types: 0x01=INSERT  0x02=DELETE  0x03=BEGIN  0x04=COMMIT  0x05=ROLLBACK
 ### SSTable
 
 ```
-V2 File: LSM2(4) + SchemaBytes(4) + Schema(var) + Padding + Pages... + Footer
+SSTable File: LSM2(4) + SchemaBytes(4) + Schema(var) + Padding + Pages... + Footer
 
 Footer: FT01(4) + min_pk(8) + max_pk(8) + BloomLen(4) + BloomFilter(var)
 

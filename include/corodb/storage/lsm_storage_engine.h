@@ -198,12 +198,12 @@ namespace corodb {
         /// 将 MemTable 合并到 L0 SSTable 并触发层级压缩。
         void flush_memtable(const std::string& name, const std::vector<Column>& columns);
 
-        /// 读取 SSTable 文件（支持 V1/V2 格式），返回含 commit_ts 的条目列表。
+        /// 读取 SSTable 文件，返回含 commit_ts 的条目列表。
         /// 内部按 (路径, mtime) 缓存解码结果，避免重复反序列化；返回 shared_ptr 以零拷贝共享。
         [[nodiscard]] std::shared_ptr<const std::vector<MemEntry>>
         read_sstable(const std::string& path, const std::vector<Column>& columns) const;
 
-        /// 以 V2 格式（含 commit_ts）写入 SSTable 文件。
+        /// 以 commit_ts 感知格式写入 SSTable 文件。
         void write_sstable(const std::string& path, const std::vector<Column>& columns,
                            const std::vector<MemEntry>& entries) const;
 

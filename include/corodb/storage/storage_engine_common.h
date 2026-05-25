@@ -14,7 +14,7 @@
  *   |                       LSMTreeEngine                             |
  *   |                    LSM-Tree Storage                             |
  *   +-----------------------------------------------------------------+
- *   | Magic: 0x4C534D32 ("LSM2")                                      |
+ *   | Magic: 0x4C534D32                                              |
  *   +-----------------------------------------------------------------+
  *   | MemTable + SSTable  |  O(1) write  |  Background Compaction    |
  *   +-----------------------------------------------------------------+
@@ -140,7 +140,7 @@ namespace corodb::storage_internal {
     // ---- 文件格式魔术数字 ----
     constexpr uint32_t kMagic = 0x43444232;      ///< "CDB2"
     constexpr uint32_t kWalMagic = 0x57414c31;   ///< "WAL1"
-    constexpr uint32_t kLsmMagic = 0x4c534d32;   ///< "LSM2"（含 commit_ts + footer）
+    constexpr uint32_t kLsmMagic = 0x4c534d32;   ///< LSM SSTable magic number
     constexpr uint32_t kIndexMagic = 0x53494458; ///< "SIDX"
     constexpr uint32_t kFooterMagic = 0x46543031; ///< "FT01"
 
@@ -172,7 +172,7 @@ namespace corodb::storage_internal {
         std::vector<uint8_t> bits_;
     };
 
-    /** @brief SSTable V2 页脚（存储在数据页之后）。 */
+    /** @brief SSTable 页脚（存储在数据页之后）。 */
     struct SstFooter {
         int64_t min_pk{ 0 };
         int64_t max_pk{ 0 };
