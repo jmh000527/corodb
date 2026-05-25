@@ -1,0 +1,554 @@
+// Copyright (c) 2024 CoroDB Authors. All rights reserved.
+//
+// @file physical_planner.cpp
+// @brief 物理查询计划生成器的实现。
+
+#include "corodb/optimizer/physical/physical_planner.h"
+
+#include <stdexcept>
+#include <unordered_set>
+#include <utility>
+
+#include "corodb/storage/storage_engine_base.h"
+#include "corodb/storage/table.h"
+
+namespace corodb::opt {
+
+    PhysicalPlanner::PhysicalPlanner() = default;
+
+    PhysicalPlanner::PhysicalPlanner(Catalog& catalog, StorageEngine* storage)
+        : catalog_{ &catalog }, storage_{ storage } {
+    }
+
+    PhysicalPlanner::~PhysicalPlanner() = default;
+
+    namespace {
+        /** @brief 从 Literal 表达式中提取常量 Value（INSERT/Values 场景）。 */
+        Value materialize_constant(const Expression& expr) {
+            if (auto* lit = std::get_if<Literal>(&expr))
+                return lit->value;
+            throw std::runtime_error("[PhysicalPlanner] Only literal values supported in INSERT/Values");
+        }
+
+        /** @brief 按列名查找列索引，未找到抛异常。 */
+        std::size_t resolve_column_index(const Table& table, const std::string& col) {
+            const auto& cols = table.columns();
+            for (std::size_t i = 0; i < cols.size(); ++i) {
+                if (cols[i].name == col)
+                    return i;
+            }
+            throw std::runtime_error("[PhysicalPlanner] Unknown column: " + col + " in " + table.name());
+        }
+
+        /** @brief 递归收集计划子树中所有表名和别名（用于 Join 等值键归属判断）。 */
+        void collect_plan_tables(const LogicalPlan& p, std::unordered_set<std::string>& out) {
+            std::visit(
+                    [&](const auto& n) {
+                        using T = std::decay_t<decltype(n)>;
+                        if constexpr (std::is_same_v<T, LogicalScan>) {
+                            if (n.table)
+                                out.insert(n.table->name());
+                            if (!n.alias.empty())
+                                out.insert(n.alias);
+                        } else if constexpr (std::is_same_v<T, LogicalJoin>) {
+                            if (n.left)
+                                collect_plan_tables(*n.left, out);
+                            if (n.right)
+                                collect_plan_tables(*n.right, out);
+                        } else if constexpr (requires { n.child; }) {
+                            if (n.child)
+                                collect_plan_tables(*n.child, out);
+                        } else if constexpr (std::is_same_v<T, LogicalDML>) {
+                            if (n.table)
+                                out.insert(n.table->name());
+                            if (n.source)
+                                collect_plan_tables(*n.source, out);
+                        }
+                    },
+                    p.node);
+        }
+
+        /** @brief LogicalColumn 列表 → SelectItem 列表（Project/Aggregate 共用）。 */
+        std::vector<SelectStmt::SelectItem> cols_to_items(const std::vector<LogicalColumn>& cs) {
+            std::vector<SelectStmt::SelectItem> out;
+            out.reserve(cs.size());
+            for (const auto& c: cs) {
+                SelectStmt::SelectItem it;
+                if (auto* a = std::get_if<AggregateExpr>(&c.expr)) {
+                    it.value = *a;
+                } else {
+                    it.value = c.expr;
+                }
+                if (!c.output_name.empty())
+                    it.alias = c.output_name;
+                out.push_back(std::move(it));
+            }
+            return out;
+        }
+
+        /** @brief 检查 ON 是否为简单等值连接 (col = col)，按表归属分配左右键。 */
+        bool try_extract_equi_keys(const BoolExpr& on, const std::unordered_set<std::string>& left_tabs,
+                                   const std::unordered_set<std::string>& right_tabs, ColumnRef& lkey,
+                                   ColumnRef& rkey) {
+            if (on.kind != BoolExpr::Kind::Comparison || !on.cmp.has_value())
+                return false;
+            const auto& cmp = *on.cmp;
+            if (cmp.op != CompareOp::Eq)
+                return false;
+            auto* a = std::get_if<ColumnRef>(&cmp.lhs);
+            auto* b = std::get_if<ColumnRef>(&cmp.rhs);
+            if (!a || !b)
+                return false;
+            if (a->table.empty() || b->table.empty())
+                return false;
+            // a 在 left, b 在 right
+            if (left_tabs.count(a->table) && right_tabs.count(b->table)) {
+                lkey = *a;
+                rkey = *b;
+                return true;
+            }
+            // 反之
+            if (right_tabs.count(a->table) && left_tabs.count(b->table)) {
+                lkey = *b;
+                rkey = *a;
+                return true;
+            }
+            return false;
+        }
+    } // namespace
+
+    /**
+     * @brief 将逻辑计划树翻译为可执行的物理计划树。
+     * @param lp 逻辑计划根节点。
+     * @return 物理计划根节点。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::plan(const LogicalPlan& lp) {
+        return visit(lp);
+    }
+
+    /**
+     * @brief 按节点类型分发到对应的 build_* 方法。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::visit(const LogicalPlan& lp) {
+        return std::visit(
+                [&](const auto& n) -> std::unique_ptr<PlanNode> {
+                    using T = std::decay_t<decltype(n)>;
+                    if constexpr (std::is_same_v<T, LogicalScan>)
+                        return build_scan(n);
+                    else if constexpr (std::is_same_v<T, LogicalFilter>)
+                        return build_filter(n);
+                    else if constexpr (std::is_same_v<T, LogicalProject>)
+                        return build_project(n);
+                    else if constexpr (std::is_same_v<T, LogicalJoin>)
+                        return build_join(n);
+                    else if constexpr (std::is_same_v<T, LogicalAggregate>)
+                        return build_aggregate(n);
+                    else if constexpr (std::is_same_v<T, LogicalSort>)
+                        return build_sort(n);
+                    else if constexpr (std::is_same_v<T, LogicalLimit>)
+                        return build_limit(n);
+                    else if constexpr (std::is_same_v<T, LogicalDML>)
+                        return build_dml(n);
+                    else if constexpr (std::is_same_v<T, LogicalValues>) {
+                        throw std::runtime_error("[PhysicalPlanner] LogicalValues outside DML context not supported");
+                    } else if constexpr (std::is_same_v<T, LogicalDDL>) {
+                        return build_ddl(n);
+                    }
+                },
+                lp.node);
+    }
+
+    /**
+     * @brief 将 LogicalScan 翻译为 SeqScanPlan。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_scan(const LogicalScan& s) {
+        return std::make_unique<SeqScanPlan>(s.table, s.alias);
+    }
+
+    /**
+     * @brief 将 LogicalFilter 翻译为物理计划节点；若满足索引条件则生成 IndexScanPlan，否则生成 FilterPlan。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_filter(const LogicalFilter& f) {
+        // 基础 P1 IndexScan 选择：当 child 是 Scan 且 predicate 为单一等值列=字面量
+        // 且该列已建索引时，直接生成 IndexScanPlan（取代 SeqScan + Filter）。
+        if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::Comparison &&
+            f.predicate.cmp.has_value() && f.predicate.cmp->op == CompareOp::Eq) {
+            const auto& scan = std::get<LogicalScan>(f.child->node);
+            const auto& cmp = *f.predicate.cmp;
+            const ColumnRef* col = nullptr;
+            const Literal* lit = nullptr;
+            if (auto* c = std::get_if<ColumnRef>(&cmp.lhs)) {
+                col = c;
+                if (auto* l = std::get_if<Literal>(&cmp.rhs))
+                    lit = l;
+            }
+            if (!col && std::get_if<Literal>(&cmp.lhs)) {
+                if (auto* c2 = std::get_if<ColumnRef>(&cmp.rhs)) {
+                    col = c2;
+                    lit = std::get_if<Literal>(&cmp.lhs);
+                }
+            }
+            if (col && lit && scan.table) {
+                const auto& idxed = scan.table->indexed_columns();
+                if (idxed.count(col->name) > 0) {
+                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, lit->value);
+                }
+            }
+        }
+        auto child = visit(*f.child);
+        return std::make_unique<FilterPlan>(std::move(child), f.predicate);
+    }
+
+    /**
+     * @brief 将 LogicalProject 翻译为 ProjectPlan；若子节点为 Aggregate 则将列列表下沉到 AggregatePlan。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_project(const LogicalProject& p) {
+        // 当 child 为 LogicalAggregate 时，把 Project 的列下沉到 AggregatePlan.projections，
+        // 直接返回 AggregatePlan（避免 Executor 在 Project 层再次处理 AggregateExpr）。
+        if (p.child && p.child->kind == LogicalKind::Aggregate) {
+            const auto& agg = std::get<LogicalAggregate>(p.child->node);
+            auto agg_plan = build_aggregate(agg);
+            auto* hp = dynamic_cast<AggregatePlan*>(agg_plan.get());
+            if (hp) {
+                hp->projections = cols_to_items(p.columns);
+            }
+            return agg_plan;
+        }
+        // 当 Limit/Sort 节点夹在 Project 与 Aggregate 之间时（如 GROUP BY + LIMIT），
+        // 穿透这些中间节点找到 LogicalAggregate，构建物理子树后向其注入 projections，
+        // 避免空 projections 导致 "Column not found" 错误。
+        {
+            const LogicalPlan* inner = p.child.get();
+            while (inner && (inner->kind == LogicalKind::Limit || inner->kind == LogicalKind::Sort)) {
+                if (inner->kind == LogicalKind::Limit) {
+                    inner = std::get<LogicalLimit>(inner->node).child.get();
+                } else {
+                    inner = std::get<LogicalSort>(inner->node).child.get();
+                }
+            }
+            if (inner && inner->kind == LogicalKind::Aggregate) {
+                auto child = p.child ? visit(*p.child) : nullptr;
+                PlanNode* cursor = child.get();
+                while (cursor) {
+                    if (auto* ap = dynamic_cast<AggregatePlan*>(cursor)) {
+                        ap->projections = cols_to_items(p.columns);
+                        break;
+                    }
+                    if (auto* lp = dynamic_cast<LimitPlan*>(cursor)) {
+                        cursor = lp->child.get();
+                    } else if (auto* op = dynamic_cast<OrderByPlan*>(cursor)) {
+                        cursor = op->child.get();
+                    } else {
+                        break;
+                    }
+                }
+                return child;
+            }
+        }
+        auto child = p.child ? visit(*p.child) : nullptr;
+        return std::make_unique<ProjectPlan>(std::move(child), cols_to_items(p.columns), p.distinct);
+    }
+
+    /**
+     * @brief 将 LogicalJoin 翻译为 HashJoinPlan / MergeJoinPlan / NestedLoopJoinPlan，
+     *        按 ON 条件和子树排序状态选择最优物理实现。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_join(const LogicalJoin& j) {
+        // P2: Inner + 等值 + 双侧表名清晰 → HashJoin；否则 NestedLoop。
+        // P3: 若 Inner + 等值 且 双侧 child 为 LogicalSort，且 sort key 顶层
+        //     恰好分别等于左/右等值键 → MergeJoin（避免重复排序）。
+        if ((j.join_type == JoinType::Inner || j.join_type == JoinType::Left) && j.on.has_value()) {
+            std::unordered_set<std::string> ltabs, rtabs;
+            if (j.left)
+                collect_plan_tables(*j.left, ltabs);
+            if (j.right)
+                collect_plan_tables(*j.right, rtabs);
+            ColumnRef lk, rk;
+            if (try_extract_equi_keys(*j.on, ltabs, rtabs, lk, rk)) {
+                // P3 检测：左右都是 Sort 且首个排序键匹配等值键
+                bool merge_ok = false;
+                if (j.left && j.left->kind == LogicalKind::Sort && j.right && j.right->kind == LogicalKind::Sort) {
+                    const auto& ls = std::get<LogicalSort>(j.left->node);
+                    const auto& rs = std::get<LogicalSort>(j.right->node);
+                    auto first_col = [](const std::vector<LogicalSortKey>& ks) -> const ColumnRef* {
+                        if (ks.empty())
+                            return nullptr;
+                        return std::get_if<ColumnRef>(&ks.front().expr);
+                    };
+                    const ColumnRef* lkey0 = first_col(ls.keys);
+                    const ColumnRef* rkey0 = first_col(rs.keys);
+                    if (lkey0 && rkey0 && lkey0->name == lk.name && rkey0->name == rk.name) {
+                        merge_ok = true;
+                    }
+                }
+
+                auto left = j.left ? visit(*j.left) : nullptr;
+                auto right = j.right ? visit(*j.right) : nullptr;
+                if (merge_ok) {
+                    auto mj = std::make_unique<MergeJoinPlan>(std::move(left), std::move(right), std::move(lk),
+                                                              std::move(rk), std::nullopt, j.join_type);
+                    mj->left_sorted = true;
+                    mj->right_sorted = true;
+                    return mj;
+                }
+                return std::make_unique<HashJoinPlan>(std::move(left), std::move(right), std::move(lk), std::move(rk),
+                                                      std::nullopt, j.join_type);
+            }
+        }
+
+        if (!j.on.has_value()) {
+            throw std::runtime_error("[PhysicalPlanner] Join without ON not supported");
+        }
+        auto left = j.left ? visit(*j.left) : nullptr;
+        auto right = j.right ? visit(*j.right) : nullptr;
+        return std::make_unique<NestedLoopJoinPlan>(std::move(left), std::move(right), *j.on, j.join_type);
+    }
+
+    /**
+     * @brief 将 LogicalAggregate 翻译为 AggregatePlan，按 group_by 与子排序键匹配选择 Hash 或 Sort 策略。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_aggregate(const LogicalAggregate& a) {
+        // T9.6.3: 决定 Hash vs Sort 策略 ——
+        // 当 a.child 为 LogicalSort 且其 sort 键集合 == group_by 列集合时，可吸收排序为
+        // SortAggregate（流式聚合，无需哈希表）。
+        bool use_sort = false;
+        const LogicalPlan* effective_child = a.child.get();
+        if (a.child && std::holds_alternative<LogicalSort>(a.child->node) && !a.group_by.empty()) {
+            const auto& ls = std::get<LogicalSort>(a.child->node);
+            // 提取 group_by 列集合（仅 ColumnRef 形式参与匹配）
+            std::vector<ColumnRef> gb_cols;
+            gb_cols.reserve(a.group_by.size());
+            bool all_col = true;
+            for (const auto& e: a.group_by) {
+                if (auto* c = std::get_if<ColumnRef>(&e))
+                    gb_cols.push_back(*c);
+                else {
+                    all_col = false;
+                    break;
+                }
+            }
+            if (all_col && ls.keys.size() == gb_cols.size()) {
+                auto col_eq = [](const ColumnRef& x, const ColumnRef& y) {
+                    return x.name == y.name && (x.table.empty() || y.table.empty() || x.table == y.table);
+                };
+                auto contains = [&](const std::vector<ColumnRef>& v, const ColumnRef& c) {
+                    for (const auto& e: v)
+                        if (col_eq(e, c))
+                            return true;
+                    return false;
+                };
+                std::vector<ColumnRef> sort_cols;
+                bool ok = true;
+                for (const auto& k: ls.keys) {
+                    if (auto* c = std::get_if<ColumnRef>(&k.expr))
+                        sort_cols.push_back(*c);
+                    else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    bool same = true;
+                    for (const auto& g: gb_cols)
+                        if (!contains(sort_cols, g)) {
+                            same = false;
+                            break;
+                        }
+                    if (same)
+                        for (const auto& s: sort_cols)
+                            if (!contains(gb_cols, s)) {
+                                same = false;
+                                break;
+                            }
+                    if (same) {
+                        use_sort = true;
+                        // 吸收 sort 节点：直接拿 sort 的 child
+                        effective_child = ls.child.get();
+                    }
+                }
+            }
+        }
+
+        auto child = effective_child ? visit(*effective_child) : nullptr;
+
+        std::vector<ColumnRef> group;
+        group.reserve(a.group_by.size());
+        for (const auto& e: a.group_by) {
+            if (auto* c = std::get_if<ColumnRef>(&e))
+                group.push_back(*c);
+            else
+                throw std::runtime_error("[PhysicalPlanner] GROUP BY expression must be a column");
+        }
+
+        std::vector<AggregateExpr> aggs;
+        aggs.reserve(a.aggregates.size());
+        for (const auto& it: a.aggregates) {
+            AggregateExpr ag;
+            ag.func = it.func;
+            if (it.arg.has_value()) {
+                if (auto* c = std::get_if<ColumnRef>(&*it.arg))
+                    ag.arg = *c;
+            }
+            aggs.push_back(std::move(ag));
+        }
+
+        std::vector<SelectStmt::SelectItem> proj;
+        return std::make_unique<AggregatePlan>(
+                std::move(child), std::move(group), std::move(aggs), std::move(proj), a.having,
+                use_sort ? AggregatePlan::Strategy::Sort : AggregatePlan::Strategy::Hash);
+    }
+
+    /**
+     * @brief 将 LogicalSort 翻译为 OrderByPlan。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_sort(const LogicalSort& s) {
+        auto child = s.child ? visit(*s.child) : nullptr;
+        std::vector<SelectStmt::OrderByItem> items;
+        items.reserve(s.keys.size());
+        for (const auto& k: s.keys) {
+            SelectStmt::OrderByItem ob;
+            ob.key = k.expr;
+            ob.asc = k.ascending;
+            items.push_back(std::move(ob));
+        }
+        return std::make_unique<OrderByPlan>(std::move(child), std::move(items));
+    }
+
+    /**
+     * @brief 将 LogicalLimit 翻译为 LimitPlan。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_limit(const LogicalLimit& l) {
+        auto child = l.child ? visit(*l.child) : nullptr;
+        std::optional<int64_t> lim, off;
+        if (l.limit.has_value())
+            lim = static_cast<int64_t>(*l.limit);
+        if (l.offset.has_value())
+            off = static_cast<int64_t>(*l.offset);
+        return std::make_unique<LimitPlan>(std::move(child), lim, off);
+    }
+
+    /**
+     * @brief 将 LogicalDML 翻译为 InsertPlan / UpdatePlan / DeletePlan。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_dml(const LogicalDML& d) {
+        switch (d.kind) {
+            case LogicalDML::Kind::Insert: {
+                if (!d.table)
+                    throw std::runtime_error("[PhysicalPlanner] DML.Insert missing table");
+                std::vector<std::size_t> indexes;
+                if (d.columns.empty()) {
+                    indexes.resize(d.table->columns().size());
+                    for (std::size_t i = 0; i < indexes.size(); ++i)
+                        indexes[i] = i;
+                } else {
+                    for (const auto& c: d.columns)
+                        indexes.push_back(resolve_column_index(*d.table, c));
+                }
+                if (!d.source || d.source->kind != LogicalKind::Values) {
+                    throw std::runtime_error("[PhysicalPlanner] DML.Insert source must be Values");
+                }
+                const auto& vals = std::get<LogicalValues>(d.source->node);
+                std::vector<std::vector<Value>> all_rows;
+                all_rows.reserve(vals.rows.size());
+                for (const auto& row: vals.rows) {
+                    if (row.size() != indexes.size()) {
+                        throw std::runtime_error("[PhysicalPlanner] INSERT columns/values size mismatch");
+                    }
+                    std::vector<Value> vs;
+                    vs.reserve(row.size());
+                    for (const auto& e: row)
+                        vs.push_back(materialize_constant(e));
+                    all_rows.push_back(std::move(vs));
+                }
+                return std::make_unique<InsertPlan>(d.table, std::move(indexes), std::move(all_rows));
+            }
+            case LogicalDML::Kind::Update: {
+                if (!d.table)
+                    throw std::runtime_error("[PhysicalPlanner] DML.Update missing table");
+                std::vector<UpdatePlan::Assignment> assigns;
+                if (d.columns.size() != d.set_exprs.size()) {
+                    throw std::runtime_error("[PhysicalPlanner] DML.Update columns/exprs mismatch");
+                }
+                assigns.reserve(d.columns.size());
+                for (std::size_t i = 0; i < d.columns.size(); ++i) {
+                    assigns.push_back(
+                            UpdatePlan::Assignment{ resolve_column_index(*d.table, d.columns[i]), d.set_exprs[i] });
+                }
+                return std::make_unique<UpdatePlan>(d.table, std::move(assigns), d.where);
+            }
+            case LogicalDML::Kind::Delete: {
+                if (!d.table)
+                    throw std::runtime_error("[PhysicalPlanner] DML.Delete missing table");
+                return std::make_unique<DeletePlan>(d.table, d.where);
+            }
+        }
+        throw std::runtime_error("[PhysicalPlanner] Unknown DML kind");
+    }
+
+    /**
+     * @brief 把 LogicalDDL 翻译为对应的 DDL PlanNode。
+     *
+     * LogicalDDL 内部封装的是原始 AST Statement；按 variant 分发到
+     * CreateTablePlan / CreateIndexPlan / DropTablePlan / DropIndexPlan。
+     *
+     * @throws std::runtime_error 当 PhysicalPlanner 不持有 Catalog/StorageEngine
+     *                            或 DDL 形态未识别。
+     */
+    std::unique_ptr<PlanNode> PhysicalPlanner::build_ddl(const LogicalDDL& d) {
+        if (!catalog_) {
+            throw std::runtime_error("[PhysicalPlanner] DDL requires Catalog (use full constructor)");
+        }
+        return std::visit(
+                [this](const auto& s) -> std::unique_ptr<PlanNode> {
+                    using T = std::decay_t<decltype(s)>;
+                    if constexpr (std::is_same_v<T, CreateStmt>) {
+                        if (!storage_) {
+                            throw std::runtime_error("[PhysicalPlanner] CREATE TABLE requires StorageEngine");
+                        }
+                        if (catalog_->lookup(s.table)) {
+                            throw std::runtime_error("[PhysicalPlanner] Table already exists: " + s.table);
+                        }
+                        if (storage_->table_exists(s.table)) {
+                            throw std::runtime_error("Table already exists: " + s.table);
+                        }
+                        std::vector<Column> cols;
+                        cols.reserve(s.columns.size());
+                        for (const auto& c: s.columns) {
+                            cols.push_back(Column{ s.table, c.name, c.type });
+                        }
+                        return std::make_unique<CreateTablePlan>(s.table, std::move(cols), catalog_, storage_);
+                    } else if constexpr (std::is_same_v<T, CreateIndexStmt>) {
+                        auto table = catalog_->lookup(s.table);
+                        if (!table) {
+                            throw std::runtime_error("[PhysicalPlanner] Unknown table: " + s.table);
+                        }
+                        bool found = false;
+                        for (const auto& c: table->columns()) {
+                            if (c.name == s.column) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            throw std::runtime_error("[PhysicalPlanner] Unknown column for index: " + s.column);
+                        }
+                        return std::make_unique<CreateIndexPlan>(std::move(table), s.index_name, s.column);
+                    } else if constexpr (std::is_same_v<T, DropTableStmt>) {
+                        return std::make_unique<DropTablePlan>(s.table, s.if_exists, catalog_, storage_);
+                    } else if constexpr (std::is_same_v<T, DropIndexStmt>) {
+                        std::shared_ptr<Table> table;
+                        if (!s.table.empty()) {
+                            table = catalog_->lookup(s.table);
+                            if (!table && !s.if_exists) {
+                                throw std::runtime_error("[PhysicalPlanner] Unknown table: " + s.table);
+                            }
+                        }
+                        return std::make_unique<DropIndexPlan>(std::move(table), s.index_name, s.if_exists);
+                    } else {
+                        throw std::runtime_error("[PhysicalPlanner] DDL form not handled by physical planner");
+                    }
+                },
+                d.original);
+    }
+
+} // namespace corodb::opt

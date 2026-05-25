@@ -1,0 +1,436 @@
+// Copyright (c) 2024 CoroDB Authors. All rights reserved.
+//
+// @file query_processor.cpp
+// @brief 顶层 SQL 流水线（PG 风格 exec_simple_query）实现。
+
+#include "corodb/process/query_processor.h"
+
+#include <algorithm>
+#include <cctype>
+#include <utility>
+
+#include "corodb/common/config.h"
+#include "corodb/db/database.h"
+#include "corodb/executor/executor.h"
+#include "corodb/plan/logical_plan.h"
+#include "corodb/process/explain_printer.h"
+
+namespace corodb {
+
+    namespace {
+
+        // 从语句中提取涉及的表名列表
+        std::vector<std::string> extract_table_names(const Statement& stmt) {
+            std::vector<std::string> tables;
+            if (std::holds_alternative<SelectStmt>(stmt)) {
+                const auto& s = std::get<SelectStmt>(stmt);
+                tables.push_back(s.from_table);
+                for (const auto& join: s.joins) {
+                    tables.push_back(join.table);
+                }
+            } else if (std::holds_alternative<InsertStmt>(stmt)) {
+                tables.push_back(std::get<InsertStmt>(stmt).table);
+            } else if (std::holds_alternative<UpdateStmt>(stmt)) {
+                tables.push_back(std::get<UpdateStmt>(stmt).table);
+            } else if (std::holds_alternative<DeleteStmt>(stmt)) {
+                tables.push_back(std::get<DeleteStmt>(stmt).table);
+            } else if (std::holds_alternative<CreateStmt>(stmt)) {
+                tables.push_back(std::get<CreateStmt>(stmt).table);
+            } else if (std::holds_alternative<CreateIndexStmt>(stmt)) {
+                tables.push_back(std::get<CreateIndexStmt>(stmt).table);
+            }
+            return tables;
+        }
+
+        // 判断语句是否为 DDL（CREATE TABLE / CREATE INDEX）
+        bool is_ddl(const Statement& stmt) {
+            return std::holds_alternative<CreateStmt>(stmt) || std::holds_alternative<CreateIndexStmt>(stmt);
+        }
+
+    } // namespace
+
+    std::generator<Record> QueryProcessor::build_status_rows() {
+        std::vector<Binding> bindings;
+        bindings.push_back(Binding{ "", "metric", 0 });
+        bindings.push_back(Binding{ "", "value", 1 });
+
+        // Use the existing session's txn context. For a default session, txn_id=0.
+        auto make_row = [&](std::string metric, std::string value) -> Record {
+            Record r;
+            r.bindings = bindings;
+            r.values.push_back(std::move(metric));
+            r.values.push_back(std::move(value));
+            return r;
+        };
+
+        co_yield make_row("active_transactions", std::to_string(txn_manager_.active_count()));
+        co_yield make_row("plan_cache_entries", std::to_string(plan_cache_.size()));
+        co_yield make_row("tables", std::to_string(catalog_.size()));
+        co_yield make_row("isolation_level", "see session");
+        co_yield make_row("storage_engine", "LSM-Tree");
+        co_yield make_row("database_version", "0.1.0");
+    }
+
+    // ---- PlanCache ----
+
+    std::shared_ptr<PlanNode> PlanCache::lookup(const std::string& key) {
+        std::lock_guard lock(mutex_);
+        auto it = cache_.find(key);
+        if (it == cache_.end())
+            return nullptr;
+        // 移到 MRU 位置
+        auto lit = std::find(lru_.begin(), lru_.end(), key);
+        if (lit != lru_.end()) {
+            lru_.erase(lit);
+            lru_.push_back(key);
+        }
+        return it->second;
+    }
+
+    void PlanCache::insert(const std::string& key, std::shared_ptr<PlanNode> plan) {
+        std::lock_guard lock(mutex_);
+        // 容量满时淘汰 LRU 条目。
+        while (cache_.size() >= max_entries_ && !lru_.empty()) {
+            const std::string& lru_key = lru_.front();
+            cache_.erase(lru_key);
+            lru_.pop_front();
+        }
+        cache_[key] = std::move(plan);
+        lru_.push_back(key);
+    }
+
+    void PlanCache::invalidate_all() {
+        std::lock_guard lock(mutex_);
+        cache_.clear();
+        lru_.clear();
+    }
+
+    std::size_t PlanCache::size() const {
+        std::lock_guard lock(mutex_);
+        return cache_.size();
+    }
+
+    std::string QueryProcessor::normalize_sql(const std::string& sql) {
+        std::string out;
+        out.reserve(sql.size());
+        bool in_space = false;
+        for (char c : sql) {
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                if (!in_space) {
+                    out.push_back(' ');
+                    in_space = true;
+                }
+            } else {
+                out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                in_space = false;
+            }
+        }
+        // 去除首尾空格。
+        auto start = out.find_first_not_of(' ');
+        if (start == std::string::npos)
+            return "";
+        auto end = out.find_last_not_of(' ');
+        return out.substr(start, end - start + 1);
+    }
+
+    /**
+     * @brief 构造 QueryProcessor，绑定 Catalog、存储引擎、事务管理器及锁组件。
+     */
+    QueryProcessor::QueryProcessor(Catalog& catalog, StorageEngine& storage, TransactionManager& txn_manager,
+                                   LockManager& lock_manager, RowLockManager& row_locks, std::mutex& commit_apply_mutex,
+                                   UserManager& user_manager)
+        : catalog_(catalog), storage_(storage), txn_manager_(txn_manager), lock_manager_(lock_manager),
+          row_locks_(row_locks), txn_ctrl_(txn_manager, catalog, storage, row_locks, commit_apply_mutex),
+          utility_(catalog, storage), user_manager_(user_manager) {
+        plan_cache_.set_max_entries(Config::instance().plan_cache_entries());
+    }
+
+    /**
+     * @brief 对语句完整执行逻辑优化与物理规划，返回物理执行计划树。
+     * @param stmt 已解析的 AST 语句。
+     * @return 物理计划根节点的 unique_ptr。
+     */
+    std::unique_ptr<PlanNode> QueryProcessor::build_physical_plan(const Statement& stmt) {
+        opt::LogicalPlanner lplanner{ catalog_ };
+        auto lp = lplanner.plan(stmt);
+        opt::RuleSet rules = opt::make_default_rules();
+        lp = rules.apply(std::move(lp));
+        opt::PhysicalPlanner pplanner{ catalog_, &storage_ };
+        return pplanner.plan(*lp);
+    }
+
+    /**
+     * @brief 顶层 SQL 执行入口：解析 → 事务控制分发 → 规划 → DDL/DML/SELECT 执行。
+     * @param sql 原始 SQL 字符串。
+     * @param session 当前会话（含事务状态与写缓冲）。
+     * @return 包含结果行集或状态消息的 ProcessedQuery。
+     */
+    /**
+     * @brief 顶层 SQL 执行入口（PG 风格 exec_simple_query）。
+     *
+     * 流水线：解析 → 事务控制分发 → 规划 → DDL/DML/SELECT 分派。
+     *
+     * 与 PostgreSQL 的 exec_simple_query() 对应——从 SQL 字符串到结果行的
+     * 完整路径都在此方法内。主要阶段：
+     *
+     *   1. Parser：SQL 文本 → AST（递归下降解析器）
+     *   2. 事务控制：BEGIN/COMMIT/ROLLBACK/SET 在此层处理，不进入执行器
+     *   3. LogicalPlanner：AST → LogicalPlan 树（从语义构建算子流水线）
+     *   4. RuleSet：定点迭代重写 LogicalPlan（5 条规则，最多 16 轮）
+     *   5. PhysicalPlanner：LogicalPlan → PhysicalPlan（选择具体物理算子）
+     *   6. 分派：DDL → UtilityProcessor / SELECT → coroutine generator / DML → Executor
+     *
+     * SELECT 返回惰性 generator（不立即执行，由调用方逐行消费）。
+     * DML（INSERT/UPDATE/DELETE）立即 drain generator 完成写操作。
+     */
+    ProcessedQuery QueryProcessor::run(const std::string& sql, std::shared_ptr<Session> session) {
+        Parser parser;
+        Statement stmt = parser.parse(sql);
+
+        // 0) CREATE USER: always available, even before authentication.
+        if (auto* cu = std::get_if<CreateUserStmt>(&stmt)) {
+            if (session->authenticated && session->auth_user != "admin") {
+                throw std::runtime_error("[Auth] Only admin can create users");
+            }
+            user_manager_.add_user(cu->username, cu->password);
+            ProcessedQuery q;
+            q.message = "CREATE USER";
+            return q;
+        }
+
+        // 0b) AUTH: always available, even before authentication.
+        if (auto* auth = std::get_if<AuthStmt>(&stmt)) {
+            if (!user_manager_.authenticate(auth->username, auth->password)) {
+                throw std::runtime_error("[Auth] Authentication failed for user: " + auth->username);
+            }
+            session->authenticated = true;
+            session->auth_user = auth->username;
+            ProcessedQuery q;
+            q.message = "AUTH OK";
+            return q;
+        }
+
+        // Require authentication for all other commands (only when users exist).
+        if (!session->authenticated && user_manager_.has_users()) {
+            throw std::runtime_error("[Auth] Not authenticated. Use AUTH <username> '<password>'");
+        }
+
+        // 1) 事务控制语句
+        if (auto txn_res = txn_ctrl_.handle(stmt, *session); txn_res.has_value()) {
+            ProcessedQuery q;
+            q.message = std::move(txn_res->message);
+            return q;
+        }
+
+        // 1b) CHECKPOINT
+        if (std::holds_alternative<CheckpointStmt>(stmt)) {
+            storage_.checkpoint();
+            ProcessedQuery q;
+            q.message = "CHECKPOINT";
+            return q;
+        }
+
+        // 1c) SHOW STATUS
+        if (std::holds_alternative<ShowStatusStmt>(stmt)) {
+            ProcessedQuery q;
+            q.rows = build_status_rows();
+            q.is_select = true;
+            return q;
+        }
+
+        // 1d) PREPARE: parse and cache the plan.
+        if (auto* prep = std::get_if<PrepareStmt>(&stmt)) {
+            Parser inner_parser;
+            Statement inner_stmt = inner_parser.parse(prep->sql);
+            auto plan = build_physical_plan(inner_stmt);
+            session->prepared_stmts[prep->name] = std::move(plan);
+            ProcessedQuery q;
+            q.message = "PREPARE";
+            return q;
+        }
+
+        // 1e) EXECUTE: run the cached plan.
+        if (auto* exec = std::get_if<ExecuteStmt>(&stmt)) {
+            auto it = session->prepared_stmts.find(exec->name);
+            if (it == session->prepared_stmts.end())
+                throw std::runtime_error("[Process] Prepared statement not found: " + exec->name);
+            auto shared_plan = it->second; // shared_ptr<PlanNode>
+
+            txn_ctrl_.prepare_for_statement(stmt, *session);
+            ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+            if (session->statement_timeout_ms > 0) {
+                ctx.deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(session->statement_timeout_ms);
+            }
+            auto executor = std::make_shared<Executor>(ctx);
+            auto gen = executor->run(shared_plan.get());
+            ProcessedQuery q;
+            q.rows = std::move(gen);
+            struct Keeper { std::shared_ptr<PlanNode> plan; std::shared_ptr<Executor> exec; };
+            q.plan = std::shared_ptr<void>(std::make_shared<Keeper>(Keeper{ shared_plan, executor }));
+            q.is_select = true;
+            return q;
+        }
+
+        // 1f) DEALLOCATE PREPARE: remove cached plan(s).
+        if (auto* dea = std::get_if<DeallocateStmt>(&stmt)) {
+            if (dea->name.empty()) {
+                session->prepared_stmts.clear();
+                ProcessedQuery q;
+                q.message = "DEALLOCATE ALL";
+                return q;
+            }
+            session->prepared_stmts.erase(dea->name);
+            ProcessedQuery q;
+            q.message = "DEALLOCATE PREPARE";
+            return q;
+        }
+
+        // Failed 状态保护
+        if (session->current_txn_id != 0) {
+            auto state = txn_manager_.get_state(session->current_txn_id);
+            if (state && *state == TxnState::Failed) {
+                throw std::runtime_error("[Process] Current transaction is aborted; commands ignored until ROLLBACK");
+            }
+        }
+
+        // 2) EXPLAIN
+        if (std::holds_alternative<std::shared_ptr<ExplainStmt>>(stmt)) {
+            const auto& ex = std::get<std::shared_ptr<ExplainStmt>>(stmt);
+            const auto& inner = ex->inner;
+            const bool dml_or_select =
+                    std::holds_alternative<SelectStmt>(inner) || std::holds_alternative<InsertStmt>(inner) ||
+                    std::holds_alternative<UpdateStmt>(inner) || std::holds_alternative<DeleteStmt>(inner);
+            if (dml_or_select) {
+                opt::LogicalPlanner lplanner{ catalog_ };
+                auto lp = lplanner.plan(inner);
+                opt::RuleSet rules = opt::make_default_rules();
+                lp = rules.apply(std::move(lp));
+                std::string ltext = opt::to_string(*lp, 0);
+
+                opt::PhysicalPlanner pplanner{ catalog_, &storage_ };
+                std::shared_ptr<PlanNode> shared_plan = pplanner.plan(*lp);
+
+                if (ex->analyze) {
+                    // EXPLAIN ANALYZE：带性能分析执行。
+                    txn_ctrl_.prepare_for_statement(inner, *session);
+                    ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+                    if (session->statement_timeout_ms > 0) {
+                        ctx.deadline = std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds(session->statement_timeout_ms);
+                    }
+                    auto executor = std::make_shared<Executor>(ctx);
+                    QueryStats stats;
+                    auto gen = executor->run_profiled(shared_plan.get(), stats);
+                    // Drain the generator and discard rows (stats are collected).
+                    for (const auto& _: gen) { (void)_; }
+                    ProcessedQuery q;
+                    q.rows = ExplainPrinter::render_analyze(std::move(ltext), shared_plan.get(), stats);
+                    q.plan = shared_plan;
+                    q.is_select = true;
+                    return q;
+                }
+
+                ProcessedQuery q;
+                q.rows = ExplainPrinter::render_dual(std::move(ltext), shared_plan.get());
+                q.plan = shared_plan;
+                q.is_select = true;
+                return q;
+            }
+            std::shared_ptr<PlanNode> shared_plan = build_physical_plan(inner);
+            ProcessedQuery q;
+            q.rows = ExplainPrinter::render(shared_plan.get());
+            q.plan = shared_plan;
+            q.is_select = true;
+            return q;
+        }
+
+        try {
+            auto table_names = extract_table_names(stmt);
+            const bool ddl_op = is_ddl(stmt);
+            const bool is_select = std::holds_alternative<SelectStmt>(stmt);
+
+            // Invalidate plan cache and prepared statements on DDL.
+            if (ddl_op) {
+                plan_cache_.invalidate_all();
+                session->prepared_stmts.clear();
+            }
+
+            std::optional<GlobalLockGuard> global_guard;
+            if (ddl_op) {
+                global_guard.emplace(lock_manager_, LockMode::Exclusive);
+            }
+
+            std::optional<MultiTableLockGuard> table_guard;
+            if (!table_names.empty() && !ddl_op && !is_select && !session->in_transaction()) {
+                table_guard.emplace(lock_manager_, std::move(table_names), LockMode::Exclusive);
+            }
+
+            // Check plan cache for SELECT only (DML has different values per statement).
+            std::shared_ptr<PlanNode> shared_plan;
+            if (is_select) {
+                std::string normalized = normalize_sql(sql);
+                shared_plan = plan_cache_.lookup(normalized);
+            }
+            if (!shared_plan) {
+                auto plan = build_physical_plan(stmt);
+                shared_plan = std::move(plan);
+                if (is_select) {
+                    plan_cache_.insert(normalize_sql(sql), shared_plan);
+                }
+            }
+            // 3) 分派：DDL → Utility；DML/SELECT → Executor
+            if (UtilityProcessor::is_utility_plan(shared_plan.get())) {
+                utility_.process(shared_plan.get());
+                ProcessedQuery q;
+                q.message = "OK";
+                q.plan = shared_plan;
+                return q;
+            }
+
+            // 为 DML/SELECT 准备 snapshot_ts / auto_commit_ts
+            txn_ctrl_.prepare_for_statement(stmt, *session);
+
+            ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+
+            // Set query deadline from session timeout.
+            if (session->statement_timeout_ms > 0) {
+                ctx.deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(session->statement_timeout_ms);
+            }
+
+            if (is_select) {
+                // 把 Executor 用 shared_ptr 持有，让其与 generator 一起存活到客户端消费完毕。
+                auto executor = std::make_shared<Executor>(ctx);
+                auto gen = executor->run(shared_plan.get());
+                ProcessedQuery q;
+                q.rows = std::move(gen);
+                // 用 plan 字段一并保活 plan 与 executor。
+                struct Keeper {
+                    std::shared_ptr<PlanNode> plan;
+                    std::shared_ptr<Executor> exec;
+                };
+                q.plan = std::shared_ptr<void>(std::make_shared<Keeper>(Keeper{ shared_plan, executor }));
+                q.is_select = true;
+                return q;
+            }
+
+            // 写路径：在此处 drain generator
+            Executor executor{ ctx };
+            auto gen = executor.run(shared_plan.get());
+            for (const auto& _: gen) {
+                (void)_;
+            }
+            ProcessedQuery q;
+            q.message = "OK";
+            q.plan = shared_plan;
+            return q;
+        } catch (...) {
+            if (session->current_txn_id != 0) {
+                txn_manager_.mark_failed(session->current_txn_id);
+            }
+            throw;
+        }
+    }
+
+} // namespace corodb

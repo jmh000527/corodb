@@ -1,0 +1,270 @@
+// Copyright (c) 2024 CoroDB Authors. All rights reserved.
+//
+// @file transaction_controller.cpp
+// @brief 事务控制语句（BEGIN/COMMIT/ROLLBACK/SET TX）处理实现。
+
+#include "corodb/process/transaction_controller.h"
+
+#include <climits>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace corodb {
+
+    /**
+     * @brief 检查 stmt 类型并分发到 begin/commit/rollback/set_transaction 处理器。
+     * @return 事务控制结果；若 stmt 不是事务控制语句则返回 nullopt。
+     */
+    std::optional<TxnControlResult> TransactionController::handle(const Statement& stmt, Session& session) {
+        if (std::holds_alternative<BeginStmt>(stmt))
+            return begin(session);
+        if (std::holds_alternative<CommitStmt>(stmt))
+            return commit(session);
+        if (std::holds_alternative<RollbackStmt>(stmt))
+            return rollback(session);
+        if (std::holds_alternative<SetTransactionStmt>(stmt))
+            return set_transaction(std::get<SetTransactionStmt>(stmt), session);
+        return std::nullopt;
+    }
+
+    /**
+     * @brief 开启新事务：分配 txn_id，并根据隔离级别设置 snapshot_ts。
+     * @return 包含新事务 ID 的文本结果。
+     */
+    TxnControlResult TransactionController::begin(Session& session) {
+        if (session.current_txn_id != 0) {
+            throw std::runtime_error("[Process] Transaction already in progress");
+        }
+        uint64_t txn_id = txn_manager_.begin();
+        (void)storage_.begin_transaction();
+        session.current_txn_id = txn_id;
+        if (session.isolation == IsolationLevel::RepeatableRead || session.isolation == IsolationLevel::Serializable) {
+            auto rts = txn_manager_.get_read_ts(txn_id);
+            session.snapshot_ts = rts.value_or(0);
+        } else {
+            session.snapshot_ts = 0;
+        }
+        return TxnControlResult{ "Transaction started with ID: " + std::to_string(txn_id) };
+    }
+
+    /**
+     * @brief 提交事务：Serializable 下检测写-读冲突，应用写缓冲，刷盘，释放行锁。
+     * @return 提交成功/失败的文本结果。
+     */
+    TxnControlResult TransactionController::commit(Session& session) {
+        if (session.current_txn_id == 0) {
+            throw std::runtime_error("[Process] No active transaction to commit");
+        }
+        uint64_t txn_id = session.current_txn_id;
+        auto state = txn_manager_.get_state(txn_id);
+        // 已标记失败的事务只能回滚
+        if (state && *state == TxnState::Failed) {
+            txn_manager_.rollback(txn_id);
+            session.current_txn_id = 0;
+            session.write_buffer.clear();
+            session.read_set.clear();
+        session.table_read_versions.clear();
+            session.snapshot_ts = 0;
+            row_locks_.release_all(txn_id);
+            throw std::runtime_error("[Process] Cannot COMMIT failed transaction; rolled back instead");
+        }
+
+        uint64_t commit_ts = 0;
+        try {
+            // 串行化冲突检测 + 写缓冲应用必须在同一把锁下原子完成
+            std::scoped_lock commit_guard(commit_apply_mutex_);
+
+            // Serializable 级别：检查快照期间读集是否已被修改
+            if (session.isolation == IsolationLevel::Serializable) {
+                // 主键级冲突检测。
+                for (const auto& [tname, pks]: session.read_set) {
+                    auto tbl = catalog_.lookup(tname);
+                    if (!tbl)
+                        continue;
+                    for (int64_t pk: pks) {
+                        auto old_row = tbl->lookup_visible(pk, session.snapshot_ts);
+                        auto cur_row = tbl->lookup_visible(pk, UINT64_MAX);
+                        const bool changed =
+                                old_row.has_value() != cur_row.has_value() ||
+                                (old_row.has_value() && cur_row.has_value() && old_row->values != cur_row->values);
+                        if (changed) {
+                            txn_manager_.rollback(txn_id);
+                            session.write_buffer.clear();
+                            session.read_set.clear();
+        session.table_read_versions.clear();
+                            session.table_read_versions.clear();
+                            session.current_txn_id = 0;
+                            session.snapshot_ts = 0;
+                            row_locks_.release_all(txn_id);
+                            throw std::runtime_error("[Process] Serialization failure: row read by this "
+                                                     "transaction was concurrently modified (table=" +
+                                                     tname + ", pk=" + std::to_string(pk) + ")");
+                        }
+                    }
+                }
+
+                // 表级幻读检测：若读取过的表被并发事务修改，中止当前事务。
+                for (const auto& [tname, read_version] : session.table_read_versions) {
+                    auto tbl = catalog_.lookup(tname);
+                    if (!tbl)
+                        continue;
+                    if (tbl->write_counter() != read_version) {
+                        txn_manager_.rollback(txn_id);
+                        session.write_buffer.clear();
+                        session.read_set.clear();
+        session.table_read_versions.clear();
+                        session.table_read_versions.clear();
+                        session.current_txn_id = 0;
+                        session.snapshot_ts = 0;
+                        row_locks_.release_all(txn_id);
+                        throw std::runtime_error("[Process] Serialization failure: phantom read detected "
+                                                 "(table=" + tname + " was modified by concurrent transaction)");
+                    }
+                }
+            }
+
+            // 分配全局提交时间戳（commit_ts），向后快照可见
+            bool ok_mgr = txn_manager_.commit(txn_id, &commit_ts);
+            if (!ok_mgr) {
+                throw std::runtime_error("[Process] TxnManager.commit failed (state mismatch)");
+            }
+            // 将写缓冲中的 upsert / delete 批量刷入持久化层
+            for (auto& [tname, tbuf]: session.write_buffer.tables) {
+                if (tbuf.empty())
+                    continue;
+                auto tbl = catalog_.lookup(tname);
+                if (!tbl)
+                    continue;
+                auto& rows = tbl->rows_mut();
+
+                if (!tbuf.deletes.empty()) {
+                    std::erase_if(rows, [&](const Row& row) -> bool {
+                        if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+                            return false;
+                        return tbuf.deletes.count(std::get<int64_t>(row.values.front())) > 0;
+                    });
+                    // 先从内存行集中移除，再写 WAL
+                    for (int64_t k: tbuf.deletes) {
+                        tbl->persist_row_delete(k, commit_ts);
+                    }
+                }
+
+                if (!tbuf.upserts.empty()) {
+                    // 构建 pk → index 映射，用于 in-place 更新已有行
+                    std::unordered_map<int64_t, std::size_t> idx_by_pk;
+                    idx_by_pk.reserve(rows.size());
+                    for (std::size_t i = 0; i < rows.size(); ++i) {
+                        if (!rows[i].values.empty() && std::holds_alternative<int64_t>(rows[i].values.front()))
+                            idx_by_pk[std::get<int64_t>(rows[i].values.front())] = i;
+                    }
+                    for (auto& [pk, row]: tbuf.upserts) {
+                        auto it = idx_by_pk.find(pk);
+                        if (it != idx_by_pk.end()) {
+                            rows[it->second] = row;
+                        } else {
+                            rows.push_back(row);
+                        }
+                        tbl->persist_row_upsert(row, commit_ts);
+                    }
+                }
+
+                tbl->refresh_indexes();
+            }
+        } catch (...) {
+            txn_manager_.mark_failed(txn_id);
+            session.write_buffer.clear();
+            session.read_set.clear();
+        session.table_read_versions.clear();
+            session.current_txn_id = 0;
+            session.snapshot_ts = 0;
+            row_locks_.release_all(txn_id);
+            throw;
+        }
+
+        session.write_buffer.clear();
+        session.read_set.clear();
+        session.table_read_versions.clear();
+        session.current_txn_id = 0;
+        session.snapshot_ts = 0;
+        // 提交成功后释放行锁，允许其他事务继续
+        row_locks_.release_all(txn_id);
+        bool ok_eng = storage_.commit_transaction(txn_id);
+        return TxnControlResult{ ok_eng ? std::string("Transaction committed")
+                                        : std::string("Transaction commit failed") };
+    }
+
+    /**
+     * @brief 回滚事务：清空写缓冲与读集，释放行锁，通知事务管理器。
+     * @return 回滚成功/失败的文本结果。
+     */
+    TxnControlResult TransactionController::rollback(Session& session) {
+        if (session.current_txn_id == 0) {
+            throw std::runtime_error("[Process] No active transaction to rollback");
+        }
+        uint64_t txn_id = session.current_txn_id;
+        session.current_txn_id = 0;
+        session.snapshot_ts = 0;
+        session.write_buffer.clear();
+        session.read_set.clear();
+        session.table_read_versions.clear();
+        row_locks_.release_all(txn_id);
+        txn_manager_.rollback(txn_id);
+        bool ok_eng = storage_.rollback_transaction(txn_id);
+        return TxnControlResult{ ok_eng ? std::string("Transaction rolled back")
+                                        : std::string("Transaction rollback failed") };
+    }
+
+    /**
+     * @brief 设置会话隔离级别（必须在事务外调用）。
+     * @param s 包含新隔离级别代码的 SET TRANSACTION 语句。
+     */
+    TxnControlResult TransactionController::set_transaction(const SetTransactionStmt& s, Session& session) {
+        if (session.current_txn_id != 0) {
+            throw std::runtime_error("[Process] SET TRANSACTION ISOLATION LEVEL must be issued outside a transaction");
+        }
+        switch (s.isolation_level) {
+            case 0:
+                session.isolation = IsolationLevel::ReadUncommitted;
+                break;
+            case 1:
+                session.isolation = IsolationLevel::ReadCommitted;
+                break;
+            case 2:
+                session.isolation = IsolationLevel::RepeatableRead;
+                break;
+            case 3:
+                session.isolation = IsolationLevel::Serializable;
+                break;
+            default:
+                throw std::runtime_error("[Process] Unknown isolation level code");
+        }
+        return TxnControlResult{ "Isolation level updated" };
+    }
+
+    /**
+     * @brief 为即将执行的语句分配 snapshot_ts（供读取可见性判断）和 auto_commit_ts（自动提交写操作）。
+     * @param stmt 即将执行的语句，用于区分 SELECT 与 DML。
+     */
+    void TransactionController::prepare_for_statement(const Statement& stmt, Session& session) {
+        const bool is_select = std::holds_alternative<SelectStmt>(stmt);
+
+        if (session.in_transaction()) {
+            if (session.isolation == IsolationLevel::ReadUncommitted) {
+                // ReadUncommitted：读取含未提交数据的最新版本。
+                session.snapshot_ts = UINT64_MAX;
+            } else if (session.isolation == IsolationLevel::ReadCommitted) {
+                session.snapshot_ts = txn_manager_.allocate_ts();
+            }
+        } else {
+            // Auto-commit: always read latest committed snapshot.
+            session.snapshot_ts = txn_manager_.allocate_ts();
+        }
+
+        if (!session.in_transaction() && !is_select) {
+            session.auto_commit_ts = txn_manager_.allocate_ts();
+        } else {
+            session.auto_commit_ts = 0;
+        }
+    }
+
+} // namespace corodb

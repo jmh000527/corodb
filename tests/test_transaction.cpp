@@ -1,0 +1,630 @@
+/**
+ * @file test_transaction.cpp
+ * @brief 事务生命周期与 SET TRANSACTION 隔离级别测试（Phase 1）
+ *
+ * 当前阶段只验证状态机正确性，不验证 MVCC 可见性差异（后续 Phase 2/3）。
+ *
+ * 覆盖：
+ *   - BEGIN / COMMIT / ROLLBACK 在 Session 上正确推进 current_txn_id
+ *   - 嵌套 BEGIN 报错
+ *   - COMMIT/ROLLBACK 在无事务时报错
+ *   - 错误语句在事务中将事务标记为 Failed，后续语句被拒绝
+ *   - SET TRANSACTION ISOLATION LEVEL 写入 Session.isolation
+ */
+
+#include <filesystem>
+#include <gtest/gtest.h>
+#include <memory>
+
+#include "corodb/db/database.h"
+#include "corodb/db/session.h"
+#include "corodb/storage/lsm_storage_engine.h"
+#include "corodb/storage/storage_engine.h"
+#include "corodb/storage/storage_engine_common.h"
+#include "corodb/txn/transaction_manager.h"
+
+using namespace corodb;
+
+namespace {
+
+    class TempDir {
+    public:
+        TempDir() {
+            auto now = std::chrono::system_clock::now().time_since_epoch().count();
+            p_ = std::filesystem::temp_directory_path() /
+                 ("corodb_txn_test_" + std::to_string(now) + "_" + std::to_string(::rand()));
+            std::filesystem::create_directories(p_);
+        }
+        ~TempDir() {
+            try {
+                std::filesystem::remove_all(p_);
+            } catch (...) {
+            }
+        }
+        std::string path() const {
+            return p_.string();
+        }
+
+    private:
+        std::filesystem::path p_;
+    };
+
+    class TxnTest : public ::testing::Test {
+    protected:
+        std::unique_ptr<TempDir> dir;
+        std::unique_ptr<Database> db;
+        std::shared_ptr<Session> sess = std::make_shared<Session>();
+
+        void SetUp() override {
+            dir = std::make_unique<TempDir>();
+            db = std::make_unique<Database>(dir->path());
+        }
+        void TearDown() override {
+            db.reset();
+            storage_internal::WalManager::instance().clear_all();
+            dir.reset();
+        }
+
+        void exec_ok(const std::string& sql) {
+            auto r = db->execute(sql, sess);
+            if (r.rows.has_value()) {
+                for (auto&& rec: *r.rows) {
+                    (void)rec;
+                }
+            }
+            EXPECT_TRUE(r.is_success()) << "SQL failed: " << sql;
+        }
+
+        void exec_ok_on(std::shared_ptr<Session> s, const std::string& sql) {
+            auto r = db->execute(sql, std::move(s));
+            if (r.rows.has_value()) {
+                for (auto&& rec: *r.rows) {
+                    (void)rec;
+                }
+            }
+            EXPECT_TRUE(r.is_success()) << "SQL failed: " << sql;
+        }
+    };
+
+} // namespace
+
+TEST_F(TxnTest, BeginCommitLifecycle) {
+    EXPECT_EQ(sess->current_txn_id, 0u);
+    exec_ok("BEGIN");
+    EXPECT_NE(sess->current_txn_id, 0u);
+    uint64_t id = sess->current_txn_id;
+    exec_ok("COMMIT");
+    EXPECT_EQ(sess->current_txn_id, 0u);
+
+    exec_ok("BEGIN");
+    EXPECT_NE(sess->current_txn_id, 0u);
+    EXPECT_NE(sess->current_txn_id, id) << "txn IDs must be unique and monotonic";
+}
+
+TEST_F(TxnTest, BeginRollbackLifecycle) {
+    exec_ok("BEGIN");
+    EXPECT_NE(sess->current_txn_id, 0u);
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(sess->current_txn_id, 0u);
+}
+
+TEST_F(TxnTest, NestedBeginRejected) {
+    exec_ok("BEGIN");
+    EXPECT_THROW(db->execute("BEGIN", sess), std::runtime_error);
+    // 嵌套 BEGIN 失败后事务仍然活跃
+    EXPECT_NE(sess->current_txn_id, 0u);
+    exec_ok("ROLLBACK");
+}
+
+TEST_F(TxnTest, CommitWithoutBeginRejected) {
+    EXPECT_THROW(db->execute("COMMIT", sess), std::runtime_error);
+}
+
+TEST_F(TxnTest, RollbackWithoutBeginRejected) {
+    EXPECT_THROW(db->execute("ROLLBACK", sess), std::runtime_error);
+}
+
+TEST_F(TxnTest, ErrorInsideTxnPoisonsTransaction) {
+    exec_ok("CREATE TABLE t (id INT64, name TEXT)");
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (1, 'a')");
+
+    // 错误语句（表不存在），应让事务进入 Failed
+    EXPECT_THROW(db->execute("INSERT INTO no_such_table VALUES (1, 'x')", sess), std::runtime_error);
+
+    // 后续 DML 应被拒绝（事务已 poisoned）
+    EXPECT_THROW(db->execute("INSERT INTO t VALUES (2, 'b')", sess), std::runtime_error);
+
+    // SELECT 也应被拒绝
+    EXPECT_THROW(db->execute("SELECT * FROM t", sess), std::runtime_error);
+
+    // COMMIT 失败状态事务必须返回错误并自动 ROLLBACK
+    EXPECT_THROW(db->execute("COMMIT", sess), std::runtime_error);
+    EXPECT_EQ(sess->current_txn_id, 0u);
+
+    // 现在可以重新开始事务
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (3, 'c')");
+    exec_ok("COMMIT");
+}
+
+TEST_F(TxnTest, RollbackPoisonedTransaction) {
+    exec_ok("CREATE TABLE t (id INT64, name TEXT)");
+    exec_ok("BEGIN");
+    EXPECT_THROW(db->execute("SELECT * FROM no_such_table", sess), std::runtime_error);
+    // 显式 ROLLBACK 必须成功，即便事务已是 Failed
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(sess->current_txn_id, 0u);
+}
+
+TEST_F(TxnTest, SetTransactionIsolationLevel) {
+    EXPECT_EQ(sess->isolation, IsolationLevel::ReadCommitted);
+
+    exec_ok("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    EXPECT_EQ(sess->isolation, IsolationLevel::Serializable);
+
+    exec_ok("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    EXPECT_EQ(sess->isolation, IsolationLevel::RepeatableRead);
+
+    exec_ok("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    EXPECT_EQ(sess->isolation, IsolationLevel::ReadCommitted);
+
+    exec_ok("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+    EXPECT_EQ(sess->isolation, IsolationLevel::ReadUncommitted);
+}
+
+TEST_F(TxnTest, SetIsolationInsideTxnRejected) {
+    exec_ok("BEGIN");
+    EXPECT_THROW(db->execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", sess), std::runtime_error);
+    exec_ok("ROLLBACK");
+}
+
+TEST_F(TxnTest, IsolationLevelPersistsAcrossTransactions) {
+    exec_ok("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    exec_ok("BEGIN");
+    EXPECT_EQ(sess->isolation, IsolationLevel::Serializable);
+    exec_ok("COMMIT");
+    EXPECT_EQ(sess->isolation, IsolationLevel::Serializable);
+}
+
+TEST_F(TxnTest, MultipleSessionsHaveIndependentTxnIds) {
+    auto s1 = std::make_shared<Session>();
+    auto s2 = std::make_shared<Session>();
+    auto r1 = db->execute("BEGIN", s1);
+    auto r2 = db->execute("BEGIN", s2);
+    EXPECT_NE(s1->current_txn_id, 0u);
+    EXPECT_NE(s2->current_txn_id, 0u);
+    EXPECT_NE(s1->current_txn_id, s2->current_txn_id) << "two sessions must get different txn IDs";
+    db->execute("COMMIT", s1);
+    db->execute("ROLLBACK", s2);
+}
+
+// ============================================================
+// Phase 2 / T2.2-T2.3 / T3.3: TxnWriteBuffer + 写写冲突
+// ============================================================
+
+namespace {
+    // 数 SELECT 的行数（必须迭代 generator 才会触发 plan 执行）
+    std::size_t count_rows(Database& db, std::shared_ptr<Session> s, const std::string& sql) {
+        auto r = db.execute(sql, std::move(s));
+        if (!r.rows.has_value())
+            return 0;
+        std::size_t n = 0;
+        for (auto&& rec: *r.rows) {
+            (void)rec;
+            ++n;
+        }
+        return n;
+    }
+} // namespace
+
+class TxnBufferTest : public TxnTest {
+protected:
+    void SetUp() override {
+        TxnTest::SetUp();
+        exec_ok("CREATE TABLE t (id INT64, v INT64)");
+        exec_ok("INSERT INTO t VALUES (1, 100)");
+        exec_ok("INSERT INTO t VALUES (2, 200)");
+        exec_ok("INSERT INTO t VALUES (3, 300)");
+    }
+};
+
+TEST_F(TxnBufferTest, RollbackUndoesInsert) {
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (4, 400)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 4u) << "read-your-own-writes inside txn";
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u) << "ROLLBACK must undo INSERT";
+}
+
+TEST_F(TxnBufferTest, RollbackUndoesUpdate) {
+    exec_ok("BEGIN");
+    exec_ok("UPDATE t SET v = 999 WHERE id = 1");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 999"), 1u);
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 999"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 100"), 1u);
+}
+
+TEST_F(TxnBufferTest, RollbackUndoesDelete) {
+    exec_ok("BEGIN");
+    exec_ok("DELETE FROM t WHERE id = 2");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u) << "ROLLBACK must undo DELETE";
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 2"), 1u);
+}
+
+TEST_F(TxnBufferTest, CommitAppliesAllDml) {
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (4, 400)");
+    exec_ok("UPDATE t SET v = 111 WHERE id = 1");
+    exec_ok("DELETE FROM t WHERE id = 3");
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 111"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 3"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 4"), 1u);
+}
+
+TEST_F(TxnBufferTest, NoDirtyReadAcrossSessions) {
+    auto other = std::make_shared<Session>();
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (4, 400)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 4u) << "writer reads its own writes";
+    EXPECT_EQ(count_rows(*db, other, "SELECT * FROM t"), 3u) << "other session must not see uncommitted INSERT";
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, other, "SELECT * FROM t"), 4u) << "after COMMIT, other session sees the new row";
+}
+
+TEST_F(TxnBufferTest, InsertThenUpdateInSameTxnMerges) {
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (10, 1000)");
+    exec_ok("UPDATE t SET v = 1111 WHERE id = 10");
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 10 AND v = 1111"), 1u);
+}
+
+TEST_F(TxnBufferTest, InsertThenDeleteInSameTxnLeavesNothing) {
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (11, 1100)");
+    exec_ok("DELETE FROM t WHERE id = 11");
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 11"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+}
+
+TEST_F(TxnBufferTest, DeleteThenInsertSamePkRestores) {
+    exec_ok("BEGIN");
+    exec_ok("DELETE FROM t WHERE id = 1");
+    exec_ok("INSERT INTO t VALUES (1, 12345)");
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1 AND v = 12345"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+}
+
+// ---------- T3.3: 写写冲突（first-committer-wins） ----------
+
+TEST_F(TxnBufferTest, WriteWriteConflictOnUpdate) {
+    auto s1 = std::make_shared<Session>(); auto s2 = std::make_shared<Session>();
+    db->execute("BEGIN", s1);
+    db->execute("BEGIN", s2);
+
+    // s1 先写 id=1
+    db->execute("UPDATE t SET v = 11 WHERE id = 1", s1);
+
+    // s2 也想写 id=1 → 必须冲突
+    EXPECT_THROW(db->execute("UPDATE t SET v = 22 WHERE id = 1", s2), std::runtime_error);
+
+    // s2 现在是 Failed 事务，必须 ROLLBACK
+    EXPECT_THROW(db->execute("COMMIT", s2), std::runtime_error);
+    EXPECT_EQ(s2->current_txn_id, 0u);
+
+    // s1 正常 COMMIT
+    db->execute("COMMIT", s1);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1 AND v = 11"), 1u);
+}
+
+TEST_F(TxnBufferTest, WriteWriteConflictOnInsert) {
+    auto s1 = std::make_shared<Session>(); auto s2 = std::make_shared<Session>();
+    db->execute("BEGIN", s1);
+    db->execute("BEGIN", s2);
+
+    db->execute("INSERT INTO t VALUES (50, 5000)", s1);
+    EXPECT_THROW(db->execute("INSERT INTO t VALUES (50, 9999)", s2), std::runtime_error);
+
+    db->execute("ROLLBACK", s2);
+    db->execute("COMMIT", s1);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 50 AND v = 5000"), 1u);
+}
+
+TEST_F(TxnBufferTest, WriteWriteConflictOnDelete) {
+    auto s1 = std::make_shared<Session>(); auto s2 = std::make_shared<Session>();
+    db->execute("BEGIN", s1);
+    db->execute("BEGIN", s2);
+
+    db->execute("DELETE FROM t WHERE id = 2", s1);
+    EXPECT_THROW(db->execute("UPDATE t SET v = 222 WHERE id = 2", s2), std::runtime_error);
+
+    db->execute("ROLLBACK", s2);
+    db->execute("COMMIT", s1);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 2"), 0u);
+}
+
+TEST_F(TxnBufferTest, RollbackReleasesRowLockForOthers) {
+    auto s1 = std::make_shared<Session>(); auto s2 = std::make_shared<Session>();
+    db->execute("BEGIN", s1);
+    db->execute("UPDATE t SET v = 11 WHERE id = 1", s1);
+    db->execute("ROLLBACK", s1); // 释放 (t, 1) 锁
+
+    // s2 现在应能成功更新同一行
+    db->execute("BEGIN", s2);
+    db->execute("UPDATE t SET v = 22 WHERE id = 1", s2);
+    db->execute("COMMIT", s2);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1 AND v = 22"), 1u);
+}
+
+TEST_F(TxnBufferTest, CommitReleasesRowLockForOthers) {
+    auto s1 = std::make_shared<Session>(); auto s2 = std::make_shared<Session>();
+    db->execute("BEGIN", s1);
+    db->execute("UPDATE t SET v = 11 WHERE id = 1", s1);
+    db->execute("COMMIT", s1); // 释放 (t, 1) 锁
+
+    db->execute("BEGIN", s2);
+    db->execute("UPDATE t SET v = 22 WHERE id = 1", s2);
+    db->execute("COMMIT", s2);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1 AND v = 22"), 1u);
+}
+
+TEST_F(TxnBufferTest, IdempotentLockOnSamePkWithinTxn) {
+    // 同一事务对同一 pk 多次写入应幂等，不报冲突
+    exec_ok("BEGIN");
+    exec_ok("UPDATE t SET v = 10 WHERE id = 1");
+    exec_ok("UPDATE t SET v = 11 WHERE id = 1");
+    exec_ok("UPDATE t SET v = 12 WHERE id = 1");
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1 AND v = 12"), 1u);
+}
+
+// ---------------- MVCC commit_ts 启动恢复（T2.5 基础）----------------
+
+class MvccBootstrapTest : public ::testing::Test {
+protected:
+    std::unique_ptr<TempDir> dir;
+
+    void SetUp() override {
+        dir = std::make_unique<TempDir>();
+    }
+    void TearDown() override {
+        storage_internal::WalManager::instance().clear_all();
+        dir.reset();
+    }
+};
+
+TEST_F(MvccBootstrapTest, MaxObservedCommitTsScansWalAndSstable) {
+    // 1) 第一次启动：写入若干事务，记录最后一次分配的 commit_ts
+    {
+        Database db(dir->path());
+        auto s = std::make_shared<Session>();
+        ASSERT_TRUE(db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)", s).is_success());
+        ASSERT_TRUE(db.execute("BEGIN", s).is_success());
+        ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 10)", s).is_success());
+        ASSERT_TRUE(db.execute("INSERT INTO t VALUES (2, 20)", s).is_success());
+        ASSERT_TRUE(db.execute("COMMIT", s).is_success());
+        ASSERT_TRUE(db.execute("BEGIN", s).is_success());
+        ASSERT_TRUE(db.execute("UPDATE t SET v = 99 WHERE id = 1", s).is_success());
+        ASSERT_TRUE(db.execute("COMMIT", s).is_success());
+    }
+
+    // 2) 直接通过引擎接口扫描磁盘观察到的最大 commit_ts，应为 > 0
+    {
+        auto eng = std::make_unique<LSMTreeEngine>(dir->path());
+        const uint64_t max_ts = eng->max_observed_commit_ts();
+        EXPECT_GT(max_ts, 0u) << "WAL/SSTable should carry persisted commit_ts after V2 plumbing";
+    }
+
+    // 3) 二次启动：Database 构造时必然 bootstrap，next_ts > 已观察值。
+    //    这里通过新事务的 commit 不抛错来侧面验证（具体 ts 内部不可见）。
+    {
+        Database db(dir->path());
+        auto s = std::make_shared<Session>();
+        ASSERT_TRUE(db.execute("BEGIN", s).is_success());
+        ASSERT_TRUE(db.execute("INSERT INTO t VALUES (3, 30)", s).is_success());
+        ASSERT_TRUE(db.execute("COMMIT", s).is_success());
+        auto r = db.execute("SELECT * FROM t WHERE id = 3", s);
+        ASSERT_TRUE(r.is_success());
+        ASSERT_TRUE(r.rows.has_value());
+        size_t cnt = 0;
+        for (auto&& rec: *r.rows) {
+            (void)rec;
+            ++cnt;
+        }
+        EXPECT_EQ(cnt, 1u);
+    }
+}
+
+TEST_F(MvccBootstrapTest, MaxObservedCommitTsEmptyDirReturnsZero) {
+    auto eng = std::make_unique<LSMTreeEngine>(dir->path());
+    EXPECT_EQ(eng->max_observed_commit_ts(), 0u);
+}
+
+// =====================================================================
+// MVCC 端到端隔离级别测试（T2.4 + T3.1 + T3.2）
+//
+// 验证：BEGIN 之后、其它 session 提交的写不影响：
+//   - REPEATABLE READ：整事务一个 snapshot，看不到并发提交
+//   - READ COMMITTED：每语句一个 snapshot，能看到并发提交
+// =====================================================================
+
+class MvccIsolationTest : public TxnTest {
+protected:
+    void SetUp() override {
+        TxnTest::SetUp();
+        exec_ok("CREATE TABLE t (id INT64, v INT64)");
+        exec_ok("INSERT INTO t VALUES (1, 100)");
+        exec_ok("INSERT INTO t VALUES (2, 200)");
+    }
+};
+
+TEST_F(MvccIsolationTest, RepeatableReadSeesStableSnapshot) {
+    auto reader = std::make_shared<Session>();
+    auto r1 = db->execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", reader);
+    EXPECT_TRUE(r1.is_success());
+    exec_ok_on(reader, "BEGIN");
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t"), 2u);
+
+    // 另一会话 auto-commit 插入新行
+    auto writer = std::make_shared<Session>();
+    auto rw = db->execute("INSERT INTO t VALUES (3, 300)", writer);
+    EXPECT_TRUE(rw.is_success());
+    // sanity：另一连接（auto-commit）能看到新行
+    EXPECT_EQ(count_rows(*db, writer, "SELECT * FROM t"), 3u);
+
+    // RR 事务里的 reader 看到的还应是 BEGIN 时的快照（2 行）
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t"), 2u) << "RR snapshot must remain stable across statements";
+
+    exec_ok_on(reader, "COMMIT");
+    // 提交后再读，得到最新快照（3 行）
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t"), 3u);
+}
+
+TEST_F(MvccIsolationTest, ReadCommittedSeesConcurrentCommit) {
+    auto reader = std::make_shared<Session>();
+    auto r1 = db->execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", reader);
+    EXPECT_TRUE(r1.is_success());
+    exec_ok_on(reader, "BEGIN");
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t"), 2u);
+
+    auto writer = std::make_shared<Session>();
+    auto rw = db->execute("INSERT INTO t VALUES (3, 300)", writer);
+    EXPECT_TRUE(rw.is_success());
+
+    // RC 每语句新 snapshot —— 应看到并发 INSERT
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t"), 3u) << "RC must take fresh snapshot per statement";
+
+    exec_ok_on(reader, "COMMIT");
+}
+
+TEST_F(MvccIsolationTest, RepeatableReadIgnoresConcurrentDeleteAndUpdate) {
+    auto reader = std::make_shared<Session>();
+    db->execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", reader);
+    exec_ok_on(reader, "BEGIN");
+    auto initial = count_rows(*db, reader, "SELECT * FROM t WHERE v = 100");
+    EXPECT_EQ(initial, 1u);
+
+    auto writer = std::make_shared<Session>();
+    db->execute("UPDATE t SET v = 999 WHERE id = 1", writer);
+    db->execute("DELETE FROM t WHERE id = 2", writer);
+
+    // RR 仍然看到旧值
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t WHERE v = 100"), 1u) << "RR ignores concurrent UPDATE";
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t WHERE id = 2"), 1u) << "RR ignores concurrent DELETE";
+    EXPECT_EQ(count_rows(*db, reader, "SELECT * FROM t"), 2u);
+
+    exec_ok_on(reader, "COMMIT");
+}
+
+TEST_F(MvccIsolationTest, AutoCommitInsertVisibleToFreshSelect) {
+    // 验证 auto-commit 路径下 SELECT 走 MVCC 仍正常
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+    exec_ok("INSERT INTO t VALUES (5, 500)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+    exec_ok("DELETE FROM t WHERE id = 1");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1"), 0u);
+}
+
+// =====================================================================
+// SSI（Serializable Snapshot Isolation）测试（T3.4）
+// =====================================================================
+
+TEST_F(MvccIsolationTest, SerializableAbortsOnReadSetConflict) {
+    // 经典 write-skew：A 在 SER 下读 row 1，期间 B auto-commit 改写 row 1，A 提交时应失败
+    auto a = std::make_shared<Session>();
+    EXPECT_TRUE(db->execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", a).is_success());
+    exec_ok_on(a, "BEGIN");
+    // A 读 row 1（进入 read_set）
+    EXPECT_EQ(count_rows(*db, a, "SELECT * FROM t WHERE id = 1"), 1u);
+
+    // 另一会话改写 row 1 并提交
+    auto b = std::make_shared<Session>();
+    EXPECT_TRUE(db->execute("UPDATE t SET v = 999 WHERE id = 1", b).is_success());
+
+    // A 再做点写（确保走 commit 验证路径）
+    EXPECT_TRUE(db->execute("INSERT INTO t VALUES (10, 10)", a).is_success());
+
+    // A 提交应失败（抛异常或返回失败）
+    bool failed = false;
+    try {
+        auto cr = db->execute("COMMIT", a);
+        failed = !cr.is_success();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed) << "SER commit should fail when read-set row was modified by concurrent committer";
+}
+
+TEST_F(MvccIsolationTest, SerializableCommitsWithoutConflict) {
+    auto a = std::make_shared<Session>();
+    EXPECT_TRUE(db->execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", a).is_success());
+    exec_ok_on(a, "BEGIN");
+    EXPECT_EQ(count_rows(*db, a, "SELECT * FROM t WHERE id = 1"), 1u);
+    EXPECT_TRUE(db->execute("INSERT INTO t VALUES (11, 11)", a).is_success());
+    auto cr = db->execute("COMMIT", a);
+    EXPECT_TRUE(cr.is_success());
+}
+
+TEST_F(MvccIsolationTest, RepeatableReadDoesNotValidateReadSet) {
+    // RR 下不做 SSI 验证，同样的 write-skew 模式应能成功 commit
+    auto a = std::make_shared<Session>();
+    EXPECT_TRUE(db->execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", a).is_success());
+    exec_ok_on(a, "BEGIN");
+    EXPECT_EQ(count_rows(*db, a, "SELECT * FROM t WHERE id = 1"), 1u);
+
+    auto b = std::make_shared<Session>();
+    EXPECT_TRUE(db->execute("UPDATE t SET v = 999 WHERE id = 1", b).is_success());
+
+    EXPECT_TRUE(db->execute("INSERT INTO t VALUES (12, 12)", a).is_success());
+    auto cr = db->execute("COMMIT", a);
+    EXPECT_TRUE(cr.is_success()) << "RR must not validate read-set";
+}
+
+// =====================================================================
+// T9.5.1: TransactionManager::min_active_read_ts 单测
+// =====================================================================
+
+TEST(TransactionManagerGcHorizon, NoActiveTxnReturnsNextTs) {
+    TransactionManager tm;
+    const auto a = tm.min_active_read_ts();
+    // 无活跃事务时 horizon = next_ts_，新 begin() 后 horizon 单调推进
+    auto id = tm.begin();
+    EXPECT_GE(*tm.get_read_ts(id), a);
+    tm.commit(id);
+    const auto b = tm.min_active_read_ts();
+    EXPECT_GE(b, a) << "horizon must advance after txn finishes";
+}
+
+TEST(TransactionManagerGcHorizon, SingleActiveReturnsThatReadTs) {
+    TransactionManager tm;
+    auto id = tm.begin();
+    auto rt = *tm.get_read_ts(id);
+    EXPECT_EQ(tm.min_active_read_ts(), rt);
+    tm.commit(id);
+}
+
+TEST(TransactionManagerGcHorizon, MultiActiveReturnsMin) {
+    TransactionManager tm;
+    auto a = tm.begin();
+    auto b = tm.begin();
+    auto c = tm.begin();
+    auto rt_a = *tm.get_read_ts(a);
+    EXPECT_EQ(tm.min_active_read_ts(), rt_a);
+    tm.commit(a);
+    EXPECT_EQ(tm.min_active_read_ts(), *tm.get_read_ts(b));
+    tm.commit(b);
+    EXPECT_EQ(tm.min_active_read_ts(), *tm.get_read_ts(c));
+    tm.commit(c);
+}
+
+
