@@ -336,14 +336,11 @@ namespace corodb {
                 break;
             if (type == 1) {
                 Row row = decode_row(rec, columns, path);
-                int64_t pk = row.values.empty() ? 0 : extract_int_key(row);
+                Value pk = extract_key(row);
                 rows.emplace_back(MemEntry{ pk, std::move(row), false, commit_ts });
             } else if (type == 2) {
-                // Tombstone stores [8B pk] in record bytes; legacy may have len=0.
-                int64_t pk = 0;
-                if (rec.size() >= sizeof(int64_t)) {
-                    std::memcpy(&pk, rec.data(), sizeof(int64_t));
-                }
+                // Tombstone 记录存放 encode_key(pk) 字节串。
+                Value pk = rec.empty() ? Value{ NullValue{} } : decode_key(rec);
                 rows.emplace_back(MemEntry{ pk, Row{}, true, commit_ts });
             }
         }
@@ -436,9 +433,7 @@ namespace corodb {
             uint8_t type = e.tombstone ? 2 : 1;
             std::string rec;
             if (e.tombstone) {
-                rec.assign(sizeof(int64_t), '\0');
-                int64_t pk = e.pk;
-                std::memcpy(rec.data(), &pk, sizeof(int64_t));
+                rec = encode_key(e.pk);
             } else {
                 rec = encode_row(e.row);
             }
@@ -474,19 +469,13 @@ namespace corodb {
         {
             SstFooter footer;
             if (!entries.empty()) {
-                footer.min_pk = entries.front().pk;
-                footer.max_pk = entries.back().pk;
-                // Collect unique pks for bloom filter.
-                std::vector<int64_t> pks;
+                // 收集去重的编码键用于布隆过滤器（entries 已按 pk 排序）。
+                std::vector<std::string> pks;
                 pks.reserve(entries.size());
-                int64_t prev = 0;
-                bool first = true;
                 for (const auto& e: entries) {
-                    if (first || e.pk != prev) {
-                        pks.push_back(e.pk);
-                        prev = e.pk;
-                        first = false;
-                    }
+                    std::string enc = encode_key(e.pk);
+                    if (pks.empty() || pks.back() != enc)
+                        pks.push_back(std::move(enc));
                 }
                 footer.bloom.build(pks);
             }
@@ -561,24 +550,23 @@ namespace corodb {
 
         for (const auto& rec: records) {
             if (rec.type == 2) {
-                if (rec.payload.size() < sizeof(int64_t))
-                    continue;
-                int64_t key = 0;
-                std::memcpy(&key, rec.payload.data(), sizeof(int64_t));
+                // 墓碑（无 ts）：payload = encode_key(pk)
+                Value key = rec.payload.empty() ? Value{ NullValue{} } : decode_key(rec.payload);
                 state->memtable[MVCCKey{ key, 0 }] = MemEntry{ key, Row{}, true, 0 };
             } else if (rec.type == 1) {
                 Row r = decode_row(rec.payload, schema, name);
-                int64_t key = extract_int_key(r);
+                Value key = extract_key(r);
                 state->memtable[MVCCKey{ key, 0 }] = MemEntry{ key, r, false, 0 };
             } else if (rec.type == 12) {
-                if (rec.payload.size() < sizeof(uint64_t) + sizeof(int64_t))
+                // 墓碑（含 ts）：payload = [8B ts][encode_key(pk)]
+                if (rec.payload.size() < sizeof(uint64_t))
                     continue;
                 uint64_t ts = 0;
-                int64_t key = 0;
                 std::memcpy(&ts, rec.payload.data(), sizeof(uint64_t));
-                std::memcpy(&key, rec.payload.data() + sizeof(uint64_t), sizeof(int64_t));
                 if (!ts_committed(ts))
                     continue; // 提交未封口的撕裂删除，丢弃
+                std::string key_bytes = rec.payload.substr(sizeof(uint64_t));
+                Value key = key_bytes.empty() ? Value{ NullValue{} } : decode_key(key_bytes);
                 state->memtable[MVCCKey{ key, ts }] = MemEntry{ key, Row{}, true, ts };
             } else if (rec.type == 11) {
                 if (rec.payload.size() < sizeof(uint64_t))
@@ -589,7 +577,7 @@ namespace corodb {
                     continue; // 提交未封口的撕裂插入，丢弃
                 std::string row_bytes = rec.payload.substr(sizeof(uint64_t));
                 Row r = decode_row(row_bytes, schema, name);
-                int64_t key = extract_int_key(r);
+                Value key = extract_key(r);
                 state->memtable[MVCCKey{ key, ts }] = MemEntry{ key, r, false, ts };
             }
         }
@@ -701,7 +689,7 @@ namespace corodb {
         std::unique_lock lock(state->mutex);     // 独占锁保护表状态
         load_state_locked(state, name, columns); // 加载状态（如果需要）
 
-        int64_t key = extract_int_key(row); // 提取键值
+        Value key = extract_key(row); // 提取主键 Value
 
         std::string rec = encode_row(row);       // 编码行数据（复用于WAL和大小计算）
         const std::size_t rec_size = rec.size(); // 保存编码后的大小
@@ -739,8 +727,8 @@ namespace corodb {
         }
     }
 
-    void LSMTreeEngine::delete_row_by_key(const std::string& name, const std::vector<Column>& columns, int64_t key,
-                                          uint64_t commit_ts) {
+    void LSMTreeEngine::delete_row_by_key(const std::string& name, const std::vector<Column>& columns,
+                                          const Value& key, uint64_t commit_ts) {
         auto* state = get_or_create_state(name);
         std::unique_lock lock(state->mutex);
         load_state_locked(state, name, columns);
@@ -751,16 +739,15 @@ namespace corodb {
         // tombstone 不参与 memtable_bytes 增量（接近零），保持简单
 
         const auto wpath = wal_path(name);
+        std::string enc = encode_key(key);
         if (commit_ts != 0) {
-            // 墓碑：payload = [8B ts][8B key]
-            std::string payload(sizeof(uint64_t) + sizeof(int64_t), '\0');
+            // 墓碑：payload = [8B ts][encode_key(pk)]
+            std::string payload(sizeof(uint64_t), '\0');
             std::memcpy(payload.data(), &commit_ts, sizeof(uint64_t));
-            std::memcpy(payload.data() + sizeof(uint64_t), &key, sizeof(int64_t));
+            payload.append(enc);
             wal_append_record_no_wait(wpath, 12, payload);
         } else {
-            std::string payload(sizeof(int64_t), '\0');
-            std::memcpy(payload.data(), &key, sizeof(int64_t));
-            wal_append_record_no_wait(wpath, 2, payload);
+            wal_append_record_no_wait(wpath, 2, enc);
         }
 
         lock.unlock();
@@ -884,7 +871,7 @@ namespace corodb {
     }
 
     std::optional<Row> LSMTreeEngine::lookup_visible(const std::string& name, const std::vector<Column>& columns,
-                                                     int64_t pk, uint64_t snapshot_ts) {
+                                                     const Value& pk, uint64_t snapshot_ts) {
         load_state_if_needed(name, columns);
         auto* state = get_or_create_state(name);
         std::shared_lock lock(state->mutex);
@@ -930,8 +917,7 @@ namespace corodb {
                 std::shared_lock lf(sst_footer_cache_mutex_);
                 auto fit = sst_footer_cache_.find(abs_p);
                 if (fit != sst_footer_cache_.end() && fit->second.second.valid()) {
-                    if (pk < fit->second.second.min_pk || pk > fit->second.second.max_pk ||
-                        !fit->second.second.bloom.maybe_contains(pk)) {
+                    if (!fit->second.second.bloom.maybe_contains(encode_key(pk))) {
                         continue; // Key definitely not in this SSTable.
                     }
                 }
@@ -940,7 +926,7 @@ namespace corodb {
             auto ptr = read_sstable(p, columns);
             // SST 按 (pk asc, ts desc) 排序：用二分定位 pk 起点，避免 O(N) 线性扫描。
             auto lo = std::lower_bound(ptr->begin(), ptr->end(), pk,
-                                       [](const MemEntry& e, int64_t key) { return e.pk < key; });
+                                       [](const MemEntry& e, const Value& key) { return ValueLess{}(e.pk, key); });
             for (auto it = lo; it != ptr->end() && it->pk == pk; ++it) {
                 if (it->commit_ts <= snapshot_ts) {
                     cands.push_back({ it->commit_ts, it->tombstone, it->row });
@@ -1005,10 +991,10 @@ namespace corodb {
             bool seen{ false };
             Row row;
         };
-        std::map<int64_t, Best> best;
+        std::map<Value, Best, ValueLess> best;
         uint64_t observed_max_commit_ts = 0;
 
-        auto consider = [&](int64_t pk, uint64_t ts, bool tomb, Row&& row) {
+        auto consider = [&](const Value& pk, uint64_t ts, bool tomb, Row&& row) {
             if (ts > observed_max_commit_ts)
                 observed_max_commit_ts = ts;
             if (ts > snapshot_ts)
@@ -1082,7 +1068,7 @@ namespace corodb {
         std::vector<MemEntry> entries;
         entries.reserve(rows.size());
         for (const auto& r: rows) {
-            int64_t pk = r.values.empty() ? 0 : extract_int_key(r);
+            Value pk = extract_key(r);
             entries.push_back(MemEntry{ pk, r, false, 0 });
         }
         write_sstable(base_path(name), columns, entries);
@@ -1199,7 +1185,7 @@ namespace corodb {
      * @param entries 索引条目列表
      */
     void LSMTreeEngine::write_index_rows(const std::string& table, const std::string& column,
-                                         const std::vector<std::pair<Value, int64_t>>& entries) {
+                                         const std::vector<std::pair<Value, Value>>& entries) {
         auto path = index_file_path(base_dir_, table, column); // 获取索引文件路径
         write_index_file(path, entries);                       // 写入索引条目
     }
@@ -1210,7 +1196,7 @@ namespace corodb {
      * O(1) 摊销，避免基类默认实现的“读全量 + 重写全量”（O(n) 每条）开销。
      */
     void LSMTreeEngine::append_index_entry(const std::string& table, const std::string& column, const Value& value,
-                                           int64_t pk) {
+                                           const Value& pk) {
         write_index_file(index_file_path(base_dir_, table, column), { { value, pk } });
     }
 
@@ -1220,8 +1206,8 @@ namespace corodb {
      * @param column 列名
      * @return 索引条目列表
      */
-    std::vector<std::pair<Value, int64_t>> LSMTreeEngine::load_index_rows(const std::string& table,
-                                                                          const std::string& column) const {
+    std::vector<std::pair<Value, Value>> LSMTreeEngine::load_index_rows(const std::string& table,
+                                                                        const std::string& column) const {
         auto path = index_file_path(base_dir_, table, column); // 获取索引文件路径
         return read_index_file(path);                          // 读取并返回索引条目
     }

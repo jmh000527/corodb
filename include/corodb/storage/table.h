@@ -134,7 +134,7 @@ namespace corodb {
         void persist_row_upsert(const Row& row, uint64_t commit_ts = 0);
 
         /** @brief 以增量方式持久化主键删除。 */
-        void persist_row_delete(int64_t key, uint64_t commit_ts = 0);
+        void persist_row_delete(const Value& key, uint64_t commit_ts = 0);
 
         /** @brief 重建当前表的全部索引。 */
         void refresh_indexes();
@@ -156,10 +156,10 @@ namespace corodb {
         [[nodiscard]] bool has_index(const std::string& column) const;
 
         /** @brief 使用列索引查找匹配行的主键集合（去重）。 */
-        [[nodiscard]] std::vector<int64_t> lookup_index(const std::string& column, const Value& key) const;
+        [[nodiscard]] std::vector<Value> lookup_index(const std::string& column, const Value& key) const;
 
         /** @brief 范围查找：返回索引列处于 [low, high]（按 inclusive 标志）区间内的主键集合（去重）。 */
-        [[nodiscard]] std::vector<int64_t> lookup_index_range(const std::string& column,
+        [[nodiscard]] std::vector<Value> lookup_index_range(const std::string& column,
                                                               const std::optional<Value>& low, bool low_inclusive,
                                                               const std::optional<Value>& high,
                                                               bool high_inclusive) const;
@@ -172,7 +172,7 @@ namespace corodb {
         [[nodiscard]] std::vector<Row> scan_visible(uint64_t snapshot_ts) const;
 
         /** @brief 读取给定快照时间点主键可见的最新版本。 */
-        [[nodiscard]] std::optional<Row> lookup_visible(int64_t pk, uint64_t snapshot_ts) const;
+        [[nodiscard]] std::optional<Row> lookup_visible(const Value& pk, uint64_t snapshot_ts) const;
 
         /** @brief 返回可变行缓存；调用方负责维护索引一致性。 */
         [[nodiscard]] std::vector<Row>& rows_mut() noexcept {
@@ -213,7 +213,7 @@ namespace corodb {
 
         std::unordered_set<std::string> indexed_columns_;
         /// 二级索引：列名 → (列值 → 主键)，有序 multimap（支持等值与范围查找），与内存行缓存解耦。
-        std::unordered_map<std::string, std::multimap<Value, int64_t, ValueLess>> indexes_;
+        std::unordered_map<std::string, std::multimap<Value, Value, ValueLess>> indexes_;
         std::unordered_map<std::string, std::string> index_name_registry_; ///< 索引名 → 列名
 
         void index_row(const Row& row);

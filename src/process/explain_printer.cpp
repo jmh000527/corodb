@@ -148,7 +148,15 @@ namespace corodb {
             }
             if (const auto* idx = dynamic_cast<const IndexScanPlan*>(plan)) {
                 oss << in << "Index Scan on " << idx->table->name() << "\n";
-                if (!idx->is_range) {
+                if (idx->is_in) {
+                    oss << ai << "Index Cond: (" << idx->column << " IN (";
+                    for (std::size_t i = 0; i < idx->in_keys.size(); ++i) {
+                        if (i)
+                            oss << ", ";
+                        oss << value_to_string(idx->in_keys[i]);
+                    }
+                    oss << "))\n";
+                } else if (!idx->is_range) {
                     oss << ai << "Index Cond: (" << idx->column << " = " << value_to_string(idx->key) << ")\n";
                 } else {
                     oss << ai << "Index Cond: (";

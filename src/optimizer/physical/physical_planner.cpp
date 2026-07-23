@@ -249,6 +249,30 @@ namespace corodb::opt {
             }
         }
 
+        // col IN (v1, v2, ...) → 多个等值点查的并集 IndexScan（列已建索引且值均为字面量）。
+        if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::In &&
+            f.predicate.in_expr.has_value() && !f.predicate.in_expr->negated) {
+            const auto& scan = std::get<LogicalScan>(f.child->node);
+            const auto& ie = *f.predicate.in_expr;
+            const auto* col = std::get_if<ColumnRef>(&ie.expr);
+            if (col && scan.table && !ie.values.empty() && scan.table->indexed_columns().count(col->name) > 0) {
+                std::vector<Value> keys;
+                keys.reserve(ie.values.size());
+                bool all_lit = true;
+                for (const auto& e: ie.values) {
+                    if (const auto* lit = std::get_if<Literal>(&e)) {
+                        keys.push_back(lit->value);
+                    } else {
+                        all_lit = false;
+                        break;
+                    }
+                }
+                if (all_lit) {
+                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(keys));
+                }
+            }
+        }
+
         auto child = visit(*f.child);
         return std::make_unique<FilterPlan>(std::move(child), f.predicate);
     }

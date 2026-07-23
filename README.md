@@ -849,7 +849,7 @@ PageHeader (18 bytes):
 +-----------+----------+-------------------+
 | SIDX (4)  | Count(4) | Entries...        |
 +-----------+----------+-------------------+
-Entry: value(tag+data) + 主键 pk(8)
+Entry: value(tag+data) + 主键 pk（write_value 变长编码，支持 int64/字符串/浮点）
 
 有序二级索引存 (列值 → 主键) 超集：写入即追加一条 Entry，读取合并所有 Chunk；
 IndexScan 用 lookup_visible + 可见性重查过滤陈旧条目（MVCC 正确，支持等值与范围）。
@@ -1018,7 +1018,7 @@ cd build && ctest -j8
 
 ### 已完成
 
-**存储引擎** — LSM-Tree (MemTable + SSTable L0-L3 + WAL)、Buffer Pool (Clock + 16-shard)、内核级 fsync（默认 durable）、SSTable 原子写入、WAL 记录校验和、Bloom Filter + key range 页脚、增量索引写入、SSTable 解码缓存 LRU、全层级 GC、WAL 全局提交日志 + 崩溃原子恢复（含跨表事务）、CHECKPOINT 提交日志 GC
+**存储引擎** — LSM-Tree (MemTable + SSTable L0-L3 + WAL)、Buffer Pool (Clock + 16-shard)、内核级 fsync（默认 durable）、SSTable 原子写入、WAL 记录校验和、Bloom Filter + key range 页脚、增量索引写入、SSTable 解码缓存 LRU、全层级 GC、WAL 全局提交日志 + 崩溃原子恢复（含跨表事务）、CHECKPOINT 提交日志 GC、主键泛化（int64/字符串/浮点任意标量）
 
 **查询引擎** — SQL 解析器、Volcano 协程执行器、两段式优化器（5 条重写规则）、MergeJoin 预排序优化、EXPLAIN + EXPLAIN ANALYZE、查询超时、LRU 计划缓存、Float64 类型 + AVG() 浮点、字符串转义、等值/范围 IndexScan（value→主键有序二级索引）、写入约束强制（NOT NULL/类型/主键唯一）
 

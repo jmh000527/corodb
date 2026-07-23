@@ -58,7 +58,7 @@ namespace corodb {
          * 由 Database::execute 的 catch 块 mark_failed。
          */
         inline void txn_acquire_row_lock(const ExecutionContext& ctx, uint64_t txn_id, const std::string& table,
-                                         int64_t pk) {
+                                         const Value& pk) {
             auto* locks = ctx.row_locks;
             if (!locks)
                 return;
@@ -67,8 +67,8 @@ namespace corodb {
                 return;
             if (*owner == txn_id)
                 return;
-            throw WriteConflictError("ERROR: write-write conflict on " + table + " pk=" + std::to_string(pk) +
-                                     " (locked by txn " + std::to_string(*owner) + ")");
+            throw WriteConflictError("ERROR: write-write conflict on " + table + " (locked by txn " +
+                                     std::to_string(*owner) + ")");
         }
 
         /**
@@ -100,10 +100,10 @@ namespace corodb {
         }
 
         /** @brief 提取一行的 int64 主键（约定首列）；非 int64 首列返回 nullopt（无主键表）。 */
-        inline std::optional<int64_t> row_pk(const Row& row) {
-            if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+        inline std::optional<Value> row_pk(const Row& row) {
+            if (row.values.empty())
                 return std::nullopt;
-            return std::get<int64_t>(row.values.front());
+            return row.values.front();
         }
 
         /**
@@ -324,7 +324,7 @@ namespace corodb {
         }
 
         // snapshot_ts 生效时走快照读路径，既覆盖事务内一致性，也覆盖自动提交查询。
-        std::unordered_set<int64_t> emitted_buffer_keys;
+        std::unordered_set<Value, ValueHash, ValueEq> emitted_buffer_keys;
         const uint64_t snapshot_ts = sess ? sess->snapshot_ts : 0;
         const bool use_mvcc = snapshot_ts != 0 && sess;
         // 只有 SERIALIZABLE 隔离才记录读集，提交阶段再做验证。
@@ -336,16 +336,16 @@ namespace corodb {
         auto record_read_pk = [&](const Row& row) {
             if (!track_read_set)
                 return;
-            if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+            if (row.values.empty())
                 return;
-            sess->read_set[plan.table->name()].insert(std::get<int64_t>(row.values.front()));
+            sess->read_set[plan.table->name()].insert(row.values.front());
         };
         if (use_mvcc) {
             auto rows = plan.table->scan_visible(snapshot_ts);
             check_timeout(ctx);
             for (const auto& row: rows) {
-                if (buf && !row.values.empty() && std::holds_alternative<int64_t>(row.values.front())) {
-                    int64_t pk = std::get<int64_t>(row.values.front());
+                if (buf && !row.values.empty()) {
+                    const Value& pk = row.values.front();
                     if (buf->deletes.count(pk))
                         continue;
                     auto it = buf->upserts.find(pk);
@@ -363,8 +363,8 @@ namespace corodb {
         } else {
             check_timeout(ctx);
             for (const auto& row: plan.table->rows()) {
-                if (buf && !row.values.empty() && std::holds_alternative<int64_t>(row.values.front())) {
-                    int64_t pk = std::get<int64_t>(row.values.front());
+                if (buf && !row.values.empty()) {
+                    const Value& pk = row.values.front();
                     if (buf->deletes.count(pk))
                         continue;
                     auto it = buf->upserts.find(pk);
@@ -428,9 +428,9 @@ namespace corodb {
             auto record_idx_read = [&](const Row& row) {
                 if (!track_read_set)
                     return;
-                if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+                if (row.values.empty())
                     return;
-                sess->read_set[idx->table->name()].insert(std::get<int64_t>(row.values.front()));
+                sess->read_set[idx->table->name()].insert(row.values.front());
             };
 
             // 索引列在表中的下标（用于可见性重查过滤陈旧超集条目）。
@@ -440,6 +440,12 @@ namespace corodb {
 
             // 索引键匹配判定：等值用 ValueEq；范围用 low/high + inclusive。
             auto matches = [&](const Value& v) -> bool {
+                if (idx->is_in) {
+                    for (const auto& k: idx->in_keys)
+                        if (ValueEq{}(v, k))
+                            return true;
+                    return false;
+                }
                 if (!idx->is_range)
                     return ValueEq{}(v, idx->key);
                 if (idx->low.has_value()) {
@@ -461,12 +467,25 @@ namespace corodb {
                 return true;
             };
             // 通过索引取候选主键；对每个 pk 做可见性重查 + 键匹配重查。
-            auto pks = idx->is_range ? idx->table->lookup_index_range(idx->column, idx->low, idx->low_inclusive,
-                                                                      idx->high, idx->high_inclusive)
-                                     : idx->table->lookup_index(idx->column, idx->key);
-            std::unordered_set<int64_t> emitted;
+            std::vector<Value> pks;
+            if (idx->is_in) {
+                // IN：多个等值点查的并集（去重）。
+                std::unordered_set<Value, ValueHash, ValueEq> seen_pk;
+                for (const auto& k: idx->in_keys) {
+                    for (const auto& p: idx->table->lookup_index(idx->column, k)) {
+                        if (seen_pk.insert(p).second)
+                            pks.push_back(p);
+                    }
+                }
+            } else if (idx->is_range) {
+                pks = idx->table->lookup_index_range(idx->column, idx->low, idx->low_inclusive, idx->high,
+                                                     idx->high_inclusive);
+            } else {
+                pks = idx->table->lookup_index(idx->column, idx->key);
+            }
+            std::unordered_set<Value, ValueHash, ValueEq> emitted;
             check_timeout(ctx);
-            for (int64_t pk: pks) {
+            for (const Value& pk: pks) {
                 if (buf) {
                     if (buf->deletes.count(pk)) {
                         emitted.insert(pk);
@@ -1427,21 +1446,18 @@ namespace corodb {
             if (auto* sess = ctx.session.get(); sess && sess->in_transaction()) {
                 auto& tbuf = sess->write_buffer.for_table(ins->table->name());
                 for (auto& r: batch_rows) {
-                    if (r.values.empty() || !std::holds_alternative<int64_t>(r.values.front())) {
-                        // 无 int64 主键的表：当前实现仅支持有主键表的事务隔离，
-                        // 否则直接落表（不参与 ROLLBACK）。绝大多数场景表都有主键。
+                    if (r.values.empty()) {
+                        // 无主键列的表：直接落表（不参与 ROLLBACK）。
                         ins->table->insert_batch({ std::move(r) });
                         continue;
                     }
-                    int64_t pk = std::get<int64_t>(r.values.front());
+                    Value pk = r.values.front();
                     // 主键唯一性：本事务已删除该 pk 则允许重插；否则缓冲已有或已提交可见即为重复键。
                     if (tbuf.deletes.count(pk) == 0) {
                         if (tbuf.upserts.count(pk) > 0)
-                            throw std::runtime_error("ERROR: duplicate key in transaction: pk=" +
-                                                     std::to_string(pk));
+                            throw std::runtime_error("ERROR: duplicate key in transaction");
                         if (ins->table->lookup_visible(pk, std::numeric_limits<uint64_t>::max()).has_value())
-                            throw std::runtime_error("ERROR: duplicate key violates primary key: pk=" +
-                                                     std::to_string(pk));
+                            throw std::runtime_error("ERROR: duplicate key violates primary key");
                     }
                     // 写写冲突检测失败时立即中止当前事务。
                     txn_acquire_row_lock(ctx, sess->current_txn_id, ins->table->name(), pk);
@@ -1453,16 +1469,15 @@ namespace corodb {
 
             // 自动提交路径：主键唯一性校验（本批次内部 + 与已提交数据），再批量插入。
             {
-                std::unordered_set<int64_t> seen_pks;
+                std::unordered_set<Value, ValueHash, ValueEq> seen_pks;
                 for (const auto& r: batch_rows) {
                     auto pk = row_pk(r);
                     if (!pk.has_value())
                         continue;
                     if (!seen_pks.insert(*pk).second)
-                        throw std::runtime_error("ERROR: duplicate key in INSERT: pk=" + std::to_string(*pk));
+                        throw std::runtime_error("ERROR: duplicate key in INSERT");
                     if (ins->table->lookup_visible(*pk, std::numeric_limits<uint64_t>::max()).has_value())
-                        throw std::runtime_error("ERROR: duplicate key violates primary key: pk=" +
-                                                 std::to_string(*pk));
+                        throw std::runtime_error("ERROR: duplicate key violates primary key");
                 }
             }
             // 使用批量插入（对支持优化的存储引擎更高效）
@@ -1502,9 +1517,9 @@ namespace corodb {
 
                 // 扫 rows_：跳过 buffer 标删的 pk，buffer 里有 upsert 的 pk 用 buffer 版
                 for (const auto& base_row: upd->table->rows()) {
-                    if (base_row.values.empty() || !std::holds_alternative<int64_t>(base_row.values.front()))
+                    if (base_row.values.empty())
                         continue;
-                    int64_t pk = std::get<int64_t>(base_row.values.front());
+                    Value pk = base_row.values.front();
                     if (tbuf.deletes.count(pk))
                         continue;
                     auto upsert_it = tbuf.upserts.find(pk);
@@ -1516,19 +1531,19 @@ namespace corodb {
                     }
                 }
                 // 还要扫 buffer 里"纯 INSERT"（pk 不在 rows_）的条目：避免 update 漏掉自己刚 INSERT 的行
-                std::vector<int64_t> pure_inserts;
+                std::vector<Value> pure_inserts;
                 {
-                    std::unordered_set<int64_t> rows_pk;
+                    std::unordered_set<Value, ValueHash, ValueEq> rows_pk;
                     for (const auto& r: upd->table->rows()) {
-                        if (!r.values.empty() && std::holds_alternative<int64_t>(r.values.front()))
-                            rows_pk.insert(std::get<int64_t>(r.values.front()));
+                        if (!r.values.empty())
+                            rows_pk.insert(r.values.front());
                     }
                     for (const auto& [pk, _]: tbuf.upserts) {
                         if (!rows_pk.count(pk))
                             pure_inserts.push_back(pk);
                     }
                 }
-                for (int64_t pk: pure_inserts) {
+                for (const Value& pk: pure_inserts) {
                     auto it = tbuf.upserts.find(pk);
                     if (it == tbuf.upserts.end())
                         continue;
@@ -1588,9 +1603,9 @@ namespace corodb {
 
                 // 扫 rows_：标记 deletes
                 for (const auto& base_row: del->table->rows()) {
-                    if (base_row.values.empty() || !std::holds_alternative<int64_t>(base_row.values.front()))
+                    if (base_row.values.empty())
                         continue;
-                    int64_t pk = std::get<int64_t>(base_row.values.front());
+                    Value pk = base_row.values.front();
                     if (tbuf.deletes.count(pk))
                         continue;
                     auto upsert_it = tbuf.upserts.find(pk);
@@ -1603,19 +1618,19 @@ namespace corodb {
                     }
                 }
                 // 扫 buffer 里纯 INSERT 的行
-                std::vector<int64_t> to_remove_inserts;
+                std::vector<Value> to_remove_inserts;
                 {
-                    std::unordered_set<int64_t> rows_pk;
+                    std::unordered_set<Value, ValueHash, ValueEq> rows_pk;
                     for (const auto& r: del->table->rows()) {
-                        if (!r.values.empty() && std::holds_alternative<int64_t>(r.values.front()))
-                            rows_pk.insert(std::get<int64_t>(r.values.front()));
+                        if (!r.values.empty())
+                            rows_pk.insert(r.values.front());
                     }
                     for (const auto& [pk, row]: tbuf.upserts) {
                         if (!rows_pk.count(pk) && matches(row))
                             to_remove_inserts.push_back(pk);
                     }
                 }
-                for (int64_t pk: to_remove_inserts) {
+                for (const Value& pk: to_remove_inserts) {
                     tbuf.upserts.erase(pk);
                     // 纯 INSERT 撤销不需要写 deletes（rows_ 中本就没有这条）
                 }
@@ -1624,7 +1639,7 @@ namespace corodb {
 
             // 自动提交路径
             auto& rows = del->table->rows_mut();
-            std::vector<int64_t> deleted_keys;
+            std::vector<Value> deleted_keys;
             deleted_keys.reserve(rows.size());
             std::erase_if(rows, [&](const Row& row) -> bool {
                 if (del->where.has_value()) {
@@ -1632,12 +1647,12 @@ namespace corodb {
                     if (evaluate_bool_expr(*del->where, rec) != SqlBool::True)
                         return false;
                 }
-                if (!row.values.empty() && std::holds_alternative<int64_t>(row.values.front())) {
-                    deleted_keys.push_back(std::get<int64_t>(row.values.front()));
+                if (!row.values.empty()) {
+                    deleted_keys.push_back(row.values.front());
                 }
                 return true;
             });
-            for (int64_t k: deleted_keys) {
+            for (const Value& k: deleted_keys) {
                 uint64_t ts = sess ? sess->auto_commit_ts : 0;
                 del->table->persist_row_delete(k, ts);
             }

@@ -131,15 +131,23 @@ namespace corodb {
               high_inclusive(high_inc) {
         }
 
+        /** @brief 构造 IN 索引扫描计划节点（多个等值键的并集）。 */
+        IndexScanPlan(std::shared_ptr<Table> t, std::string alias_name, std::string col, std::vector<Value> keys)
+            : table(std::move(t)), alias(std::move(alias_name)), column(std::move(col)), is_in(true),
+              in_keys(std::move(keys)) {
+        }
+
         std::shared_ptr<Table> table;    ///< 要扫描的表
         std::string alias;               ///< 表的别名
         std::string column;              ///< 索引列名
-        Value key;                       ///< 等值键（is_range=false 时使用）
+        Value key;                       ///< 等值键（is_range/is_in 均为 false 时使用）
         bool is_range{ false };          ///< 是否为范围扫描
         std::optional<Value> low;        ///< 范围下界（nullopt=无下界）
         bool low_inclusive{ false };     ///< 下界是否含等
         std::optional<Value> high;       ///< 范围上界（nullopt=无上界）
         bool high_inclusive{ false };    ///< 上界是否含等
+        bool is_in{ false };             ///< 是否为 IN 多键扫描
+        std::vector<Value> in_keys;      ///< IN 值列表（is_in=true 时使用）
     };
 
     /** @brief 过滤计划节点，保留满足谓词的记录。 */

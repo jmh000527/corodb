@@ -14,7 +14,7 @@ namespace corodb {
      * @param txn_id 请求锁的事务 ID。
      * @return 若获取成功返回 nullopt；若锁已被他人持有，返回当前持有者的 txn_id。
      */
-    std::optional<uint64_t> RowLockManager::try_acquire(const std::string& table, int64_t pk, uint64_t txn_id) {
+    std::optional<uint64_t> RowLockManager::try_acquire(const std::string& table, const Value& pk, uint64_t txn_id) {
         std::scoped_lock lk(mu_);
         auto& row_map = by_row_[table];
         auto it = row_map.find(pk);

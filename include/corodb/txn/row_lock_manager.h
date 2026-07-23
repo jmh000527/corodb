@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "corodb/storage/table.h" // Value, ValueHash, ValueEq
+
 namespace corodb {
 
     /** @brief 线程安全的行级写意向锁管理器。 */
@@ -22,7 +24,7 @@ namespace corodb {
         RowLockManager& operator=(const RowLockManager&) = delete;
 
         /** @brief 尝试为 `(table, pk)` 申请写锁。 */
-        std::optional<uint64_t> try_acquire(const std::string& table, int64_t pk, uint64_t txn_id);
+        std::optional<uint64_t> try_acquire(const std::string& table, const Value& pk, uint64_t txn_id);
 
         /** @brief 释放某个事务持有的全部行锁。 */
         void release_all(uint64_t txn_id);
@@ -32,8 +34,8 @@ namespace corodb {
 
     private:
         mutable std::mutex mu_;
-        std::unordered_map<std::string, std::unordered_map<int64_t, uint64_t>> by_row_;
-        std::unordered_map<uint64_t, std::vector<std::pair<std::string, int64_t>>> by_txn_;
+        std::unordered_map<std::string, std::unordered_map<Value, uint64_t, ValueHash, ValueEq>> by_row_;
+        std::unordered_map<uint64_t, std::vector<std::pair<std::string, Value>>> by_txn_;
     };
 
 } // namespace corodb

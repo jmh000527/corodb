@@ -97,7 +97,7 @@ namespace corodb {
          * @param columns 列定义（用于 fallback / 加载状态）
          * @param key   要删除的主键
          */
-        virtual void delete_row_by_key(const std::string& name, const std::vector<Column>& columns, int64_t key,
+        virtual void delete_row_by_key(const std::string& name, const std::vector<Column>& columns, const Value& key,
                                        uint64_t commit_ts = 0);
 
         /**
@@ -116,7 +116,7 @@ namespace corodb {
          * 支持多版本的引擎（LSM）应 override。
          */
         [[nodiscard]] virtual std::optional<Row>
-        lookup_visible(const std::string& name, const std::vector<Column>& columns, int64_t pk, uint64_t snapshot_ts);
+        lookup_visible(const std::string& name, const std::vector<Column>& columns, const Value& pk, uint64_t snapshot_ts);
 
         /**
          * @brief MVCC 全表扫描：返回 snapshot_ts 时刻每个 pk 可见的最新版本。
@@ -160,20 +160,20 @@ namespace corodb {
          * @throws std::runtime_error 若索引文件不存在或写入失败。
          */
         virtual void write_index_rows(const std::string& table, const std::string& column,
-                                      const std::vector<std::pair<Value, int64_t>>& entries) = 0;
+                                      const std::vector<std::pair<Value, Value>>& entries) = 0;
 
         /**
          * @brief 追加单个索引条目（值→主键，增量追加）。
          * @note 默认实现通过重写全量索引实现，子类可覆盖为真正的增量追加。
          */
         virtual void append_index_entry(const std::string& table, const std::string& column, const Value& value,
-                                        int64_t pk);
+                                        const Value& pk);
 
         /**
          * @brief 加载所有索引条目。
          * @throws std::runtime_error 若索引不存在或数据损坏。
          */
-        [[nodiscard]] virtual std::vector<std::pair<Value, int64_t>>
+        [[nodiscard]] virtual std::vector<std::pair<Value, Value>>
         load_index_rows(const std::string& table, const std::string& column) const = 0;
 
         /**

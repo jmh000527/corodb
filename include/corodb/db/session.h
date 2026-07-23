@@ -23,8 +23,8 @@ namespace corodb {
 
     /** @brief 单表的事务私有写缓冲。 */
     struct TableTxnBuffer {
-        std::unordered_map<int64_t, Row> upserts;
-        std::unordered_set<int64_t> deletes;
+        std::unordered_map<Value, Row, ValueHash, ValueEq> upserts;
+        std::unordered_set<Value, ValueHash, ValueEq> deletes;
 
         bool empty() const noexcept {
             return upserts.empty() && deletes.empty();
@@ -61,7 +61,7 @@ namespace corodb {
         TxnWriteBuffer write_buffer;       ///< 事务私有写缓冲（COMMIT 时批量应用）
         uint64_t snapshot_ts{ 0 };         ///< 当前快照时间戳（MVCC 读取可见性）
         uint64_t auto_commit_ts{ 0 };      ///< 自动提交写操作的时间戳
-        std::unordered_map<std::string, std::unordered_set<int64_t>> read_set; ///< Serializable 读集（PK 级）
+        std::unordered_map<std::string, std::unordered_set<Value, ValueHash, ValueEq>> read_set; ///< Serializable 读集（PK 级）
         /// Serializable 幻读防护：记录各表在读取时的 write_version。
         std::unordered_map<std::string, uint64_t> table_read_versions;
         uint64_t statement_timeout_ms{ 0 }; ///< 0 = 无超时

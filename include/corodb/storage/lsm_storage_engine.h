@@ -75,7 +75,7 @@ namespace corodb {
                            const std::vector<Row>& rows) override;
 
         /** @brief 以 tombstone 形式按主键删除一行。 */
-        void delete_row_by_key(const std::string& name, const std::vector<Column>& columns, int64_t key,
+        void delete_row_by_key(const std::string& name, const std::vector<Column>& columns, const Value& key,
                                uint64_t commit_ts = 0) override;
 
         /** @brief 扫描磁盘文件并返回当前可见的最大 commit_ts。 */
@@ -83,7 +83,7 @@ namespace corodb {
 
         /** @brief 点查 snapshot_ts 时刻可见的主键版本。 */
         [[nodiscard]] std::optional<Row> lookup_visible(const std::string& name, const std::vector<Column>& columns,
-                                                        int64_t pk, uint64_t snapshot_ts) override;
+                                                        const Value& pk, uint64_t snapshot_ts) override;
 
         /** @brief 扫描 snapshot_ts 时刻整表可见的数据。 */
         [[nodiscard]] std::vector<Row> scan_visible(const std::string& name, const std::vector<Column>& columns,
@@ -106,14 +106,14 @@ namespace corodb {
 
         /** @brief 批量写入索引条目。 */
         void write_index_rows(const std::string& table, const std::string& column,
-                              const std::vector<std::pair<Value, int64_t>>& entries) override;
+                              const std::vector<std::pair<Value, Value>>& entries) override;
 
         /** @brief 增量追加单个索引条目（value→pk），追加一个单条 chunk。 */
         void append_index_entry(const std::string& table, const std::string& column, const Value& value,
-                                int64_t pk) override;
+                                const Value& pk) override;
 
         /** @brief 加载全部索引条目。 */
-        [[nodiscard]] std::vector<std::pair<Value, int64_t>>
+        [[nodiscard]] std::vector<std::pair<Value, Value>>
         load_index_rows(const std::string& table, const std::string& column) const override;
 
         /** @brief 持久化索引名注册表（index_name → column）。 */
@@ -143,7 +143,7 @@ namespace corodb {
 
         /** @brief MemTable 中的单个版本条目。 */
         struct MemEntry {
-            int64_t pk{ 0 };
+            Value pk{};
             Row row;
             bool tombstone{ false };
             uint64_t commit_ts{ 0 };
@@ -151,15 +151,18 @@ namespace corodb {
 
         /** @brief MemTable 中用于排序版本的复合键。 */
         struct MVCCKey {
-            int64_t pk{ 0 };
+            Value pk{};
             uint64_t commit_ts{ 0 };
         };
 
         struct MVCCKeyCompare {
             using is_transparent = void;
             bool operator()(const MVCCKey& a, const MVCCKey& b) const noexcept {
-                if (a.pk != b.pk)
-                    return a.pk < b.pk;
+                ValueLess lt;
+                if (lt(a.pk, b.pk))
+                    return true;
+                if (lt(b.pk, a.pk))
+                    return false;
                 return a.commit_ts > b.commit_ts; // newer first within same pk
             }
         };

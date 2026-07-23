@@ -20,8 +20,8 @@ namespace corodb {
     /**
      * @brief 按主键删除行（默认为空操作；不支持增量删除的引擎可忽略此调用）。
      */
-    void StorageEngine::delete_row_by_key(const std::string& name, const std::vector<Column>& columns, int64_t key,
-                                          uint64_t commit_ts) {
+    void StorageEngine::delete_row_by_key(const std::string& name, const std::vector<Column>& columns,
+                                          const Value& key, uint64_t commit_ts) {
         // 默认实现为空操作；不支持增量删除的引擎可忽略此调用
         (void)name;
         (void)columns;
@@ -40,13 +40,11 @@ namespace corodb {
      * @brief 按主键点查可见行（默认退化为全表扫描，不感知 snapshot_ts）。
      */
     std::optional<Row> StorageEngine::lookup_visible(const std::string& name, const std::vector<Column>& columns,
-                                                     int64_t pk, uint64_t /*snapshot_ts*/) {
+                                                     const Value& pk, uint64_t /*snapshot_ts*/) {
         // 默认退化为全表扫描，不感知 snapshot_ts
         for (const auto& r: load_rows(name, columns)) {
-            if (!r.values.empty()) {
-                if (auto k = std::get_if<int64_t>(&r.values.front()); k && *k == pk) {
-                    return r;
-                }
+            if (!r.values.empty() && ValueEq{}(r.values.front(), pk)) {
+                return r;
             }
         }
         return std::nullopt;
@@ -64,7 +62,7 @@ namespace corodb {
      * @brief 追加索引条目（默认实现：全量重写；子类可覆盖为增量追加）。
      */
     void StorageEngine::append_index_entry(const std::string& table, const std::string& column, const Value& value,
-                                           int64_t pk) {
+                                           const Value& pk) {
         // 默认实现：加载现有条目，追加后全量重写；子类可覆盖为增量追加
         auto entries = load_index_rows(table, column);
         entries.emplace_back(value, pk);

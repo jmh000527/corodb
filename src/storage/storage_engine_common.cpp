@@ -677,6 +677,32 @@ namespace corodb::storage_internal {
     }
 
     /**
+     * @brief 提取一行的主键 Value（约定首列；空行返回 NULL）。
+     */
+    Value extract_key(const Row& row) {
+        if (row.values.empty())
+            return Value{ NullValue{} };
+        return row.values.front();
+    }
+
+    /**
+     * @brief 将主键 Value 编码为字节串（复用 write_value）。
+     */
+    std::string encode_key(const Value& key) {
+        std::ostringstream oss(std::ios::binary);
+        write_value(oss, key);
+        return oss.str();
+    }
+
+    /**
+     * @brief 从字节串解码主键 Value（与 encode_key 对应）。
+     */
+    Value decode_key(const std::string& bytes) {
+        std::istringstream iss(bytes, std::ios::binary);
+        return read_value(iss);
+    }
+
+    /**
      * @brief 构造索引文件的完整路径（base_dir/table.column.idx）。
      */
     std::string index_file_path(const std::string& base_dir, const std::string& table, const std::string& column) {
@@ -691,7 +717,7 @@ namespace corodb::storage_internal {
      * 每批写入一个独立的"chunk"：[header] magic + chunk_count + entries。
      * 读取时合并所有 chunk，相同 (col_value) 取最后出现的 rowid。
      */
-    void write_index_file(const std::string& path, const std::vector<std::pair<Value, int64_t>>& entries) {
+    void write_index_file(const std::string& path, const std::vector<std::pair<Value, Value>>& entries) {
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
         // Create empty index file even when entries is empty (for create_index_file).
         if (entries.empty()) {
@@ -712,8 +738,7 @@ namespace corodb::storage_internal {
         ofs.write(reinterpret_cast<char*>(&count), sizeof(count));
         for (const auto& [val, pk]: entries) {
             write_value(ofs, val);
-            int64_t pk_out = pk;
-            ofs.write(reinterpret_cast<char*>(&pk_out), sizeof(pk_out));
+            write_value(ofs, pk);
         }
         ofs.flush();
         if (!ofs)
@@ -726,8 +751,8 @@ namespace corodb::storage_internal {
      * 返回全部 (value, pk) 对（不按 value 去重），形成“超集”索引：同一 pk 历史上的
      * 每个值都保留，IndexScan 在查询时用可见性重查过滤陈旧条目，从而在 MVCC 下保持正确。
      */
-    std::vector<std::pair<Value, int64_t>> read_index_file(const std::string& path) {
-        std::vector<std::pair<Value, int64_t>> out;
+    std::vector<std::pair<Value, Value>> read_index_file(const std::string& path) {
+        std::vector<std::pair<Value, Value>> out;
         std::ifstream ifs(path, std::ios::binary);
         if (!ifs)
             return out;
@@ -740,11 +765,12 @@ namespace corodb::storage_internal {
                 break;
             for (uint32_t i = 0; i < count; ++i) {
                 auto v = read_value(ifs);
-                int64_t pk = 0;
-                ifs.read(reinterpret_cast<char*>(&pk), sizeof(pk));
                 if (!ifs)
                     break;
-                out.emplace_back(std::move(v), pk);
+                auto pk = read_value(ifs);
+                if (!ifs)
+                    break;
+                out.emplace_back(std::move(v), std::move(pk));
             }
         }
         return out;
@@ -765,15 +791,14 @@ namespace corodb::storage_internal {
         ofs.write(reinterpret_cast<char*>(&count), sizeof(count));
         for (const auto& [val, pk]: entries) {
             write_value(ofs, val);
-            int64_t pk_out = pk;
-            ofs.write(reinterpret_cast<char*>(&pk_out), sizeof(pk_out));
+            write_value(ofs, pk);
         }
         ofs.flush();
     }
 
     // ---- BloomFilter ----
 
-    void BloomFilter::build(const std::vector<int64_t>& keys) {
+    void BloomFilter::build(const std::vector<std::string>& keys) {
         if (keys.empty())
             return;
         // ~2% false positive rate: 8 bits per key.
@@ -781,7 +806,7 @@ namespace corodb::storage_internal {
         if (size_ < 64)
             size_ = 64;
         bits_.assign((size_ + 7) / 8, 0);
-        for (int64_t k: keys) {
+        for (const std::string& k: keys) {
             auto [h1, h2] = hash(k);
             for (uint8_t i = 0; i < num_hashes_; ++i) {
                 uint64_t h = h1 + i * h2;
@@ -791,7 +816,7 @@ namespace corodb::storage_internal {
         }
     }
 
-    bool BloomFilter::maybe_contains(int64_t key) const noexcept {
+    bool BloomFilter::maybe_contains(const std::string& key) const noexcept {
         if (bits_.empty())
             return true; // Empty filter = don't skip.
         auto [h1, h2] = hash(key);
@@ -804,7 +829,7 @@ namespace corodb::storage_internal {
         return true;
     }
 
-    std::pair<uint64_t, uint64_t> BloomFilter::hash(int64_t key) const noexcept {
+    std::pair<uint64_t, uint64_t> BloomFilter::hash(const std::string& key) const noexcept {
         // FNV-1a double hashing.
         uint64_t h1 = 14695981039346656037ULL;
         uint64_t h2 = 14695981039346656037ULL;
@@ -812,8 +837,8 @@ namespace corodb::storage_internal {
             h ^= byte;
             h *= 1099511628211ULL;
         };
-        for (int i = 0; i < 8; ++i) {
-            uint8_t b = static_cast<uint8_t>((key >> (i * 8)) & 0xFF);
+        for (unsigned char c: key) {
+            uint8_t b = static_cast<uint8_t>(c);
             mix(h1, b);
             mix(h2, b ^ 0x5A);
         }
@@ -848,8 +873,6 @@ namespace corodb::storage_internal {
         std::string out;
         uint32_t magic = kFooterMagic;
         out.append(reinterpret_cast<const char*>(&magic), sizeof(magic));
-        out.append(reinterpret_cast<const char*>(&min_pk), sizeof(min_pk));
-        out.append(reinterpret_cast<const char*>(&max_pk), sizeof(max_pk));
         uint32_t bloom_len = static_cast<uint32_t>(bloom_data.size());
         out.append(reinterpret_cast<const char*>(&bloom_len), sizeof(bloom_len));
         out.append(bloom_data);
@@ -857,7 +880,7 @@ namespace corodb::storage_internal {
     }
 
     bool SstFooter::deserialize(const std::string& data) {
-        if (data.size() < sizeof(uint32_t) + sizeof(int64_t) * 2 + sizeof(uint32_t))
+        if (data.size() < sizeof(uint32_t) + sizeof(uint32_t))
             return false;
         const char* p = data.data();
         uint32_t magic = 0;
@@ -865,10 +888,6 @@ namespace corodb::storage_internal {
         if (magic != kFooterMagic)
             return false;
         p += sizeof(magic);
-        std::memcpy(&min_pk, p, sizeof(min_pk));
-        p += sizeof(min_pk);
-        std::memcpy(&max_pk, p, sizeof(max_pk));
-        p += sizeof(max_pk);
         uint32_t bloom_len = 0;
         std::memcpy(&bloom_len, p, sizeof(bloom_len));
         p += sizeof(bloom_len);

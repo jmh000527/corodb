@@ -155,11 +155,11 @@ namespace corodb::storage_internal {
     public:
         BloomFilter() = default;
 
-        /** @brief 从 int64 键列表构建布隆过滤器。 */
-        void build(const std::vector<int64_t>& keys);
+        /** @brief 从编码后的键字节串列表构建布隆过滤器。 */
+        void build(const std::vector<std::string>& keys);
 
-        /** @brief 测试键是否可能存在。 */
-        [[nodiscard]] bool maybe_contains(int64_t key) const noexcept;
+        /** @brief 测试编码键是否可能存在。 */
+        [[nodiscard]] bool maybe_contains(const std::string& key) const noexcept;
 
         /** @brief 过滤器是否已填充。 */
         [[nodiscard]] bool valid() const noexcept { return !bits_.empty(); }
@@ -171,17 +171,15 @@ namespace corodb::storage_internal {
         bool deserialize(const std::string& data);
 
     private:
-        [[nodiscard]] std::pair<uint64_t, uint64_t> hash(int64_t key) const noexcept;
+        [[nodiscard]] std::pair<uint64_t, uint64_t> hash(const std::string& key) const noexcept;
 
         uint32_t size_{ 0 };
         uint8_t num_hashes_{ 3 };
         std::vector<uint8_t> bits_;
     };
 
-    /** @brief SSTable 页脚（存储在数据页之后）。 */
+    /** @brief SSTable 页脚（存储在数据页之后）。仅保留 Bloom（主键泛化后不再用 int64 min/max 裁剪）。 */
     struct SstFooter {
-        int64_t min_pk{ 0 };
-        int64_t max_pk{ 0 };
         BloomFilter bloom;
 
         [[nodiscard]] bool valid() const noexcept { return bloom.valid(); }
@@ -317,10 +315,16 @@ namespace corodb::storage_internal {
     void write_len_prefixed_row(std::ostream& os, const Row& row);
 
     [[nodiscard]] int64_t extract_int_key(const Row& row);
+    /** @brief 提取一行的主键 Value（约定首列；空行返回 NULL）。 */
+    [[nodiscard]] Value extract_key(const Row& row);
+    /** @brief 将主键 Value 编码为字节串（复用 write_value，用于 WAL/SSTable/Bloom）。 */
+    [[nodiscard]] std::string encode_key(const Value& key);
+    /** @brief 从字节串解码主键 Value（与 encode_key 对应）。 */
+    [[nodiscard]] Value decode_key(const std::string& bytes);
     [[nodiscard]] std::string index_file_path(const std::string& base_dir, const std::string& table,
                                               const std::string& column);
-    void write_index_file(const std::string& path, const std::vector<std::pair<Value, int64_t>>& entries);
-    [[nodiscard]] std::vector<std::pair<Value, int64_t>> read_index_file(const std::string& path);
+    void write_index_file(const std::string& path, const std::vector<std::pair<Value, Value>>& entries);
+    [[nodiscard]] std::vector<std::pair<Value, Value>> read_index_file(const std::string& path);
     void compact_index_file(const std::string& path) ;
 
 } // namespace corodb::storage_internal

@@ -222,7 +222,7 @@ namespace corodb {
         bump_write_counter();
     }
 
-    void Table::persist_row_delete(int64_t key, uint64_t commit_ts) {
+    void Table::persist_row_delete(const Value& key, uint64_t commit_ts) {
         if (!storage_)
             return;
         storage_->delete_row_by_key(name_, columns_, key, commit_ts);
@@ -235,11 +235,10 @@ namespace corodb {
         return storage_->scan_visible(name_, columns_, snapshot_ts);
     }
 
-    std::optional<Row> Table::lookup_visible(int64_t pk, uint64_t snapshot_ts) const {
+    std::optional<Row> Table::lookup_visible(const Value& pk, uint64_t snapshot_ts) const {
         if (!storage_) {
             for (const auto& r: rows_) {
-                if (!r.values.empty() && std::holds_alternative<int64_t>(r.values.front()) &&
-                    std::get<int64_t>(r.values.front()) == pk) {
+                if (!r.values.empty() && ValueEq{}(r.values.front(), pk)) {
                     return r;
                 }
             }
@@ -342,12 +341,12 @@ namespace corodb {
      * @param key 要查找的值
      * @return 匹配的行ID列表
      */
-    std::vector<int64_t> Table::lookup_index(const std::string& column, const Value& key) const {
-        std::vector<int64_t> out;        // 结果：匹配的主键集合
+    std::vector<Value> Table::lookup_index(const std::string& column, const Value& key) const {
+        std::vector<Value> out;          // 结果：匹配的主键集合
         auto it = indexes_.find(column); // 查找索引
         if (it == indexes_.end())
             return out;                            // 索引不存在，返回空列表
-        std::unordered_set<int64_t> seen;
+        std::unordered_set<Value, ValueHash, ValueEq> seen;
         auto range = it->second.equal_range(key); // 查找匹配的键范围
         // 收集所有匹配的主键（超集索引可能含重复 pk，去重）
         for (auto iter = range.first; iter != range.second; ++iter) {
@@ -357,10 +356,10 @@ namespace corodb {
         return out;
     }
 
-    std::vector<int64_t> Table::lookup_index_range(const std::string& column, const std::optional<Value>& low,
-                                                   bool low_inclusive, const std::optional<Value>& high,
-                                                   bool high_inclusive) const {
-        std::vector<int64_t> out;
+    std::vector<Value> Table::lookup_index_range(const std::string& column, const std::optional<Value>& low,
+                                                 bool low_inclusive, const std::optional<Value>& high,
+                                                 bool high_inclusive) const {
+        std::vector<Value> out;
         auto it = indexes_.find(column);
         if (it == indexes_.end())
             return out;
@@ -369,7 +368,7 @@ namespace corodb {
         auto begin = low.has_value() ? (low_inclusive ? m.lower_bound(*low) : m.upper_bound(*low)) : m.begin();
         // 上界：<=high 用 upper_bound（含 high）；<high 用 lower_bound（不含 high）。
         auto end = high.has_value() ? (high_inclusive ? m.upper_bound(*high) : m.lower_bound(*high)) : m.end();
-        std::unordered_set<int64_t> seen;
+        std::unordered_set<Value, ValueHash, ValueEq> seen;
         for (auto iter = begin; iter != end; ++iter) {
             if (seen.insert(iter->second).second)
                 out.push_back(iter->second);
@@ -396,9 +395,9 @@ namespace corodb {
     void Table::index_row(const Row& row) {
         if (indexed_columns_.empty())
             return;
-        if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
-            return; // 无 int64 主键的表不建立 value→pk 索引
-        int64_t pk = std::get<int64_t>(row.values.front());
+        if (row.values.empty())
+            return; // 无主键列
+        const Value& pk = row.values.front();
         for (const auto& col_name: indexed_columns_) {
             auto ci = find_column(col_name);
             if (!ci || *ci >= row.values.size())
@@ -418,15 +417,13 @@ namespace corodb {
     void Table::rebuild_index_for_column(const std::string& column, std::size_t col_idx) {
         auto& idx = indexes_[column];
         idx.clear();
-        std::vector<std::pair<Value, int64_t>> entries;
+        std::vector<std::pair<Value, Value>> entries;
         entries.reserve(rows_.size());
 
         for (const auto& row: rows_) {
-            if (col_idx >= row.values.size())
+            if (row.values.empty() || col_idx >= row.values.size())
                 continue;
-            if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
-                continue;
-            int64_t pk = std::get<int64_t>(row.values.front());
+            const Value& pk = row.values.front();
             idx.emplace(row.values[col_idx], pk);
             entries.emplace_back(row.values[col_idx], pk);
         }

@@ -746,6 +746,84 @@ TEST_F(TxnTest, BetweenUsesRangeIndexScan) {
     EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
 }
 
+TEST_F(TxnTest, StringPrimaryKeyCrud) {
+    exec_ok("CREATE TABLE users (id TEXT, name TEXT)");
+    exec_ok("INSERT INTO users VALUES ('alice', 'Alice')");
+    exec_ok("INSERT INTO users VALUES ('bob', 'Bob')");
+    exec_ok("INSERT INTO users VALUES ('carol', 'Carol')");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users"), 3u);
+    // 重复字符串主键应被拒绝（lookup_visible 按字符串主键点查）。
+    EXPECT_THROW(db->execute("INSERT INTO users VALUES ('alice', 'Dup')", sess), std::runtime_error);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users"), 3u);
+    // 按字符串主键 UPDATE / DELETE。
+    exec_ok("UPDATE users SET name = 'Bobby' WHERE id = 'bob'");
+    exec_ok("DELETE FROM users WHERE id = 'carol'");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users WHERE name = 'Bobby'"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users WHERE id = 'carol'"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users"), 2u);
+}
+
+TEST_F(TxnTest, StringPrimaryKeyIndexSurvivesRestart) {
+    exec_ok("CREATE TABLE users (id TEXT, city TEXT)");
+    exec_ok("CREATE INDEX idx_city ON users (city)");
+    exec_ok("INSERT INTO users VALUES ('u1', 'NYC')");
+    exec_ok("INSERT INTO users VALUES ('u2', 'LA')");
+    exec_ok("INSERT INTO users VALUES ('u3', 'NYC')");
+    exec_ok("CHECKPOINT");
+    // 重启：从磁盘重新加载（含字符串主键的 SSTable + 索引文件，encode/decode_key 往返）。
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users WHERE city = 'NYC'"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM users"), 3u);
+}
+
+TEST_F(TxnTest, StringPrimaryKeyTransactionIsolation) {
+    exec_ok("CREATE TABLE kv (k TEXT, v INT)");
+    exec_ok("INSERT INTO kv VALUES ('x', 1)");
+    exec_ok("BEGIN");
+    exec_ok("UPDATE kv SET v = 99 WHERE k = 'x'");
+    exec_ok("INSERT INTO kv VALUES ('y', 2)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM kv WHERE v = 99"), 1u) << "read-your-own-writes (string pk)";
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM kv WHERE v = 99"), 0u) << "ROLLBACK must undo string-pk update";
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM kv"), 1u) << "ROLLBACK must undo string-pk insert";
+}
+
+TEST_F(TxnTest, InListUsesIndexScan) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    exec_ok("INSERT INTO t VALUES (1, 20)");
+    exec_ok("INSERT INTO t VALUES (2, 30)");
+    exec_ok("INSERT INTO t VALUES (3, 40)");
+    exec_ok("INSERT INTO t VALUES (4, 50)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age IN (20, 40)"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age IN (99)"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age IN (30, 40, 50)"), 3u);
+    // 确认走 IndexScan（含 IN 条件）。
+    auto r = db->execute("EXPLAIN SELECT * FROM t WHERE age IN (20, 40)", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+    EXPECT_NE(plan.find("IN ("), std::string::npos) << plan;
+}
+
+TEST_F(TxnTest, InListIndexReflectsUpdatesAndDeletes) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    exec_ok("INSERT INTO t VALUES (1, 20)");
+    exec_ok("INSERT INTO t VALUES (2, 30)");
+    exec_ok("INSERT INTO t VALUES (3, 40)");
+    exec_ok("UPDATE t SET age = 99 WHERE id = 1"); // 20 → 99（超集索引仍含 20→1）
+    exec_ok("DELETE FROM t WHERE id = 2");         // 删 30
+    // IN (20, 30, 99)：20 已改、3 0 已删，仅 id=1(99) 命中；可见性重查过滤陈旧超集条目。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age IN (20, 30, 99)"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age IN (20, 30)"), 0u);
+}
+
 // =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================

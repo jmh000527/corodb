@@ -81,7 +81,7 @@ namespace corodb {
                     auto tbl = catalog_.lookup(tname);
                     if (!tbl)
                         continue;
-                    for (int64_t pk: pks) {
+                    for (const Value& pk: pks) {
                         auto old_row = tbl->lookup_visible(pk, session.snapshot_ts);
                         auto cur_row = tbl->lookup_visible(pk, UINT64_MAX);
                         const bool changed =
@@ -98,7 +98,7 @@ namespace corodb {
                             row_locks_.release_all(txn_id);
                             throw std::runtime_error("[Process] Serialization failure: row read by this "
                                                      "transaction was concurrently modified (table=" +
-                                                     tname + ", pk=" + std::to_string(pk) + ")");
+                                                     tname + ")");
                         }
                     }
                 }
@@ -139,23 +139,23 @@ namespace corodb {
 
                 if (!tbuf.deletes.empty()) {
                     std::erase_if(rows, [&](const Row& row) -> bool {
-                        if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+                        if (row.values.empty())
                             return false;
-                        return tbuf.deletes.count(std::get<int64_t>(row.values.front())) > 0;
+                        return tbuf.deletes.count(row.values.front()) > 0;
                     });
                     // 先从内存行集中移除，再写 WAL
-                    for (int64_t k: tbuf.deletes) {
+                    for (const Value& k: tbuf.deletes) {
                         tbl->persist_row_delete(k, commit_ts);
                     }
                 }
 
                 if (!tbuf.upserts.empty()) {
                     // 构建 pk → index 映射，用于 in-place 更新已有行
-                    std::unordered_map<int64_t, std::size_t> idx_by_pk;
+                    std::unordered_map<Value, std::size_t, ValueHash, ValueEq> idx_by_pk;
                     idx_by_pk.reserve(rows.size());
                     for (std::size_t i = 0; i < rows.size(); ++i) {
-                        if (!rows[i].values.empty() && std::holds_alternative<int64_t>(rows[i].values.front()))
-                            idx_by_pk[std::get<int64_t>(rows[i].values.front())] = i;
+                        if (!rows[i].values.empty())
+                            idx_by_pk[rows[i].values.front()] = i;
                     }
                     for (auto& [pk, row]: tbuf.upserts) {
                         auto it = idx_by_pk.find(pk);
