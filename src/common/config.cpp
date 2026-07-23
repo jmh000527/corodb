@@ -248,8 +248,8 @@ namespace corodb {
         ofs << "#  预写日志（WAL）参数\n";
         ofs << "# ----------------------------------------------------------------------------\n";
         ofs << "[wal]\n";
-        ofs << "# 同步模式：\n";
-        ofs << "#   fast    — 仅 C++ 运行时 flush 到 OS 缓存（高性能，断电可能丢失未落盘数据）\n";
+        ofs << "# 同步模式（默认 durable，保证断电不丢已提交数据）：\n";
+        ofs << "#   fast    — 仅 C++ 运行时 flush 到 OS 缓存（高吞吐，断电可能丢失未落盘数据）\n";
         ofs << "#   durable — 内核级 fsync，确保数据写入物理介质（ACID 持久性）\n";
         ofs << "sync_mode = " << tmp.wal_sync_mode_ << "\n";
         ofs << "\n";

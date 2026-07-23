@@ -57,7 +57,7 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 
 ### 存储引擎
 - **LSM-Tree**: MemTable（`std::map` 红黑树）+ SSTable L0-L3 + WAL，Leveled Compaction + Tombstone GC
-- **Buffer Pool**: Clock 替换算法，16 路分片锁降低竞争，FNV-1a 页面校验
+- **Buffer Pool**: Clock 替换算法（LRU 近似），16 路分片锁降低竞争
 - **Bloom Filter**: SSTable 页脚含 Bloom + key range，点查跳过无关 SSTable
 - **原子写入**: `.tmp` → `fsync` → `rename`，崩溃安全；SSTable 解码 LRU 缓存
 - **扫描缓存**: 全表扫描结果按写入版本号缓存，无写入时共享锁并发读取
@@ -66,7 +66,7 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 - **Volcano 协程执行器**: C++23 `std::generator` 惰性求值，数据在算子间流水传递
 - **9 种物理算子**: SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit
 - **两段式优化器**: LogicalPlanner → 5 条重写规则定点迭代（最多 16 轮）→ PhysicalPlanner
-- **算子选择**: 等值索引条件 → IndexScan 升级；等值 JOIN → HashJoin / MergeJoin（预排序跳过重排）；GROUP BY 匹配排序 → SortAggregate 吸收 Sort
+- **算子选择**: 等值/范围索引条件（`=`/`<`/`>`/`BETWEEN`）→ IndexScan 升级；等值 JOIN → HashJoin / MergeJoin（预排序跳过重排）；GROUP BY 匹配排序 → SortAggregate 吸收 Sort
 - **LRU 计划缓存**: 标准化 SQL 到物理计划的缓存（默认 128 条），DDL 自动失效
 
 ### 事务系统
@@ -75,6 +75,7 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 - **Serializable 冲突检测**: 表级 SIREAD 锁 + 写计数器 + 行级读集验证，提交时检测幻读
 - **行级写写冲突**: first-committer-wins 行级写意图锁，表级锁 32 路分片，全局 5s 超时
 - **断连回滚**: 客户端断开自动回滚活跃事务并释放所有行锁
+- **崩溃原子恢复**: WAL 全局提交日志封口每次提交，重启时仅回放已提交事务（含跨表全有或全无）
 
 ### SQL 支持
 - **DDL**: CREATE/DROP TABLE, CREATE/DROP INDEX
@@ -85,6 +86,7 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 - **诊断**: EXPLAIN / EXPLAIN ANALYZE（PostgreSQL 风格计划树 + 算子级耗时与行数）
 - **预处理**: PREPARE / EXECUTE / DEALLOCATE PREPARE（会话级计划注册）
 - **管理**: CHECKPOINT（强制刷盘+全层级压缩+截断 WAL）、SHOW STATUS
+- **约束**: 写入时强制 NOT NULL / 类型匹配 / 主键唯一性
 
 ### 网络与持久性
 - **Multi-Reactor 模式**: Main Reactor 接受连接 → Sub Reactor I/O 线程池（Round-Robin）处理读写 → Worker 线程池执行 SQL
@@ -847,10 +849,10 @@ PageHeader (18 bytes):
 +-----------+----------+-------------------+
 | SIDX (4)  | Count(4) | Entries...        |
 +-----------+----------+-------------------+
-Entry: value(tag+data) + rowid(8)
+Entry: value(tag+data) + 主键 pk(8)
 
-读取时合并所有 Chunk（相同 value 取最后 rowid）。
-定期调用 compact_index_file() 合并去重。
+有序二级索引存 (列值 → 主键) 超集：写入即追加一条 Entry，读取合并所有 Chunk；
+IndexScan 用 lookup_visible + 可见性重查过滤陈旧条目（MVCC 正确，支持等值与范围）。
 ```
 
 ---
@@ -907,7 +909,6 @@ cd build && ctest -j8
 | 特性 | 状态 |
 |------|------|
 | 子查询 (`IN (SELECT ...)`) | 不支持 |
-| 范围 IndexScan (`col > val`) | 仅等值条件可用索引 |
 | `IS NULL / IS NOT NULL` | 不支持 |
 | `RIGHT JOIN` / `FULL JOIN` | 仅 INNER 和 LEFT |
 | `SAVEPOINT` / 嵌套事务 | 不支持 |
@@ -1017,9 +1018,9 @@ cd build && ctest -j8
 
 ### 已完成
 
-**存储引擎** — LSM-Tree (MemTable + SSTable L0-L3 + WAL)、Buffer Pool (Clock + 16-shard)、内核级 fsync、SSTable 原子写入、页面校验和、Bloom Filter + key range 页脚、增量索引写入、SSTable 解码缓存 LRU、全层级 GC
+**存储引擎** — LSM-Tree (MemTable + SSTable L0-L3 + WAL)、Buffer Pool (Clock + 16-shard)、内核级 fsync（默认 durable）、SSTable 原子写入、WAL 记录校验和、Bloom Filter + key range 页脚、增量索引写入、SSTable 解码缓存 LRU、全层级 GC、WAL 全局提交日志 + 崩溃原子恢复（含跨表事务）、CHECKPOINT 提交日志 GC
 
-**查询引擎** — SQL 解析器、Volcano 协程执行器、两段式优化器（5 条重写规则）、MergeJoin 预排序优化、EXPLAIN + EXPLAIN ANALYZE、查询超时、LRU 计划缓存、Float64 类型 + AVG() 浮点、字符串转义
+**查询引擎** — SQL 解析器、Volcano 协程执行器、两段式优化器（5 条重写规则）、MergeJoin 预排序优化、EXPLAIN + EXPLAIN ANALYZE、查询超时、LRU 计划缓存、Float64 类型 + AVG() 浮点、字符串转义、等值/范围 IndexScan（value→主键有序二级索引）、写入约束强制（NOT NULL/类型/主键唯一）
 
 **事务系统** — 四种隔离级别 + MVCC + Serializable 幻读防护、行级写写冲突检测、表级锁超时、全局锁超时、客户端断连回滚
 
@@ -1030,7 +1031,6 @@ cd build && ctest -j8
 ### 计划中
 
 - 基于代价的优化器（CBO）
-- 范围条件 IndexScan
 - 子查询（`IN / EXISTS`）
 - `SAVEPOINT` 嵌套事务
 - TLS 传输加密

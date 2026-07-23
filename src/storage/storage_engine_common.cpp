@@ -449,7 +449,14 @@ namespace corodb::storage_internal {
             buf.insert(buf.end(), reinterpret_cast<const char*>(&name_len),
                        reinterpret_cast<const char*>(&name_len) + sizeof(name_len));
             buf.insert(buf.end(), col.name.begin(), col.name.end());
+            // 类型字节低 6 位为 TypeKind，高 2 位携带约束标志（向后兼容：
+            // 旧数据类型字节为 0..3，高位为 0 → 约束均为 false）。
+            //   bit7 = PRIMARY KEY，bit6 = NOT NULL
             uint8_t t = type_to_wire(col.type);
+            if (col.not_null)
+                t |= 0x40;
+            if (col.primary_key)
+                t |= 0x80;
             buf.push_back(static_cast<char>(t));
         }
         return buf;
@@ -472,7 +479,9 @@ namespace corodb::storage_internal {
             is.read(name.data(), name_len);
             uint8_t t = 0;
             is.read(reinterpret_cast<char*>(&t), sizeof(t));
-            Column c{ table_name, name, wire_to_type(t) };
+            Column c{ table_name, name, wire_to_type(static_cast<uint8_t>(t & 0x3F)) };
+            c.not_null = (t & 0x40) != 0;
+            c.primary_key = (t & 0x80) != 0;
             cols.push_back(std::move(c));
         }
         return cols;
@@ -682,7 +691,7 @@ namespace corodb::storage_internal {
      * 每批写入一个独立的"chunk"：[header] magic + chunk_count + entries。
      * 读取时合并所有 chunk，相同 (col_value) 取最后出现的 rowid。
      */
-    void write_index_file(const std::string& path, const std::vector<std::pair<Value, std::size_t>>& entries) {
+    void write_index_file(const std::string& path, const std::vector<std::pair<Value, int64_t>>& entries) {
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
         // Create empty index file even when entries is empty (for create_index_file).
         if (entries.empty()) {
@@ -701,10 +710,10 @@ namespace corodb::storage_internal {
         uint32_t count = static_cast<uint32_t>(entries.size());
         ofs.write(reinterpret_cast<char*>(&magic), sizeof(magic));
         ofs.write(reinterpret_cast<char*>(&count), sizeof(count));
-        for (const auto& [val, rid]: entries) {
+        for (const auto& [val, pk]: entries) {
             write_value(ofs, val);
-            uint64_t rowid = static_cast<uint64_t>(rid);
-            ofs.write(reinterpret_cast<char*>(&rowid), sizeof(rowid));
+            int64_t pk_out = pk;
+            ofs.write(reinterpret_cast<char*>(&pk_out), sizeof(pk_out));
         }
         ofs.flush();
         if (!ofs)
@@ -712,13 +721,16 @@ namespace corodb::storage_internal {
     }
 
     /**
-     * @brief 读取索引文件所有条目，合并多 chunk（相同 value 取最后 rowid）。
+     * @brief 读取索引文件所有条目（合并多 chunk）。
+     *
+     * 返回全部 (value, pk) 对（不按 value 去重），形成“超集”索引：同一 pk 历史上的
+     * 每个值都保留，IndexScan 在查询时用可见性重查过滤陈旧条目，从而在 MVCC 下保持正确。
      */
-    std::vector<std::pair<Value, std::size_t>> read_index_file(const std::string& path) {
-        std::unordered_map<Value, std::size_t> map;
+    std::vector<std::pair<Value, int64_t>> read_index_file(const std::string& path) {
+        std::vector<std::pair<Value, int64_t>> out;
         std::ifstream ifs(path, std::ios::binary);
         if (!ifs)
-            return {};
+            return out;
         while (ifs && ifs.peek() != std::char_traits<char>::eof()) {
             uint32_t magic = 0;
             uint32_t count = 0;
@@ -728,15 +740,13 @@ namespace corodb::storage_internal {
                 break;
             for (uint32_t i = 0; i < count; ++i) {
                 auto v = read_value(ifs);
-                uint64_t rid = 0;
-                ifs.read(reinterpret_cast<char*>(&rid), sizeof(rid));
+                int64_t pk = 0;
+                ifs.read(reinterpret_cast<char*>(&pk), sizeof(pk));
                 if (!ifs)
                     break;
-                map[std::move(v)] = static_cast<std::size_t>(rid);
+                out.emplace_back(std::move(v), pk);
             }
         }
-        std::vector<std::pair<Value, std::size_t>> out(map.begin(), map.end());
-        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
         return out;
     }
 
@@ -753,10 +763,10 @@ namespace corodb::storage_internal {
         uint32_t count = static_cast<uint32_t>(entries.size());
         ofs.write(reinterpret_cast<char*>(&magic), sizeof(magic));
         ofs.write(reinterpret_cast<char*>(&count), sizeof(count));
-        for (const auto& [val, rid]: entries) {
+        for (const auto& [val, pk]: entries) {
             write_value(ofs, val);
-            uint64_t rowid = static_cast<uint64_t>(rid);
-            ofs.write(reinterpret_cast<char*>(&rowid), sizeof(rowid));
+            int64_t pk_out = pk;
+            ofs.write(reinterpret_cast<char*>(&pk_out), sizeof(pk_out));
         }
         ofs.flush();
     }

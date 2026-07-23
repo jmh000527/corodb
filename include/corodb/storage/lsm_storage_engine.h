@@ -11,6 +11,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "corodb/storage/buffer_pool.h"
@@ -105,10 +106,14 @@ namespace corodb {
 
         /** @brief 批量写入索引条目。 */
         void write_index_rows(const std::string& table, const std::string& column,
-                              const std::vector<std::pair<Value, std::size_t>>& entries) override;
+                              const std::vector<std::pair<Value, int64_t>>& entries) override;
+
+        /** @brief 增量追加单个索引条目（value→pk），追加一个单条 chunk。 */
+        void append_index_entry(const std::string& table, const std::string& column, const Value& value,
+                                int64_t pk) override;
 
         /** @brief 加载全部索引条目。 */
-        [[nodiscard]] std::vector<std::pair<Value, std::size_t>>
+        [[nodiscard]] std::vector<std::pair<Value, int64_t>>
         load_index_rows(const std::string& table, const std::string& column) const override;
 
         /** @brief 持久化索引名注册表（index_name → column）。 */
@@ -121,6 +126,9 @@ namespace corodb {
 
         /** @brief 强制刷盘所有表并截断 WAL（用于 CHECKPOINT / 备份）。 */
         void checkpoint() override;
+
+        /** @brief 将 commit_ts 写入全局提交日志（跨表原子提交点，崩溃原子恢复）。 */
+        void mark_committed(uint64_t commit_ts) override;
 
     private:
         std::string base_dir_;             ///< 存储基础目录
@@ -235,6 +243,16 @@ namespace corodb {
         /// 页脚缓存：键 = 绝对路径，值 = (mtime, footer)。
         mutable std::shared_mutex sst_footer_cache_mutex_;
         mutable std::unordered_map<std::string, std::pair<int64_t, storage_internal::SstFooter>> sst_footer_cache_;
+
+        // ---- 全局提交日志（跨表原子提交） ----
+        /// 单一的全局提交日志文件，记录已提交的 commit_ts（跨所有表）。
+        [[nodiscard]] std::string commit_log_path() const;
+        /// 惰性读入已提交 commit_ts 集合（供崩溃恢复判定行记录是否属于已提交事务）。
+        void ensure_committed_loaded() const;
+        mutable std::mutex commit_log_mutex_;
+        mutable std::unordered_set<uint64_t> committed_ts_; ///< 已提交 commit_ts 缓存
+        mutable bool committed_loaded_{ false };            ///< 提交集合是否已从磁盘加载
+        mutable bool commit_log_present_{ false };          ///< 提交日志文件是否存在（不存在则旧格式全量回放）
     };
 
 } // namespace corodb

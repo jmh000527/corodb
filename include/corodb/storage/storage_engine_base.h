@@ -160,20 +160,20 @@ namespace corodb {
          * @throws std::runtime_error 若索引文件不存在或写入失败。
          */
         virtual void write_index_rows(const std::string& table, const std::string& column,
-                                      const std::vector<std::pair<Value, std::size_t>>& entries) = 0;
+                                      const std::vector<std::pair<Value, int64_t>>& entries) = 0;
 
         /**
-         * @brief 追加单个索引条目（增量更新）。
-         * @note 默认实现通过重写全量索引实现，子类可覆盖以提供增量追加。
+         * @brief 追加单个索引条目（值→主键，增量追加）。
+         * @note 默认实现通过重写全量索引实现，子类可覆盖为真正的增量追加。
          */
         virtual void append_index_entry(const std::string& table, const std::string& column, const Value& value,
-                                        std::size_t rid);
+                                        int64_t pk);
 
         /**
          * @brief 加载所有索引条目。
          * @throws std::runtime_error 若索引不存在或数据损坏。
          */
-        [[nodiscard]] virtual std::vector<std::pair<Value, std::size_t>>
+        [[nodiscard]] virtual std::vector<std::pair<Value, int64_t>>
         load_index_rows(const std::string& table, const std::string& column) const = 0;
 
         /**
@@ -226,6 +226,16 @@ namespace corodb {
          * @brief 检查是否支持事务。
          */
         [[nodiscard]] virtual bool supports_transactions() const noexcept;
+
+        /**
+         * @brief 将 commit_ts 标记为已提交（写入全局提交日志，跨表原子提交点）。
+         *
+         * 调用方（自动提交语句 / 显式事务 COMMIT）在写完本次提交对所有表的全部行记录后
+         * 调用一次。崩溃恢复时，各表 WAL 中带 commit_ts 的行记录仅当其 commit_ts 已出现在
+         * 全局提交日志中才回放，从而保证（含跨表）提交的原子性。commit_ts==0（旧式无版本
+         * 写入）时应为空操作。默认实现为空操作，由支持 WAL 的引擎（LSM）覆盖。
+         */
+        virtual void mark_committed(uint64_t commit_ts);
 
         /** @brief 强制刷盘、压缩并截断 WAL（用于备份/快照）。 */
         virtual void checkpoint() = 0;

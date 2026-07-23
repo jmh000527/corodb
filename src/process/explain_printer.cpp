@@ -148,7 +148,22 @@ namespace corodb {
             }
             if (const auto* idx = dynamic_cast<const IndexScanPlan*>(plan)) {
                 oss << in << "Index Scan on " << idx->table->name() << "\n";
-                oss << ai << "Index Cond: (" << idx->column << " = " << value_to_string(idx->key) << ")\n";
+                if (!idx->is_range) {
+                    oss << ai << "Index Cond: (" << idx->column << " = " << value_to_string(idx->key) << ")\n";
+                } else {
+                    oss << ai << "Index Cond: (";
+                    bool wrote = false;
+                    if (idx->low.has_value()) {
+                        oss << idx->column << (idx->low_inclusive ? " >= " : " > ") << value_to_string(*idx->low);
+                        wrote = true;
+                    }
+                    if (idx->high.has_value()) {
+                        if (wrote)
+                            oss << " AND ";
+                        oss << idx->column << (idx->high_inclusive ? " <= " : " < ") << value_to_string(*idx->high);
+                    }
+                    oss << ")\n";
+                }
                 return;
             }
             if (const auto* fil = dynamic_cast<const FilterPlan*>(plan)) {

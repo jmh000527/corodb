@@ -95,14 +95,10 @@ namespace corodb {
             std::fill(frame.data.begin() + ifs.gcount(), frame.data.end(), '\0');
         }
 
-        // Verify page checksum to detect silent data corruption.
-        auto* hdr = reinterpret_cast<PageHeader*>(frame.data.data());
-        if (hdr->checksum != 0) {
-            uint32_t computed = storage_internal::compute_page_checksum(frame.data);
-            if (computed != hdr->checksum) {
-                throw std::runtime_error("Page checksum mismatch: " + id.file + " page=" + std::to_string(id.page_idx));
-            }
-        }
+        // 注：LSM SSTable 数据页为原始 payload，不含 PageHeader/校验和（stamp_page_checksum
+        // 从未在写路径调用）。此前此处按 hdr->checksum 校验，会把 payload 字节误判为校验和，
+        // 对已刷盘的 SSTable 产生假阳性 "checksum mismatch"，导致已提交数据不可读。
+        // 真正的页级校验和需在为数据页预留页头后重做（见 ROADMAP）。此处不做页级校验。
 
         // 更新帧元数据
         frame.id = id;       // 记录此帧对应的页面ID

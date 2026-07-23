@@ -64,10 +64,10 @@ namespace corodb {
      * @brief 追加索引条目（默认实现：全量重写；子类可覆盖为增量追加）。
      */
     void StorageEngine::append_index_entry(const std::string& table, const std::string& column, const Value& value,
-                                           std::size_t rid) {
+                                           int64_t pk) {
         // 默认实现：加载现有条目，追加后全量重写；子类可覆盖为增量追加
         auto entries = load_index_rows(table, column);
-        entries.emplace_back(value, rid);
+        entries.emplace_back(value, pk);
         write_index_rows(table, column, entries);
     }
 
@@ -122,6 +122,13 @@ namespace corodb {
      */
     bool StorageEngine::supports_transactions() const noexcept {
         return false;
+    }
+
+    /**
+     * @brief 将 commit_ts 标记为已提交（默认空操作；无 WAL 的引擎无需原子恢复）。
+     */
+    void StorageEngine::mark_committed(uint64_t /*commit_ts*/) {
+        // 默认空操作；崩溃原子恢复由支持 WAL 的引擎（LSMTreeEngine）覆盖实现。
     }
 
 } // namespace corodb

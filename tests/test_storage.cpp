@@ -370,6 +370,128 @@ TEST_F(LSMEngineTest, MvccMultiVersionVisibilityByTs) {
     EXPECT_EQ(std::get<int64_t>(vmax->values[1]), 200);
 }
 
+// ============================================================================
+// 崩溃原子恢复测试 (P0: WAL 提交屏障)
+// ============================================================================
+
+// 已封口（写入提交屏障）的提交在重启后应完整可见。
+TEST_F(LSMEngineTest, CrashRecoveryKeepsBarrierSealedCommit) {
+    std::vector<Column> columns = { Column{ "recov1", "id", TypeKind::Int64, 0, 0 },
+                                    Column{ "recov1", "v", TypeKind::Int64, 0, 0 } };
+    engine->create_table("recov1", columns);
+
+    // 提交 A：写行 + 屏障封口（模拟成功提交）。
+    Row a;
+    a.values = { int64_t{ 1 }, int64_t{ 100 } };
+    engine->append_row("recov1", columns, a, /*commit_ts=*/10);
+    engine->mark_committed(10);
+
+    // 模拟重启：销毁引擎、释放 WAL 句柄，在同目录重新打开。
+    engine.reset();
+    storage_internal::WalManager::instance().clear_all();
+    engine = std::make_unique<LSMTreeEngine>(temp_dir->path());
+
+    auto row = engine->lookup_visible("recov1", columns, 1, std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(row.has_value());
+    EXPECT_EQ(std::get<int64_t>(row->values[1]), 100);
+}
+
+// 未封口（提交中崩溃）的"撕裂"写入在重启后应被丢弃，且不影响已封口的提交。
+TEST_F(LSMEngineTest, CrashRecoveryDiscardsTornCommit) {
+    std::vector<Column> columns = { Column{ "recov2", "id", TypeKind::Int64, 0, 0 },
+                                    Column{ "recov2", "v", TypeKind::Int64, 0, 0 } };
+    engine->create_table("recov2", columns);
+
+    // 提交 A：成功（写行 + 屏障）。
+    Row a;
+    a.values = { int64_t{ 1 }, int64_t{ 100 } };
+    engine->append_row("recov2", columns, a, /*commit_ts=*/10);
+    engine->mark_committed(10);
+
+    // 提交 B：撕裂——写了行但崩溃于提交之前（不调用 mark_committed）。
+    Row b;
+    b.values = { int64_t{ 2 }, int64_t{ 200 } };
+    engine->append_row("recov2", columns, b, /*commit_ts=*/20);
+
+    // 模拟重启。
+    engine.reset();
+    storage_internal::WalManager::instance().clear_all();
+    engine = std::make_unique<LSMTreeEngine>(temp_dir->path());
+
+    // 已封口的提交 A 存活。
+    auto row1 = engine->lookup_visible("recov2", columns, 1, std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(row1.has_value());
+    EXPECT_EQ(std::get<int64_t>(row1->values[1]), 100);
+
+    // 撕裂的提交 B 被丢弃（原子性：不回放未提交的写入）。
+    EXPECT_FALSE(
+            engine->lookup_visible("recov2", columns, 2, std::numeric_limits<uint64_t>::max()).has_value());
+}
+
+// 跨表事务：同一 commit_ts 跨两张表；仅当全局提交日志封口时两表才一起可见，否则一起丢弃。
+TEST_F(LSMEngineTest, CrashRecoveryCrossTableAtomicity) {
+    std::vector<Column> cols_a = { Column{ "xt_a", "id", TypeKind::Int64, 0, 0 },
+                                   Column{ "xt_a", "v", TypeKind::Int64, 0, 0 } };
+    std::vector<Column> cols_b = { Column{ "xt_b", "id", TypeKind::Int64, 0, 0 },
+                                   Column{ "xt_b", "v", TypeKind::Int64, 0, 0 } };
+    engine->create_table("xt_a", cols_a);
+    engine->create_table("xt_b", cols_b);
+
+    // 已提交的跨表事务 ts=10：写 A 和 B 各一行，然后 mark_committed(10)。
+    Row a1;
+    a1.values = { int64_t{ 1 }, int64_t{ 100 } };
+    Row b1;
+    b1.values = { int64_t{ 1 }, int64_t{ 200 } };
+    engine->append_row("xt_a", cols_a, a1, /*commit_ts=*/10);
+    engine->append_row("xt_b", cols_b, b1, /*commit_ts=*/10);
+    engine->mark_committed(10);
+
+    // 撕裂的跨表事务 ts=20：写 A 和 B 各一行，但崩溃于 mark_committed 之前。
+    Row a2;
+    a2.values = { int64_t{ 2 }, int64_t{ 300 } };
+    Row b2;
+    b2.values = { int64_t{ 2 }, int64_t{ 400 } };
+    engine->append_row("xt_a", cols_a, a2, /*commit_ts=*/20);
+    engine->append_row("xt_b", cols_b, b2, /*commit_ts=*/20);
+
+    // 模拟重启。
+    engine.reset();
+    storage_internal::WalManager::instance().clear_all();
+    engine = std::make_unique<LSMTreeEngine>(temp_dir->path());
+
+    // 已提交事务：A、B 两表的 pk=1 都可见。
+    auto a_row = engine->lookup_visible("xt_a", cols_a, 1, std::numeric_limits<uint64_t>::max());
+    auto b_row = engine->lookup_visible("xt_b", cols_b, 1, std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(a_row.has_value());
+    ASSERT_TRUE(b_row.has_value());
+    EXPECT_EQ(std::get<int64_t>(a_row->values[1]), 100);
+    EXPECT_EQ(std::get<int64_t>(b_row->values[1]), 200);
+
+    // 撕裂事务：A、B 两表的 pk=2 都被丢弃（跨表原子性）。
+    EXPECT_FALSE(engine->lookup_visible("xt_a", cols_a, 2, std::numeric_limits<uint64_t>::max()).has_value());
+    EXPECT_FALSE(engine->lookup_visible("xt_b", cols_b, 2, std::numeric_limits<uint64_t>::max()).has_value());
+}
+
+// CHECKPOINT 会截断全局提交日志（GC），但已提交数据已刷盘，重启后必须仍在。
+TEST_F(LSMEngineTest, CheckpointTruncatesCommitLogKeepsCommittedData) {
+    std::vector<Column> columns = { Column{ "ck", "id", TypeKind::Int64, 0, 0 },
+                                    Column{ "ck", "v", TypeKind::Int64, 0, 0 } };
+    engine->create_table("ck", columns);
+    Row r;
+    r.values = { int64_t{ 1 }, int64_t{ 100 } };
+    engine->append_row("ck", columns, r, /*commit_ts=*/10);
+    engine->mark_committed(10);
+    engine->checkpoint(); // 刷盘 + 截断 WAL + 截断全局提交日志
+
+    // 重启：已提交数据已落盘到 SSTable，GC 不得丢失。
+    engine.reset();
+    storage_internal::WalManager::instance().clear_all();
+    engine = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    auto row = engine->lookup_visible("ck", columns, 1, std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(row.has_value());
+    EXPECT_EQ(std::get<int64_t>(row->values[1]), 100);
+}
+
 TEST_F(LSMEngineTest, MvccTombstoneShadowsOlderVersionAtSnapshot) {
     std::vector<Column> columns = { Column{ "mvcc2", "id", TypeKind::Int64, 0, 0 },
                                     Column{ "mvcc2", "v", TypeKind::Int64, 0, 0 } };

@@ -72,6 +72,41 @@ namespace corodb {
         }
 
         /**
+         * @brief 校验单个值是否满足列约束：NOT NULL + 基本类型族。违反抛 runtime_error。
+         *
+         * 类型校验采用"族"级宽松策略：数值列（Int64/Float64）接受 int64/double，
+         * 文本列（Text）接受 string；NULL 仅在非 NOT NULL 列允许。
+         */
+        inline void validate_value(const Column& c, const Value& v) {
+            if (std::holds_alternative<NullValue>(v)) {
+                if (c.not_null)
+                    throw std::runtime_error("ERROR: NULL value violates NOT NULL constraint on column '" + c.name +
+                                             "'");
+                return;
+            }
+            const bool is_num = std::holds_alternative<int64_t>(v) || std::holds_alternative<double>(v);
+            const bool is_txt = std::holds_alternative<std::string>(v);
+            if (c.type == TypeKind::Text && !is_txt)
+                throw std::runtime_error("ERROR: type mismatch: column '" + c.name + "' expects TEXT");
+            if ((c.type == TypeKind::Int64 || c.type == TypeKind::Float64) && !is_num)
+                throw std::runtime_error("ERROR: type mismatch: column '" + c.name + "' expects a numeric value");
+        }
+
+        /** @brief 校验整行是否满足列约束（逐列调用 validate_value）。 */
+        inline void validate_row_constraints(const std::vector<Column>& cols, const Row& row) {
+            const std::size_t n = std::min(cols.size(), row.values.size());
+            for (std::size_t i = 0; i < n; ++i)
+                validate_value(cols[i], row.values[i]);
+        }
+
+        /** @brief 提取一行的 int64 主键（约定首列）；非 int64 首列返回 nullopt（无主键表）。 */
+        inline std::optional<int64_t> row_pk(const Row& row) {
+            if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+                return std::nullopt;
+            return std::get<int64_t>(row.values.front());
+        }
+
+        /**
          * @brief 比较两个 Value 向量的比较器
          *
          * 用于 std::set 实现 DISTINCT 去重
@@ -385,8 +420,6 @@ namespace corodb {
             if (sess && sess->in_transaction()) {
                 buf = sess->write_buffer.find_table(idx->table->name());
             }
-            const bool use_mvcc = snapshot_ts != 0 && sess;
-            // 只有 SERIALIZABLE 隔离才记录读集。
             const bool track_read_set =
                     sess && sess->in_transaction() && sess->isolation == IsolationLevel::Serializable;
             if (track_read_set) {
@@ -399,59 +432,74 @@ namespace corodb {
                     return;
                 sess->read_set[idx->table->name()].insert(std::get<int64_t>(row.values.front()));
             };
-            if (use_mvcc) {
-                // MVCC 路径：扫快照行并按索引列过滤。
-                // 注：当前简化实现是 O(n) 过滤，未来可扩展索引本身存储 (col_value, pk)
-                // 之后用 storage->lookup_visible(pk, snapshot_ts) 直接定位。
-                auto col_idx_opt = idx->table->find_column(idx->column);
-                std::size_t col_idx = col_idx_opt.value_or(0);
-                auto rows = idx->table->scan_visible(snapshot_ts);
-                std::unordered_set<int64_t> emitted_buffer_keys;
-                check_timeout(ctx);
-                for (const auto& row: rows) {
-                    if (col_idx >= row.values.size())
-                        continue;
-                    if (!ValueEq{}(row.values[col_idx], idx->key))
-                        continue;
-                    if (buf && !row.values.empty() && std::holds_alternative<int64_t>(row.values.front())) {
-                        int64_t pk = std::get<int64_t>(row.values.front());
-                        if (buf->deletes.count(pk))
-                            continue;
-                        auto bit = buf->upserts.find(pk);
-                        if (bit != buf->upserts.end()) {
-                            if (col_idx < bit->second.values.size() &&
-                                !ValueEq{}(bit->second.values[col_idx], idx->key)) {
-                                continue; // upsert 改了索引列且不再匹配
-                            }
-                            co_yield make_record_from_row(*idx->table, bit->second, binding);
-                            emitted_buffer_keys.insert(pk);
-                            record_idx_read(row);
-                            continue;
-                        }
+
+            // 索引列在表中的下标（用于可见性重查过滤陈旧超集条目）。
+            const std::size_t col_idx = idx->table->find_column(idx->column).value_or(0);
+            // 无 snapshot（sessionless / 非 MVCC）时取最新已提交版本。
+            const uint64_t snap = (snapshot_ts != 0) ? snapshot_ts : std::numeric_limits<uint64_t>::max();
+
+            // 索引键匹配判定：等值用 ValueEq；范围用 low/high + inclusive。
+            auto matches = [&](const Value& v) -> bool {
+                if (!idx->is_range)
+                    return ValueEq{}(v, idx->key);
+                if (idx->low.has_value()) {
+                    if (idx->low_inclusive) {
+                        if (ValueLess{}(v, *idx->low))
+                            return false; // v < low
+                    } else if (!ValueLess{}(*idx->low, v)) {
+                        return false; // !(low < v)
                     }
-                    co_yield make_record_from_row(*idx->table, row, binding);
-                    record_idx_read(row);
                 }
+                if (idx->high.has_value()) {
+                    if (idx->high_inclusive) {
+                        if (ValueLess{}(*idx->high, v))
+                            return false; // high < v
+                    } else if (!ValueLess{}(v, *idx->high)) {
+                        return false; // !(v < high)
+                    }
+                }
+                return true;
+            };
+            // 通过索引取候选主键；对每个 pk 做可见性重查 + 键匹配重查。
+            auto pks = idx->is_range ? idx->table->lookup_index_range(idx->column, idx->low, idx->low_inclusive,
+                                                                      idx->high, idx->high_inclusive)
+                                     : idx->table->lookup_index(idx->column, idx->key);
+            std::unordered_set<int64_t> emitted;
+            check_timeout(ctx);
+            for (int64_t pk: pks) {
                 if (buf) {
-                    for (const auto& [pk, row]: buf->upserts) {
-                        if (emitted_buffer_keys.count(pk))
-                            continue;
-                        if (col_idx >= row.values.size())
-                            continue;
-                        if (!ValueEq{}(row.values[col_idx], idx->key))
-                            continue;
-                        co_yield make_record_from_row(*idx->table, row, binding);
+                    if (buf->deletes.count(pk)) {
+                        emitted.insert(pk);
+                        continue;
+                    }
+                    auto bit = buf->upserts.find(pk);
+                    if (bit != buf->upserts.end()) {
+                        const Row& br = bit->second; // 事务缓冲覆盖：用缓冲行，且需仍匹配索引键
+                        if (col_idx < br.values.size() && matches(br.values[col_idx])) {
+                            record_idx_read(br);
+                            co_yield make_record_from_row(*idx->table, br, binding);
+                        }
+                        emitted.insert(pk);
+                        continue;
                     }
                 }
-            } else {
-                // 旧路径：rid 索引（rows_ 缓存）
-                auto rids = idx->table->lookup_index(idx->column, idx->key);
-                for (auto rid: rids) {
-                    if (rid >= idx->table->rows().size())
+                auto row = idx->table->lookup_visible(pk, snap);
+                if (!row.has_value())
+                    continue; // 已删除 / 不可见
+                // 可见性重查：超集索引可能含陈旧值，需确认可见版本的索引列仍满足键条件。
+                if (col_idx >= row->values.size() || !matches(row->values[col_idx]))
+                    continue;
+                emitted.insert(pk);
+                record_idx_read(*row);
+                co_yield make_record_from_row(*idx->table, *row, binding);
+            }
+            // 事务缓冲中匹配键但不在索引/未发出的纯新增行。
+            if (buf) {
+                for (const auto& [pk, row]: buf->upserts) {
+                    if (emitted.count(pk))
                         continue;
-                    const auto& row = idx->table->rows()[rid];
-                    co_yield make_record_from_row(*idx->table, row, binding);
-                    record_idx_read(row);
+                    if (col_idx < row.values.size() && matches(row.values[col_idx]))
+                        co_yield make_record_from_row(*idx->table, row, binding);
                 }
             }
             co_return;
@@ -1371,6 +1419,10 @@ namespace corodb {
                 batch_rows.push_back(std::move(row));
             }
 
+            // 约束校验：NOT NULL + 类型族匹配（对本次 INSERT 的每一行）。
+            for (const auto& r: batch_rows)
+                validate_row_constraints(ins->table->columns(), r);
+
             // 事务路径：写入 TxnWriteBuffer，等 COMMIT 时才落到 Table::rows_
             if (auto* sess = ctx.session.get(); sess && sess->in_transaction()) {
                 auto& tbuf = sess->write_buffer.for_table(ins->table->name());
@@ -1382,6 +1434,15 @@ namespace corodb {
                         continue;
                     }
                     int64_t pk = std::get<int64_t>(r.values.front());
+                    // 主键唯一性：本事务已删除该 pk 则允许重插；否则缓冲已有或已提交可见即为重复键。
+                    if (tbuf.deletes.count(pk) == 0) {
+                        if (tbuf.upserts.count(pk) > 0)
+                            throw std::runtime_error("ERROR: duplicate key in transaction: pk=" +
+                                                     std::to_string(pk));
+                        if (ins->table->lookup_visible(pk, std::numeric_limits<uint64_t>::max()).has_value())
+                            throw std::runtime_error("ERROR: duplicate key violates primary key: pk=" +
+                                                     std::to_string(pk));
+                    }
                     // 写写冲突检测失败时立即中止当前事务。
                     txn_acquire_row_lock(ctx, sess->current_txn_id, ins->table->name(), pk);
                     tbuf.deletes.erase(pk);
@@ -1390,11 +1451,28 @@ namespace corodb {
                 co_return;
             }
 
-            // 自动提交路径：使用批量插入（对支持优化的存储引擎更高效）
+            // 自动提交路径：主键唯一性校验（本批次内部 + 与已提交数据），再批量插入。
+            {
+                std::unordered_set<int64_t> seen_pks;
+                for (const auto& r: batch_rows) {
+                    auto pk = row_pk(r);
+                    if (!pk.has_value())
+                        continue;
+                    if (!seen_pks.insert(*pk).second)
+                        throw std::runtime_error("ERROR: duplicate key in INSERT: pk=" + std::to_string(*pk));
+                    if (ins->table->lookup_visible(*pk, std::numeric_limits<uint64_t>::max()).has_value())
+                        throw std::runtime_error("ERROR: duplicate key violates primary key: pk=" +
+                                                 std::to_string(*pk));
+                }
+            }
+            // 使用批量插入（对支持优化的存储引擎更高效）
             uint64_t ts = 0;
             if (auto* sess = ctx.session.get())
                 ts = sess->auto_commit_ts;
             ins->table->insert_batch(std::move(batch_rows), ts);
+            // 自动提交语句写完全部行后写入全局提交日志（原子提交点），保证崩溃恢复的原子性。
+            if (ts != 0 && ctx.storage)
+                ctx.storage->mark_committed(ts);
             co_return;
         }
 
@@ -1418,6 +1496,7 @@ namespace corodb {
                                                                            : eval_expression(rec, a.value);
                         new_row.values[a.column_index] = v;
                     }
+                    validate_row_constraints(upd->table->columns(), new_row);
                     return new_row;
                 };
 
@@ -1468,11 +1547,17 @@ namespace corodb {
                 Record rec = make_record_from_row(*upd->table, row, upd->table->name());
                 if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
                     continue;
+                // 先计算并校验所有赋值，再一次性写入，避免约束违反时留下部分修改。
+                std::vector<std::pair<std::size_t, Value>> pending;
+                pending.reserve(upd->assignments.size());
                 for (const auto& a: upd->assignments) {
                     Value v = std::holds_alternative<Literal>(a.value) ? std::get<Literal>(a.value).value
                                                                        : eval_expression(rec, a.value);
-                    row.values[a.column_index] = v;
+                    validate_value(upd->table->columns()[a.column_index], v);
+                    pending.emplace_back(a.column_index, std::move(v));
                 }
+                for (auto& [idx, v]: pending)
+                    row.values[idx] = std::move(v);
                 modified.push_back(&row);
             }
             for (Row* r: modified) {
@@ -1480,6 +1565,9 @@ namespace corodb {
                 upd->table->persist_row_upsert(*r, ts);
             }
             upd->table->refresh_indexes();
+            // 自动提交语句写完全部行后写入全局提交日志（原子提交点），保证崩溃恢复的原子性。
+            if (auto ts = sess ? sess->auto_commit_ts : 0; ts != 0 && ctx.storage)
+                ctx.storage->mark_committed(ts);
             co_return;
         }
 
@@ -1554,6 +1642,9 @@ namespace corodb {
                 del->table->persist_row_delete(k, ts);
             }
             del->table->refresh_indexes();
+            // 自动提交语句写完全部删除后写入全局提交日志（原子提交点），保证崩溃恢复的原子性。
+            if (auto ts = sess ? sess->auto_commit_ts : 0; ts != 0 && ctx.storage)
+                ctx.storage->mark_committed(ts);
             co_return;
         }
 

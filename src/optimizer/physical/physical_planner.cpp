@@ -30,6 +30,22 @@ namespace corodb::opt {
             throw std::runtime_error("[PhysicalPlanner] Only literal values supported in INSERT/Values");
         }
 
+        /** @brief 反转比较操作符方向（将 lit OP col 归一化为 col OP' lit）。 */
+        CompareOp reverse_compare_op(CompareOp op) {
+            switch (op) {
+                case CompareOp::Lt:
+                    return CompareOp::Gt;
+                case CompareOp::Le:
+                    return CompareOp::Ge;
+                case CompareOp::Gt:
+                    return CompareOp::Lt;
+                case CompareOp::Ge:
+                    return CompareOp::Le;
+                default:
+                    return op; // Eq/Ne 等对称或不处理
+            }
+        }
+
         /** @brief 按列名查找列索引，未找到抛异常。 */
         std::size_t resolve_column_index(const Table& table, const std::string& col) {
             const auto& cols = table.columns();
@@ -169,32 +185,70 @@ namespace corodb::opt {
      * @brief 将 LogicalFilter 翻译为物理计划节点；若满足索引条件则生成 IndexScanPlan，否则生成 FilterPlan。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_filter(const LogicalFilter& f) {
-        // 基础 P1 IndexScan 选择：当 child 是 Scan 且 predicate 为单一等值列=字面量
-        // 且该列已建索引时，直接生成 IndexScanPlan（取代 SeqScan + Filter）。
+        // IndexScan 选择：当 child 为 Scan 且 predicate 为单一比较（列 OP 字面量）且该列已建索引，
+        // 则升级为 IndexScan（等值或范围）取代 SeqScan + Filter。
         if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::Comparison &&
-            f.predicate.cmp.has_value() && f.predicate.cmp->op == CompareOp::Eq) {
+            f.predicate.cmp.has_value()) {
             const auto& scan = std::get<LogicalScan>(f.child->node);
             const auto& cmp = *f.predicate.cmp;
+            // 提取 (列, 操作符, 字面量)，同时处理 col OP lit 与 lit OP col 两种写法。
             const ColumnRef* col = nullptr;
             const Literal* lit = nullptr;
+            CompareOp op = cmp.op;
             if (auto* c = std::get_if<ColumnRef>(&cmp.lhs)) {
                 col = c;
-                if (auto* l = std::get_if<Literal>(&cmp.rhs))
-                    lit = l;
+                lit = std::get_if<Literal>(&cmp.rhs);
+            } else if (auto* c2 = std::get_if<ColumnRef>(&cmp.rhs)) {
+                col = c2;
+                lit = std::get_if<Literal>(&cmp.lhs);
+                op = reverse_compare_op(op); // 字面量在左侧：反转方向（lit < col ≡ col > lit）
             }
-            if (!col && std::get_if<Literal>(&cmp.lhs)) {
-                if (auto* c2 = std::get_if<ColumnRef>(&cmp.rhs)) {
-                    col = c2;
-                    lit = std::get_if<Literal>(&cmp.lhs);
-                }
-            }
-            if (col && lit && scan.table) {
-                const auto& idxed = scan.table->indexed_columns();
-                if (idxed.count(col->name) > 0) {
+            if (col && lit && scan.table && scan.table->indexed_columns().count(col->name) > 0) {
+                if (op == CompareOp::Eq) {
                     return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, lit->value);
+                }
+                std::optional<Value> low, high;
+                bool low_inc = false, high_inc = false;
+                switch (op) {
+                    case CompareOp::Gt:
+                        low = lit->value;
+                        break;
+                    case CompareOp::Ge:
+                        low = lit->value;
+                        low_inc = true;
+                        break;
+                    case CompareOp::Lt:
+                        high = lit->value;
+                        break;
+                    case CompareOp::Le:
+                        high = lit->value;
+                        high_inc = true;
+                        break;
+                    default:
+                        break; // Ne/Like/IsNull 等不走索引
+                }
+                if (low.has_value() || high.has_value()) {
+                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low), low_inc,
+                                                           std::move(high), high_inc);
                 }
             }
         }
+
+        // BETWEEN low AND high → 双侧含等的范围 IndexScan（列已建索引且 low/high 为字面量）。
+        if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::Between &&
+            f.predicate.between_expr.has_value() && !f.predicate.between_expr->negated) {
+            const auto& scan = std::get<LogicalScan>(f.child->node);
+            const auto& be = *f.predicate.between_expr;
+            const auto* col = std::get_if<ColumnRef>(&be.expr);
+            const auto* lo = std::get_if<Literal>(&be.low);
+            const auto* hi = std::get_if<Literal>(&be.high);
+            if (col && lo && hi && scan.table && scan.table->indexed_columns().count(col->name) > 0) {
+                return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name,
+                                                       std::optional<Value>(lo->value), true,
+                                                       std::optional<Value>(hi->value), true);
+            }
+        }
+
         auto child = visit(*f.child);
         return std::make_unique<FilterPlan>(std::move(child), f.predicate);
     }
@@ -514,7 +568,10 @@ namespace corodb::opt {
                         std::vector<Column> cols;
                         cols.reserve(s.columns.size());
                         for (const auto& c: s.columns) {
-                            cols.push_back(Column{ s.table, c.name, c.type });
+                            Column col{ s.table, c.name, c.type };
+                            col.not_null = c.not_null || c.primary_key; // PRIMARY KEY 隐含 NOT NULL
+                            col.primary_key = c.primary_key;
+                            cols.push_back(col);
                         }
                         return std::make_unique<CreateTablePlan>(s.table, std::move(cols), catalog_, storage_);
                     } else if constexpr (std::is_same_v<T, CreateIndexStmt>) {

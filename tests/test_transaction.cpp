@@ -200,6 +200,51 @@ TEST_F(TxnTest, MultipleSessionsHaveIndependentTxnIds) {
 }
 
 // ============================================================
+// 写入路径约束强制（NOT NULL / 类型 / 主键唯一性）
+// ============================================================
+
+TEST_F(TxnTest, NotNullConstraintRejectsNullColumn) {
+    exec_ok("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)");
+    // 省略 name 列 → 默认 NULL → 触发 NOT NULL 约束。
+    bool threw = false;
+    try {
+        db->execute("INSERT INTO t (id) VALUES (1)", sess);
+    } catch (const std::exception& ex) {
+        threw = true;
+        EXPECT_NE(std::string(ex.what()).find("NOT NULL"), std::string::npos) << ex.what();
+    }
+    EXPECT_TRUE(threw) << "NULL into NOT NULL column must be rejected";
+    // 提供全部非 NULL 列则成功。
+    exec_ok("INSERT INTO t VALUES (2, 'ok')");
+}
+
+TEST_F(TxnTest, TypeMismatchRejected) {
+    exec_ok("CREATE TABLE t (id INT, name TEXT)");
+    // 字符串插入 INT 列 → 类型不匹配。
+    EXPECT_THROW(db->execute("INSERT INTO t VALUES ('abc', 'x')", sess), std::runtime_error);
+    // 正确类型仍可插入。
+    exec_ok("INSERT INTO t VALUES (1, 'x')");
+}
+
+TEST_F(TxnTest, DuplicatePrimaryKeyRejectedAutoCommit) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    exec_ok("INSERT INTO t VALUES (1, 10)");
+    // 重复主键→拒绝。
+    EXPECT_THROW(db->execute("INSERT INTO t VALUES (1, 20)", sess), std::runtime_error);
+    // 不同主键仍可插入。
+    exec_ok("INSERT INTO t VALUES (2, 20)");
+}
+
+TEST_F(TxnTest, DuplicatePrimaryKeyRejectedInTxn) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    exec_ok("INSERT INTO t VALUES (1, 10)");
+    exec_ok("BEGIN");
+    // 事务内插入已提交的主键 → 重复键，事务被 poisoned。
+    EXPECT_THROW(db->execute("INSERT INTO t VALUES (1, 99)", sess), std::runtime_error);
+    exec_ok("ROLLBACK");
+}
+
+// ============================================================
 // Phase 2 / T2.2-T2.3 / T3.3: TxnWriteBuffer + 写写冲突
 // ============================================================
 
@@ -588,6 +633,117 @@ TEST_F(MvccIsolationTest, RepeatableReadDoesNotValidateReadSet) {
     EXPECT_TRUE(db->execute("INSERT INTO t VALUES (12, 12)", a).is_success());
     auto cr = db->execute("COMMIT", a);
     EXPECT_TRUE(cr.is_success()) << "RR must not validate read-set";
+}
+
+// =====================================================================
+// 二级索引按主键（value→pk）+ IndexScan 可见性重查
+// =====================================================================
+
+TEST_F(TxnTest, IndexScanReturnsCorrectRows) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT)");
+    exec_ok("CREATE INDEX idx_city ON t (city)");
+    exec_ok("INSERT INTO t VALUES (1, 'NYC')");
+    exec_ok("INSERT INTO t VALUES (2, 'LA')");
+    exec_ok("INSERT INTO t VALUES (3, 'NYC')");
+    // 等值查询走 IndexScan（value→pk）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'NYC'"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'LA'"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'SF'"), 0u);
+}
+
+TEST_F(TxnTest, IndexScanReflectsUpdatesViaRecheck) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT)");
+    exec_ok("CREATE INDEX idx_city ON t (city)");
+    exec_ok("INSERT INTO t VALUES (1, 'NYC')");
+    exec_ok("UPDATE t SET city = 'LA' WHERE id = 1");
+    // 超集索引仍含陈旧的 (NYC→1)，但可见性重查过滤：查 NYC 应 0 行，查 LA 应 1 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'NYC'"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'LA'"), 1u);
+}
+
+TEST_F(TxnTest, IndexScanAfterDeleteFiltersTombstone) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT)");
+    exec_ok("CREATE INDEX idx_city ON t (city)");
+    exec_ok("INSERT INTO t VALUES (1, 'NYC')");
+    exec_ok("INSERT INTO t VALUES (2, 'NYC')");
+    exec_ok("DELETE FROM t WHERE id = 1");
+    // 删除后索引仍含 (NYC→1)，但 lookup_visible 返回 tombstone → 过滤掉，应剩 1 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'NYC'"), 1u);
+}
+
+TEST_F(TxnTest, IndexSurvivesRestart) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT)");
+    exec_ok("CREATE INDEX idx_city ON t (city)");
+    exec_ok("INSERT INTO t VALUES (1, 'NYC')");
+    exec_ok("INSERT INTO t VALUES (2, 'NYC')");
+    // 重启：销毁并在同目录重建 Database，索引从 .idx 文件恢复。
+    db.reset();
+    storage_internal::WalManager::instance().clear_all();
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'NYC'"), 2u);
+}
+
+TEST_F(TxnTest, RangeIndexScanReturnsCorrectRows) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    exec_ok("INSERT INTO t VALUES (1, 20)");
+    exec_ok("INSERT INTO t VALUES (2, 30)");
+    exec_ok("INSERT INTO t VALUES (3, 40)");
+    exec_ok("INSERT INTO t VALUES (4, 50)");
+    // 范围条件走 range IndexScan（有序 value→pk）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age > 30"), 2u);  // 40,50
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age >= 30"), 3u); // 30,40,50
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age < 40"), 2u);  // 20,30
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age <= 40"), 3u); // 20,30,40
+}
+
+TEST_F(TxnTest, RangeIndexScanReflectsUpdatesAndDeletes) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    exec_ok("INSERT INTO t VALUES (1, 20)");
+    exec_ok("INSERT INTO t VALUES (2, 30)");
+    exec_ok("UPDATE t SET age = 99 WHERE id = 1"); // 20 → 99
+    exec_ok("DELETE FROM t WHERE id = 2");         // 删 30
+    // 超集索引仍含 (20→1),(30→2)，但可见性重查过滤：age>50 应只剩 id=1(99)。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age > 50"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age < 50"), 0u);
+}
+
+TEST_F(TxnTest, RangePredicateUsesIndexScan) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    exec_ok("INSERT INTO t VALUES (1, 20)");
+    // EXPLAIN 应显示 range IndexScan（而非 Seq Scan）。
+    auto r = db->execute("EXPLAIN SELECT * FROM t WHERE age > 10", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+    EXPECT_NE(plan.find("age > 10"), std::string::npos) << plan;
+}
+
+TEST_F(TxnTest, BetweenUsesRangeIndexScan) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    exec_ok("INSERT INTO t VALUES (1, 20)");
+    exec_ok("INSERT INTO t VALUES (2, 30)");
+    exec_ok("INSERT INTO t VALUES (3, 40)");
+    exec_ok("INSERT INTO t VALUES (4, 50)");
+    // BETWEEN 双侧含等 → range IndexScan：30,40 命中。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age BETWEEN 30 AND 40"), 2u);
+    // 确认走 IndexScan。
+    auto r = db->execute("EXPLAIN SELECT * FROM t WHERE age BETWEEN 25 AND 45", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
 }
 
 // =====================================================================

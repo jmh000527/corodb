@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,11 @@ namespace corodb {
         [[nodiscard]] bool operator()(const Value& a, const Value& b) const;
     };
 
+    /** @brief Value 的全序比较器（用于有序二级索引，支持范围扫描）。 */
+    struct ValueLess {
+        [[nodiscard]] bool operator()(const Value& a, const Value& b) const;
+    };
+
     class StorageEngine;
 
     /** @brief 列定义。 */
@@ -37,6 +43,8 @@ namespace corodb {
         TypeKind type;
         Oid column_oid{ 0 };
         Oid table_oid{ 0 };
+        bool not_null{ false };    ///< NOT NULL 约束
+        bool primary_key{ false }; ///< PRIMARY KEY 约束（隐含 NOT NULL）
 
         [[nodiscard]] std::string qualified_name() const {
             return table.empty() ? name : table + "." + name;
@@ -147,8 +155,14 @@ namespace corodb {
 
         [[nodiscard]] bool has_index(const std::string& column) const;
 
-        /** @brief 使用列索引查找匹配行。 */
-        [[nodiscard]] std::vector<std::size_t> lookup_index(const std::string& column, const Value& key) const;
+        /** @brief 使用列索引查找匹配行的主键集合（去重）。 */
+        [[nodiscard]] std::vector<int64_t> lookup_index(const std::string& column, const Value& key) const;
+
+        /** @brief 范围查找：返回索引列处于 [low, high]（按 inclusive 标志）区间内的主键集合（去重）。 */
+        [[nodiscard]] std::vector<int64_t> lookup_index_range(const std::string& column,
+                                                              const std::optional<Value>& low, bool low_inclusive,
+                                                              const std::optional<Value>& high,
+                                                              bool high_inclusive) const;
 
         [[nodiscard]] const std::vector<Row>& rows() const noexcept {
             return rows_;
@@ -198,10 +212,11 @@ namespace corodb {
         bool newly_created_{ false };
 
         std::unordered_set<std::string> indexed_columns_;
-        std::unordered_map<std::string, std::unordered_multimap<Value, std::size_t, ValueHash, ValueEq>> indexes_;
+        /// 二级索引：列名 → (列值 → 主键)，有序 multimap（支持等值与范围查找），与内存行缓存解耦。
+        std::unordered_map<std::string, std::multimap<Value, int64_t, ValueLess>> indexes_;
         std::unordered_map<std::string, std::string> index_name_registry_; ///< 索引名 → 列名
 
-        void rebuild_indexes();
+        void index_row(const Row& row);
 
         void update_indexes_for_row(std::size_t rid);
 

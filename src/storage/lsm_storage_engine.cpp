@@ -12,6 +12,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "corodb/common/config.h"
 #include "corodb/storage/storage_engine_common.h"
@@ -309,16 +310,8 @@ namespace corodb {
         for (uint32_t i = 0; i < page_count; ++i) {
             PageId pid{ abs_path, offset_pages + i };
             auto frame = bufpool_.pin(pid);
-            // Verify page checksum even when read from cache (defense-in-depth).
-            auto* hdr = reinterpret_cast<PageHeader*>(frame->data.data());
-            if (hdr->checksum != 0) {
-                uint32_t computed = compute_page_checksum(frame->data);
-                if (computed != hdr->checksum) {
-                    bufpool_.unpin(frame);
-                    throw std::runtime_error("SSTable page checksum mismatch: " + path +
-                                             " page=" + std::to_string(offset_pages + i));
-                }
-            }
+            // SSTable 数据页为原始 payload（无 PageHeader/校验和），不做页级校验，
+            // 避免把 payload 字节误判为校验和（页级校验和待引入真正页头后重做，见 ROADMAP）。
             std::size_t copied = std::min<std::size_t>(
                     Config::kDefaultPageSize, data_bytes - static_cast<std::size_t>(i) * Config::kDefaultPageSize);
             buffer.append(frame->data.data(), copied);
@@ -551,7 +544,22 @@ namespace corodb {
         //   2  = tombstone（旧格式）
         //   11 = insert with commit_ts（payload = [8B ts][row_bytes]）
         //   12 = tombstone with commit_ts（payload = [8B ts][8B key]）
-        for (const auto& rec: wal_read_records(wal_path(name))) {
+        //
+        // 崩溃原子恢复：带 commit_ts 的行记录仅当其 commit_ts 出现在【全局提交日志】中
+        // 才回放，丢弃提交过程中崩溃留下的"撕裂"写入（含跨表事务）。
+        // 向后兼容：若不存在全局提交日志（旧格式或升级前的数据），则全部回放。
+        const auto records = wal_read_records(wal_path(name));
+        ensure_committed_loaded();
+        bool commit_log_present = false;
+        std::unordered_set<uint64_t> committed_ts;
+        {
+            std::lock_guard cl(commit_log_mutex_);
+            commit_log_present = commit_log_present_;
+            committed_ts = committed_ts_;
+        }
+        auto ts_committed = [&](uint64_t ts) { return !commit_log_present || committed_ts.count(ts) > 0; };
+
+        for (const auto& rec: records) {
             if (rec.type == 2) {
                 if (rec.payload.size() < sizeof(int64_t))
                     continue;
@@ -569,12 +577,16 @@ namespace corodb {
                 int64_t key = 0;
                 std::memcpy(&ts, rec.payload.data(), sizeof(uint64_t));
                 std::memcpy(&key, rec.payload.data() + sizeof(uint64_t), sizeof(int64_t));
+                if (!ts_committed(ts))
+                    continue; // 提交未封口的撕裂删除，丢弃
                 state->memtable[MVCCKey{ key, ts }] = MemEntry{ key, Row{}, true, ts };
             } else if (rec.type == 11) {
                 if (rec.payload.size() < sizeof(uint64_t))
                     continue;
                 uint64_t ts = 0;
                 std::memcpy(&ts, rec.payload.data(), sizeof(uint64_t));
+                if (!ts_committed(ts))
+                    continue; // 提交未封口的撕裂插入，丢弃
                 std::string row_bytes = rec.payload.substr(sizeof(uint64_t));
                 Row r = decode_row(row_bytes, schema, name);
                 int64_t key = extract_int_key(r);
@@ -753,6 +765,56 @@ namespace corodb {
 
         lock.unlock();
         wal_sync_path(wpath);
+    }
+
+    /**
+     * @brief 全局提交日志文件路径（跨表原子提交的单一提交点）。
+     */
+    std::string LSMTreeEngine::commit_log_path() const {
+        std::filesystem::path p(base_dir_);
+        p /= "_commit.wal";
+        return p.string();
+    }
+
+    /**
+     * @brief 惰性读取全局提交日志，填充已提交 commit_ts 集合（崩溃恢复判定用）。
+     */
+    void LSMTreeEngine::ensure_committed_loaded() const {
+        std::lock_guard lk(commit_log_mutex_);
+        if (committed_loaded_)
+            return;
+        committed_loaded_ = true;
+        const auto path = commit_log_path();
+        std::error_code ec;
+        commit_log_present_ = std::filesystem::exists(path, ec) && !ec;
+        if (!commit_log_present_)
+            return;
+        for (const auto& rec: wal_read_records(path)) {
+            if (rec.type == kWalCommitBarrier && rec.payload.size() >= sizeof(uint64_t)) {
+                uint64_t ts = 0;
+                std::memcpy(&ts, rec.payload.data(), sizeof(uint64_t));
+                committed_ts_.insert(ts);
+            }
+        }
+    }
+
+    /**
+     * @brief 将 commit_ts 写入全局提交日志（跨表原子提交点）。
+     *
+     * 调用方在写完本次提交对所有表的全部行记录后调用一次。提交记录顺序位于所有
+     * 行记录之后并通过 group commit 落盘；崩溃恢复时凭此判定哪些 commit_ts 已完整提交（含跨表）。
+     */
+    void LSMTreeEngine::mark_committed(uint64_t commit_ts) {
+        if (commit_ts == 0)
+            return; // 旧式无版本写入（type 1/2）无需提交记录
+        ensure_committed_loaded(); // 先并入已持久化的提交集合，避免覆盖历史提交
+        std::string payload(sizeof(uint64_t), '\0');
+        std::memcpy(payload.data(), &commit_ts, sizeof(uint64_t));
+        std::lock_guard lk(commit_log_mutex_);
+        // group-commit 变体：追加提交记录并触发落盘（同时刷新所有待同步的表 WAL）。
+        wal_append_record(commit_log_path(), kWalCommitBarrier, payload);
+        committed_ts_.insert(commit_ts);
+        commit_log_present_ = true;
     }
 
     uint64_t LSMTreeEngine::max_observed_commit_ts() const {
@@ -1137,9 +1199,19 @@ namespace corodb {
      * @param entries 索引条目列表
      */
     void LSMTreeEngine::write_index_rows(const std::string& table, const std::string& column,
-                                         const std::vector<std::pair<Value, std::size_t>>& entries) {
+                                         const std::vector<std::pair<Value, int64_t>>& entries) {
         auto path = index_file_path(base_dir_, table, column); // 获取索引文件路径
         write_index_file(path, entries);                       // 写入索引条目
+    }
+
+    /**
+     * @brief 增量追加单个索引条目（value→pk）：向索引文件追加一个单条 chunk。
+     *
+     * O(1) 摊销，避免基类默认实现的“读全量 + 重写全量”（O(n) 每条）开销。
+     */
+    void LSMTreeEngine::append_index_entry(const std::string& table, const std::string& column, const Value& value,
+                                           int64_t pk) {
+        write_index_file(index_file_path(base_dir_, table, column), { { value, pk } });
     }
 
     /**
@@ -1148,8 +1220,8 @@ namespace corodb {
      * @param column 列名
      * @return 索引条目列表
      */
-    std::vector<std::pair<Value, std::size_t>> LSMTreeEngine::load_index_rows(const std::string& table,
-                                                                              const std::string& column) const {
+    std::vector<std::pair<Value, int64_t>> LSMTreeEngine::load_index_rows(const std::string& table,
+                                                                          const std::string& column) const {
         auto path = index_file_path(base_dir_, table, column); // 获取索引文件路径
         return read_index_file(path);                          // 读取并返回索引条目
     }
@@ -1379,12 +1451,38 @@ namespace corodb {
             }
         }
 
+        // 补充磁盘上存在但本会话未加载的表，确保 checkpoint 覆盖全部表。
+        // 这是安全截断全局提交日志的前提：若某表未刷盘就清空提交日志，
+        // 其 WAL 中待回放的行会因 commit_ts 失去提交证据而在恢复时被丢弃。
+        {
+            std::unordered_set<std::string> seen(tables.begin(), tables.end());
+            std::error_code ec;
+            if (std::filesystem::exists(base_dir_, ec)) {
+                const std::string suffix = ".lsm.L0";
+                for (const auto& entry: std::filesystem::directory_iterator(base_dir_, ec)) {
+                    if (ec)
+                        break;
+                    if (!entry.is_regular_file())
+                        continue;
+                    const std::string fname = entry.path().filename().string();
+                    if (fname.size() > suffix.size() &&
+                        fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                        std::string name = fname.substr(0, fname.size() - suffix.size());
+                        if (seen.insert(name).second)
+                            tables.push_back(name);
+                    }
+                }
+            }
+        }
+
         for (const auto& name: tables) {
             // Load state if needed, then flush memtable if non-empty.
             auto* state = get_or_create_state(name);
             std::map<MVCCKey, MemEntry, MVCCKeyCompare> snapshot;
             {
                 std::unique_lock lock(state->mutex);
+                if (state->schema.empty())
+                    load_state_locked(state, name, {}); // 加载 schema 并从 WAL 重建 memtable
                 if (state->memtable.empty())
                     continue;
                 snapshot = std::move(state->memtable);
@@ -1404,6 +1502,14 @@ namespace corodb {
         // Truncate all WALs.
         for (const auto& name: tables) {
             WalManager::instance().truncate(wal_path(name));
+        }
+
+        // 所有表已刷盘、WAL 已截断 → 全局提交日志中的 commit_ts 不再被任何表 WAL 引用，
+        // 可安全截断，防止其无限增长；同时清空内存中的已提交集合缓存。
+        WalManager::instance().truncate(commit_log_path());
+        {
+            std::lock_guard lk(commit_log_mutex_);
+            committed_ts_.clear();
         }
     }
 

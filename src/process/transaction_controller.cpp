@@ -170,6 +170,10 @@ namespace corodb {
 
                 tbl->refresh_indexes();
             }
+
+            // 写完本次提交对所有表的全部行记录后，将 commit_ts 写入全局提交日志（原子提交点）。
+            // 崩溃恢复时仅回放已提交的 commit_ts，保证（含跨表）提交的原子性。
+            storage_.mark_committed(commit_ts);
         } catch (...) {
             txn_manager_.mark_failed(txn_id);
             session.write_buffer.clear();

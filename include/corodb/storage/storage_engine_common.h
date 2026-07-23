@@ -144,6 +144,12 @@ namespace corodb::storage_internal {
     constexpr uint32_t kIndexMagic = 0x53494458; ///< "SIDX"
     constexpr uint32_t kFooterMagic = 0x46543031; ///< "FT01"
 
+    /// 全局提交日志（commit log）中的提交记录类型。payload = 8 字节 commit_ts（小端）。
+    /// 提交时将 commit_ts 写入独立的全局提交日志作为跨表原子提交点；崩溃恢复时，
+    /// 各表 WAL 中带 commit_ts 的行记录仅当其 commit_ts 出现在提交日志中才回放，
+    /// 否则视为未完成提交的"撕裂"写入而丢弃，从而保证（含跨表）提交的原子性。
+    constexpr uint8_t kWalCommitBarrier = 14;
+
     /** @brief SSTable 点查优化的布隆过滤器（~2% 假阳性率）。 */
     class BloomFilter {
     public:
@@ -313,8 +319,8 @@ namespace corodb::storage_internal {
     [[nodiscard]] int64_t extract_int_key(const Row& row);
     [[nodiscard]] std::string index_file_path(const std::string& base_dir, const std::string& table,
                                               const std::string& column);
-    void write_index_file(const std::string& path, const std::vector<std::pair<Value, std::size_t>>& entries);
-    [[nodiscard]] std::vector<std::pair<Value, std::size_t>> read_index_file(const std::string& path);
-    void compact_index_file(const std::string& path);
+    void write_index_file(const std::string& path, const std::vector<std::pair<Value, int64_t>>& entries);
+    [[nodiscard]] std::vector<std::pair<Value, int64_t>> read_index_file(const std::string& path);
+    void compact_index_file(const std::string& path) ;
 
 } // namespace corodb::storage_internal

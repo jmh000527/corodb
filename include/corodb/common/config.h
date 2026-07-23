@@ -149,7 +149,9 @@ namespace corodb {
         // [wal]
         uint32_t group_commit_delay_us_ = kDefaultGroupCommitDelayUs;
         uint32_t group_commit_batch_size_ = kDefaultGroupCommitBatchSize;
-        std::string wal_sync_mode_ = "fast";
+        // 默认 durable：保证提交后的数据即使断电也不丢失（生产安全）。
+        // 追求极致写吞吐且可容忍断电丢数据时，可改为 fast。
+        std::string wal_sync_mode_ = "durable";
 
         // [server]
         uint16_t server_port_ = kDefaultServerPort;

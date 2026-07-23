@@ -41,6 +41,24 @@ namespace corodb {
     }
 
     /**
+     * @brief Value 的全序比较（用于有序二级索引）。
+     *
+     * 先按 variant 序号排序（NullValue<int64<double<string），同类型内按值排序。
+     * 对单列索引而言值类型一致，因此实际上是同类型比较。
+     */
+    bool ValueLess::operator()(const Value& a, const Value& b) const {
+        if (a.index() != b.index())
+            return a.index() < b.index();
+        if (std::holds_alternative<int64_t>(a))
+            return std::get<int64_t>(a) < std::get<int64_t>(b);
+        if (std::holds_alternative<double>(a))
+            return std::get<double>(a) < std::get<double>(b);
+        if (std::holds_alternative<std::string>(a))
+            return std::get<std::string>(a) < std::get<std::string>(b);
+        return false; // NullValue 视为相等
+    }
+
+    /**
      * @brief Table class constructor
      *
      * This constructor initializes the table structure, handles interaction with the storage engine,
@@ -109,10 +127,9 @@ namespace corodb {
             // 获取或创建对应列的索引
             auto& idx = indexes_[col];
             idx.clear(); // 清空现有索引（如果有）
-            // 将加载的索引条目添加到内存索引中，跳过无效行ID
-            for (const auto& [val, rid]: entries) {
-                if (rid < rows_.size())
-                    idx.emplace(val, rid);
+            // 将持久化的 (列值 → 主键) 条目载入内存索引（超集，查询时按可见性重查过滤）
+            for (const auto& [val, pk]: entries) {
+                idx.emplace(val, pk);
             }
         }
 
@@ -190,13 +207,18 @@ namespace corodb {
         if (!storage_)
             return;                                      // 如果没有存储引擎，直接返回
         storage_->rewrite_table(name_, columns_, rows_); // 重写表数据
-        rebuild_indexes();                               // 重建所有索引
+        // 全表重写后从当前 rows_ 重建各列索引（value→pk）。
+        for (const auto& col: indexed_columns_) {
+            if (auto ci = find_column(col))
+                rebuild_index_for_column(col, *ci);
+        }
     }
 
     void Table::persist_row_upsert(const Row& row, uint64_t commit_ts) {
         if (!storage_)
             return;
         storage_->append_row(name_, columns_, row, commit_ts);
+        index_row(row); // 增量维护二级索引（value→pk 超集）
         bump_write_counter();
     }
 
@@ -227,7 +249,8 @@ namespace corodb {
     }
 
     void Table::refresh_indexes() {
-        rebuild_indexes();
+        // 二级索引改为增量维护（写入时经 index_row 追加 value→pk 超集条目）。
+        // 不再从 rows_（仅最新版本）全量重建，以免丢失历史值而破坏 MVCC 下的索引正确性。
     }
 
     /**
@@ -319,75 +342,71 @@ namespace corodb {
      * @param key 要查找的值
      * @return 匹配的行ID列表
      */
-    std::vector<std::size_t> Table::lookup_index(const std::string& column, const Value& key) const {
-        std::vector<std::size_t> out;    // 结果列表
+    std::vector<int64_t> Table::lookup_index(const std::string& column, const Value& key) const {
+        std::vector<int64_t> out;        // 结果：匹配的主键集合
         auto it = indexes_.find(column); // 查找索引
         if (it == indexes_.end())
-            return out;                           // 索引不存在，返回空列表
+            return out;                            // 索引不存在，返回空列表
+        std::unordered_set<int64_t> seen;
         auto range = it->second.equal_range(key); // 查找匹配的键范围
-        // 收集所有匹配的行ID
+        // 收集所有匹配的主键（超集索引可能含重复 pk，去重）
         for (auto iter = range.first; iter != range.second; ++iter) {
-            out.push_back(iter->second);
+            if (seen.insert(iter->second).second)
+                out.push_back(iter->second);
+        }
+        return out;
+    }
+
+    std::vector<int64_t> Table::lookup_index_range(const std::string& column, const std::optional<Value>& low,
+                                                   bool low_inclusive, const std::optional<Value>& high,
+                                                   bool high_inclusive) const {
+        std::vector<int64_t> out;
+        auto it = indexes_.find(column);
+        if (it == indexes_.end())
+            return out;
+        const auto& m = it->second;
+        // 下界：>=low 用 lower_bound；>low 用 upper_bound。
+        auto begin = low.has_value() ? (low_inclusive ? m.lower_bound(*low) : m.upper_bound(*low)) : m.begin();
+        // 上界：<=high 用 upper_bound（含 high）；<high 用 lower_bound（不含 high）。
+        auto end = high.has_value() ? (high_inclusive ? m.upper_bound(*high) : m.lower_bound(*high)) : m.end();
+        std::unordered_set<int64_t> seen;
+        for (auto iter = begin; iter != end; ++iter) {
+            if (seen.insert(iter->second).second)
+                out.push_back(iter->second);
         }
         return out;
     }
 
     /**
-     * @brief 重建所有索引
+     * @brief 为单行增量维护所有二级索引（value→pk 超集条目）。
+     * @param rid rows_ 中的行下标（仅用于取行数据）。
      */
-    void Table::rebuild_indexes() {
-        // 遍历所有已索引的列
-        for (const auto& col: indexed_columns_) {
-            std::size_t col_idx = columns_.size(); // 初始化为无效索引
-            // 查找列索引
-            for (std::size_t i = 0; i < columns_.size(); ++i) {
-                if (columns_[i].name == col) {
-                    col_idx = i;
-                    break;
-                }
-            }
-            if (col_idx == columns_.size())
-                continue;                           // 列不存在，跳过
-            rebuild_index_for_column(col, col_idx); // 为该列重建索引
-        }
+    void Table::update_indexes_for_row(std::size_t rid) {
+        if (rid >= rows_.size())
+            return;
+        index_row(rows_[rid]);
     }
 
     /**
-     * @brief 为单行增量更新所有索引
+     * @brief 为给定行的每个已索引列追加 (列值 → 主键) 条目（内存 + 持久化）。
      *
-     * 比rebuild_indexes更高效，仅更新新插入行的索引条目
-     * @param rid 新插入行的ID
+     * 采用“超集 + 可见性重查”策略：不删除旧值条目，查询时用 lookup_visible 重查过滤，
+     * 从而在 MVCC（含索引列被更新）下保持正确。
      */
-    void Table::update_indexes_for_row(std::size_t rid) {
-        if (indexed_columns_.empty() || rid >= rows_.size()) {
-            return; // 没有索引或行ID无效
-        }
-
-        const auto& row = rows_[rid];
-
-        // 遍历所有已索引的列
+    void Table::index_row(const Row& row) {
+        if (indexed_columns_.empty())
+            return;
+        if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+            return; // 无 int64 主键的表不建立 value→pk 索引
+        int64_t pk = std::get<int64_t>(row.values.front());
         for (const auto& col_name: indexed_columns_) {
-            // 查找列索引
-            std::size_t col_idx = columns_.size();
-            for (std::size_t i = 0; i < columns_.size(); ++i) {
-                if (columns_[i].name == col_name) {
-                    col_idx = i;
-                    break;
-                }
-            }
-            if (col_idx >= row.values.size()) {
-                continue; // 列不存在或行数据不完整
-            }
-
-            // 增量更新内存索引
-            auto& idx = indexes_[col_name];
-            const auto& value = row.values[col_idx];
-            idx.emplace(value, rid);
-
-            // 增量更新持久化索引
-            if (storage_) {
-                storage_->append_index_entry(name_, col_name, value, rid);
-            }
+            auto ci = find_column(col_name);
+            if (!ci || *ci >= row.values.size())
+                continue;
+            const Value& v = row.values[*ci];
+            indexes_[col_name].emplace(v, pk);
+            if (storage_)
+                storage_->append_index_entry(name_, col_name, v, pk);
         }
     }
 
@@ -399,15 +418,17 @@ namespace corodb {
     void Table::rebuild_index_for_column(const std::string& column, std::size_t col_idx) {
         auto& idx = indexes_[column];
         idx.clear();
-        std::vector<std::pair<Value, std::size_t>> entries;
+        std::vector<std::pair<Value, int64_t>> entries;
         entries.reserve(rows_.size());
 
-        for (std::size_t rid = 0; rid < rows_.size(); ++rid) {
-            const auto& row = rows_[rid];
+        for (const auto& row: rows_) {
             if (col_idx >= row.values.size())
                 continue;
-            idx.emplace(row.values[col_idx], rid);
-            entries.emplace_back(row.values[col_idx], rid);
+            if (row.values.empty() || !std::holds_alternative<int64_t>(row.values.front()))
+                continue;
+            int64_t pk = std::get<int64_t>(row.values.front());
+            idx.emplace(row.values[col_idx], pk);
+            entries.emplace_back(row.values[col_idx], pk);
         }
 
         if (storage_) {
