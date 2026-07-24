@@ -179,6 +179,11 @@ namespace corodb {
             return rows_;
         }
 
+        /** @brief 是否为存储型表（有底层存储引擎）。无存储的纯内存表仅用于测试夹具。 */
+        [[nodiscard]] bool has_storage() const noexcept {
+            return storage_ != nullptr;
+        }
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }

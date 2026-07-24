@@ -92,8 +92,7 @@ namespace corodb {
                 if (!disk_columns.empty()) {
                     columns_ = std::move(disk_columns);
                 }
-                // 从存储加载表数据行
-                rows_ = storage_->load_rows(name_, columns_);
+                // 不再全量加载 rows_（去除内存天花板）：存储型表的读取一律经 scan_visible 流式获取。
             } catch (const std::exception&) {
                 // 文件不兼容或损坏时，重新创建表
                 storage_->create_table(name_, columns_);
@@ -148,13 +147,12 @@ namespace corodb {
         }
         if (storage_) {
             storage_->append_row(name_, columns_, row); // 持久化到存储
+            index_row(row);                             // 增量维护索引（不经 rows_，去除全量常驻）
+        } else {
+            const std::size_t new_rid = rows_.size(); // 新行的ID
+            rows_.emplace_back(std::move(row));       // 添加到内存中的行集合
+            update_indexes_for_row(new_rid);          // 增量更新索引
         }
-
-        const std::size_t new_rid = rows_.size(); // 新行的ID
-        rows_.emplace_back(std::move(row));       // 添加到内存中的行集合
-
-        // 增量更新索引（而不是完全重建）
-        update_indexes_for_row(new_rid);
         bump_write_counter();
     }
 
@@ -178,20 +176,20 @@ namespace corodb {
             }
         }
 
-        // 使用批量接口持久化到存储（如果存储引擎支持优化版本）
         if (storage_) {
+            // 持久化到存储 + 增量维护索引（不经 rows_，去除全量常驻）。
             storage_->append_rows(name_, columns_, rows, commit_ts);
-        }
-
-        // 批量添加到内存中
-        const std::size_t start_rid = rows_.size();
-        for (auto& row: rows) {
-            rows_.emplace_back(std::move(row));
-        }
-
-        // 增量更新索引
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            update_indexes_for_row(start_rid + i);
+            for (const auto& row: rows)
+                index_row(row);
+        } else {
+            // 纯内存表：批量添加到 rows_。
+            const std::size_t start_rid = rows_.size();
+            for (auto& row: rows) {
+                rows_.emplace_back(std::move(row));
+            }
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                update_indexes_for_row(start_rid + i);
+            }
         }
         bump_write_counter();
     }
@@ -206,8 +204,10 @@ namespace corodb {
     void Table::rewrite_all() {
         if (!storage_)
             return;                                      // 如果没有存储引擎，直接返回
-        storage_->rewrite_table(name_, columns_, rows_); // 重写表数据
-        // 全表重写后从当前 rows_ 重建各列索引（value→pk）。
+        // 从可见快照重写（去除 rows_ 依赖）。
+        auto src = storage_->scan_visible(name_, columns_, UINT64_MAX);
+        storage_->rewrite_table(name_, columns_, src); // 重写表数据
+        // 全表重写后重建各列索引（value→pk）。
         for (const auto& col: indexed_columns_) {
             if (auto ci = find_column(col))
                 rebuild_index_for_column(col, *ci);
@@ -417,10 +417,12 @@ namespace corodb {
     void Table::rebuild_index_for_column(const std::string& column, std::size_t col_idx) {
         auto& idx = indexes_[column];
         idx.clear();
+        // 数据来源：存储型从可见快照重建（去除 rows_ 依赖），纯内存表读 rows_。
+        std::vector<Row> src = storage_ ? storage_->scan_visible(name_, columns_, UINT64_MAX) : rows_;
         std::vector<std::pair<Value, Value>> entries;
-        entries.reserve(rows_.size());
+        entries.reserve(src.size());
 
-        for (const auto& row: rows_) {
+        for (const auto& row: src) {
             if (row.values.empty() || col_idx >= row.values.size())
                 continue;
             const Value& pk = row.values.front();

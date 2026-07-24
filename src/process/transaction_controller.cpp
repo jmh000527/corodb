@@ -135,36 +135,40 @@ namespace corodb {
                 auto tbl = catalog_.lookup(tname);
                 if (!tbl)
                     continue;
-                auto& rows = tbl->rows_mut();
 
-                if (!tbuf.deletes.empty()) {
-                    std::erase_if(rows, [&](const Row& row) -> bool {
-                        if (row.values.empty())
-                            return false;
-                        return tbuf.deletes.count(row.values.front()) > 0;
-                    });
-                    // 先从内存行集中移除，再写 WAL
+                if (tbl->has_storage()) {
+                    // 存储型：直接持久化（去除 rows_ 全量常驻；读取走 scan_visible）。
                     for (const Value& k: tbuf.deletes) {
                         tbl->persist_row_delete(k, commit_ts);
                     }
-                }
-
-                if (!tbuf.upserts.empty()) {
-                    // 构建 pk → index 映射，用于 in-place 更新已有行
-                    std::unordered_map<Value, std::size_t, ValueHash, ValueEq> idx_by_pk;
-                    idx_by_pk.reserve(rows.size());
-                    for (std::size_t i = 0; i < rows.size(); ++i) {
-                        if (!rows[i].values.empty())
-                            idx_by_pk[rows[i].values.front()] = i;
-                    }
                     for (auto& [pk, row]: tbuf.upserts) {
-                        auto it = idx_by_pk.find(pk);
-                        if (it != idx_by_pk.end()) {
-                            rows[it->second] = row;
-                        } else {
-                            rows.push_back(row);
-                        }
                         tbl->persist_row_upsert(row, commit_ts);
+                    }
+                } else {
+                    // 纯内存表：将缓冲应用到 rows_。
+                    auto& rows = tbl->rows_mut();
+                    if (!tbuf.deletes.empty()) {
+                        std::erase_if(rows, [&](const Row& row) -> bool {
+                            if (row.values.empty())
+                                return false;
+                            return tbuf.deletes.count(row.values.front()) > 0;
+                        });
+                    }
+                    if (!tbuf.upserts.empty()) {
+                        std::unordered_map<Value, std::size_t, ValueHash, ValueEq> idx_by_pk;
+                        idx_by_pk.reserve(rows.size());
+                        for (std::size_t i = 0; i < rows.size(); ++i) {
+                            if (!rows[i].values.empty())
+                                idx_by_pk[rows[i].values.front()] = i;
+                        }
+                        for (auto& [pk, row]: tbuf.upserts) {
+                            auto it = idx_by_pk.find(pk);
+                            if (it != idx_by_pk.end()) {
+                                rows[it->second] = row;
+                            } else {
+                                rows.push_back(row);
+                            }
+                        }
                     }
                 }
 

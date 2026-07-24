@@ -845,6 +845,25 @@ TEST_F(TxnTest, CheckpointThenReadInProcess) {
     EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 2"), 0u);
 }
 
+TEST_F(TxnTest, StorageBackedTableDoesNotMirrorRowsInMemory) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    for (int i = 1; i <= 50; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", " + std::to_string(i * 10) + ")");
+    // 数据可查询（经 scan_visible 流式获取），但 rows_ 不再全量常驻（去内存天花板）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 50u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 250"), 1u);
+    auto tbl = db->get_catalog().lookup("t");
+    ASSERT_NE(tbl, nullptr);
+    EXPECT_TRUE(tbl->has_storage());
+    EXPECT_TRUE(tbl->rows().empty()) << "storage-backed table must not keep full rows_ in memory";
+    // 更新/删除后仍正确，且 rows_ 仍为空。
+    exec_ok("UPDATE t SET v = 999 WHERE id = 1");
+    exec_ok("DELETE FROM t WHERE id = 2");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 999"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 49u);
+    EXPECT_TRUE(tbl->rows().empty()) << "writes must not repopulate rows_ for a storage-backed table";
+}
+
 // =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================

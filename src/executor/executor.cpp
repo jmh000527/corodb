@@ -326,7 +326,9 @@ namespace corodb {
         // snapshot_ts 生效时走快照读路径，既覆盖事务内一致性，也覆盖自动提交查询。
         std::unordered_set<Value, ValueHash, ValueEq> emitted_buffer_keys;
         const uint64_t snapshot_ts = sess ? sess->snapshot_ts : 0;
-        const bool use_mvcc = snapshot_ts != 0 && sess;
+        // 存储型表一律走 scan_visible（去除 rows_ 全量常驻）；无 snapshot 时取最新已提交（MAX）。
+        // 仅无存储的纯内存表（测试夹具）读 rows_。
+        const bool from_storage = plan.table->has_storage();
         // 只有 SERIALIZABLE 隔离才记录读集，提交阶段再做验证。
         const bool track_read_set = sess && sess->in_transaction() && sess->isolation == IsolationLevel::Serializable;
         // Serializable 幻读防护：读取时记录表的 write_version。
@@ -340,8 +342,8 @@ namespace corodb {
                 return;
             sess->read_set[plan.table->name()].insert(row.values.front());
         };
-        if (use_mvcc) {
-            auto rows = plan.table->scan_visible(snapshot_ts);
+        if (from_storage) {
+            auto rows = plan.table->scan_visible(snapshot_ts != 0 ? snapshot_ts : std::numeric_limits<uint64_t>::max());
             check_timeout(ctx);
             for (const auto& row: rows) {
                 if (buf && !row.values.empty()) {
@@ -1030,9 +1032,14 @@ namespace corodb {
                             sess_a && sess_a->in_transaction() && sess_a->isolation == IsolationLevel::Serializable;
                     if (!track_read_set_a && (!buf_a || (buf_a->upserts.empty() && buf_a->deletes.empty()))) {
                         const uint64_t snapshot_ts_a = sess_a ? sess_a->snapshot_ts : 0;
-                        std::size_t row_count = (snapshot_ts_a != 0 && sess_a)
-                                                        ? seq_child->table->scan_visible(snapshot_ts_a).size()
-                                                        : seq_child->table->rows().size();
+                        std::size_t row_count =
+                                seq_child->table->has_storage()
+                                        ? seq_child->table
+                                                  ->scan_visible(snapshot_ts_a != 0
+                                                                         ? snapshot_ts_a
+                                                                         : std::numeric_limits<uint64_t>::max())
+                                                  .size()
+                                        : seq_child->table->rows().size();
                         for (auto& st: global.states) {
                             st.count = static_cast<int64_t>(row_count);
                         }
@@ -1515,8 +1522,12 @@ namespace corodb {
                     return new_row;
                 };
 
-                // 扫 rows_：跳过 buffer 标删的 pk，buffer 里有 upsert 的 pk 用 buffer 版
-                for (const auto& base_row: upd->table->rows()) {
+                // 基线可见行：存储型走 scan_visible（去除 rows_ 常驻），纯内存表读 rows_。
+                std::vector<Row> base = upd->table->has_storage()
+                                                ? upd->table->scan_visible(std::numeric_limits<uint64_t>::max())
+                                                : upd->table->rows();
+                // 扫基线：跳过 buffer 标删的 pk，buffer 里有 upsert 的 pk 用 buffer 版
+                for (const auto& base_row: base) {
                     if (base_row.values.empty())
                         continue;
                     Value pk = base_row.values.front();
@@ -1530,11 +1541,11 @@ namespace corodb {
                         tbuf.upserts[pk] = std::move(*nr);
                     }
                 }
-                // 还要扫 buffer 里"纯 INSERT"（pk 不在 rows_）的条目：避免 update 漏掉自己刚 INSERT 的行
+                // 还要扫 buffer 里"纯 INSERT"（pk 不在基线）的条目：避免 update 漏掉自己刚 INSERT 的行
                 std::vector<Value> pure_inserts;
                 {
                     std::unordered_set<Value, ValueHash, ValueEq> rows_pk;
-                    for (const auto& r: upd->table->rows()) {
+                    for (const auto& r: base) {
                         if (!r.values.empty())
                             rows_pk.insert(r.values.front());
                     }
@@ -1554,34 +1565,46 @@ namespace corodb {
                 co_return;
             }
 
-            // 自动提交路径：直接修改 rows_ + 增量持久化
-            auto& rows = upd->table->rows_mut();
-            std::vector<Row*> modified;
-            modified.reserve(rows.size());
-            for (auto& row: rows) {
-                Record rec = make_record_from_row(*upd->table, row, upd->table->name());
-                if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
-                    continue;
-                // 先计算并校验所有赋值，再一次性写入，避免约束违反时留下部分修改。
-                std::vector<std::pair<std::size_t, Value>> pending;
-                pending.reserve(upd->assignments.size());
-                for (const auto& a: upd->assignments) {
-                    Value v = std::holds_alternative<Literal>(a.value) ? std::get<Literal>(a.value).value
-                                                                       : eval_expression(rec, a.value);
-                    validate_value(upd->table->columns()[a.column_index], v);
-                    pending.emplace_back(a.column_index, std::move(v));
+            // 自动提交路径
+            uint64_t ts = sess ? sess->auto_commit_ts : 0;
+            if (upd->table->has_storage()) {
+                // 存储型：从可见快照计算更新行并持久化，不再维护 rows_。
+                auto base = upd->table->scan_visible(std::numeric_limits<uint64_t>::max());
+                for (const auto& row: base) {
+                    Record rec = make_record_from_row(*upd->table, row, upd->table->name());
+                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
+                        continue;
+                    Row new_row = row;
+                    for (const auto& a: upd->assignments) {
+                        Value v = std::holds_alternative<Literal>(a.value) ? std::get<Literal>(a.value).value
+                                                                           : eval_expression(rec, a.value);
+                        validate_value(upd->table->columns()[a.column_index], v);
+                        new_row.values[a.column_index] = std::move(v);
+                    }
+                    upd->table->persist_row_upsert(new_row, ts);
                 }
-                for (auto& [idx, v]: pending)
-                    row.values[idx] = std::move(v);
-                modified.push_back(&row);
-            }
-            for (Row* r: modified) {
-                uint64_t ts = sess ? sess->auto_commit_ts : 0;
-                upd->table->persist_row_upsert(*r, ts);
+            } else {
+                // 纯内存表：就地修改 rows_。
+                auto& rows = upd->table->rows_mut();
+                for (auto& row: rows) {
+                    Record rec = make_record_from_row(*upd->table, row, upd->table->name());
+                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
+                        continue;
+                    std::vector<std::pair<std::size_t, Value>> pending;
+                    pending.reserve(upd->assignments.size());
+                    for (const auto& a: upd->assignments) {
+                        Value v = std::holds_alternative<Literal>(a.value) ? std::get<Literal>(a.value).value
+                                                                           : eval_expression(rec, a.value);
+                        validate_value(upd->table->columns()[a.column_index], v);
+                        pending.emplace_back(a.column_index, std::move(v));
+                    }
+                    for (auto& [idx, v]: pending)
+                        row.values[idx] = std::move(v);
+                }
             }
             upd->table->refresh_indexes();
             // 自动提交语句写完全部行后写入全局提交日志（原子提交点），保证崩溃恢复的原子性。
-            if (auto ts = sess ? sess->auto_commit_ts : 0; ts != 0 && ctx.storage)
+            if (ts != 0 && ctx.storage)
                 ctx.storage->mark_committed(ts);
             co_return;
         }
@@ -1601,8 +1624,12 @@ namespace corodb {
                     return evaluate_bool_expr(*del->where, rec) == SqlBool::True;
                 };
 
-                // 扫 rows_：标记 deletes
-                for (const auto& base_row: del->table->rows()) {
+                // 基线可见行：存储型走 scan_visible，纯内存表读 rows_。
+                std::vector<Row> base = del->table->has_storage()
+                                                ? del->table->scan_visible(std::numeric_limits<uint64_t>::max())
+                                                : del->table->rows();
+                // 扫基线：标记 deletes
+                for (const auto& base_row: base) {
                     if (base_row.values.empty())
                         continue;
                     Value pk = base_row.values.front();
@@ -1621,7 +1648,7 @@ namespace corodb {
                 std::vector<Value> to_remove_inserts;
                 {
                     std::unordered_set<Value, ValueHash, ValueEq> rows_pk;
-                    for (const auto& r: del->table->rows()) {
+                    for (const auto& r: base) {
                         if (!r.values.empty())
                             rows_pk.insert(r.values.front());
                     }
@@ -1638,27 +1665,39 @@ namespace corodb {
             }
 
             // 自动提交路径
-            auto& rows = del->table->rows_mut();
+            uint64_t ts = sess ? sess->auto_commit_ts : 0;
             std::vector<Value> deleted_keys;
-            deleted_keys.reserve(rows.size());
-            std::erase_if(rows, [&](const Row& row) -> bool {
-                if (del->where.has_value()) {
-                    Record rec = make_record_from_row(*del->table, row, del->table->name());
-                    if (evaluate_bool_expr(*del->where, rec) != SqlBool::True)
-                        return false;
+            if (del->table->has_storage()) {
+                // 存储型：从可见快照筛出匹配行，写 tombstone 持久化（不再维护 rows_）。
+                auto base = del->table->scan_visible(std::numeric_limits<uint64_t>::max());
+                for (const auto& row: base) {
+                    if (del->where.has_value()) {
+                        Record rec = make_record_from_row(*del->table, row, del->table->name());
+                        if (evaluate_bool_expr(*del->where, rec) != SqlBool::True)
+                            continue;
+                    }
+                    if (!row.values.empty())
+                        deleted_keys.push_back(row.values.front());
                 }
-                if (!row.values.empty()) {
-                    deleted_keys.push_back(row.values.front());
-                }
-                return true;
-            });
-            for (const Value& k: deleted_keys) {
-                uint64_t ts = sess ? sess->auto_commit_ts : 0;
-                del->table->persist_row_delete(k, ts);
+            } else {
+                // 纯内存表：就地从 rows_ 删除。
+                auto& rows = del->table->rows_mut();
+                std::erase_if(rows, [&](const Row& row) -> bool {
+                    if (del->where.has_value()) {
+                        Record rec = make_record_from_row(*del->table, row, del->table->name());
+                        if (evaluate_bool_expr(*del->where, rec) != SqlBool::True)
+                            return false;
+                    }
+                    if (!row.values.empty())
+                        deleted_keys.push_back(row.values.front());
+                    return true;
+                });
             }
+            for (const Value& k: deleted_keys)
+                del->table->persist_row_delete(k, ts);
             del->table->refresh_indexes();
             // 自动提交语句写完全部删除后写入全局提交日志（原子提交点），保证崩溃恢复的原子性。
-            if (auto ts = sess ? sess->auto_commit_ts : 0; ts != 0 && ctx.storage)
+            if (ts != 0 && ctx.storage)
                 ctx.storage->mark_committed(ts);
             co_return;
         }
