@@ -1074,72 +1074,138 @@ namespace corodb {
                 mem_copy.push_back(MemEntry{ k.pk, e.row, e.tombstone, e.commit_ts });
         }
 
-        // 2) 各层 SSTable 源（不可变，shared_ptr 到已解码向量；均按 (pk asc, ts desc) 排序）。
-        std::vector<std::shared_ptr<const std::vector<MemEntry>>> ssts;
-        int max_level = 0;
-        while (std::filesystem::exists(level_path(name, max_level + 1)))
-            ++max_level;
-        for (int l = 0; l <= max_level; ++l) {
-            std::string p = (l == 0) ? base_path(name) : level_path(name, l);
-            if (std::filesystem::exists(p))
-                ssts.push_back(read_sstable(p, columns));
+        // 2) 各层 SSTable 源：惰性按页解码（真·大于内存读路径，不整体解码，仅按需 pin 页）。
+        //    记录严格为 type∈{1,2}（见 write_sstable）；数据区之后是零填充与 footer，
+        //    footer/填充首字节均非 1/2（footer magic 低字节=0x31），故遇到非 {1,2} 类型即记录结束。
+        struct SstSrc {
+            std::string path;       ///< 绝对路径
+            uint32_t offset_pages;  ///< 数据区起始页号
+            std::size_t data_bytes; ///< 数据区字节数（含填充+footer）
+            std::size_t pos;        ///< 数据区内当前字节偏移
+        };
+        std::vector<SstSrc> ssts;
+        {
+            int max_level = 0;
+            while (std::filesystem::exists(level_path(name, max_level + 1)))
+                ++max_level;
+            for (int l = 0; l <= max_level; ++l) {
+                std::string p = (l == 0) ? base_path(name) : level_path(name, l);
+                std::error_code ec;
+                if (!std::filesystem::exists(p, ec) || ec)
+                    continue;
+                std::string abs_p = std::filesystem::absolute(p).string();
+                std::ifstream ifs(abs_p, std::ios::binary);
+                if (!ifs)
+                    continue;
+                uint32_t magic = 0, schema_bytes = 0;
+                ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+                ifs.read(reinterpret_cast<char*>(&schema_bytes), sizeof(schema_bytes));
+                if (!ifs || magic != kLsmMagic)
+                    continue;
+                std::size_t hdr = sizeof(magic) + sizeof(schema_bytes) + schema_bytes;
+                std::size_t aligned = align_up(hdr, Config::kDefaultPageSize);
+                std::size_t fsz = std::filesystem::file_size(abs_p);
+                if (fsz < aligned)
+                    continue;
+                ssts.push_back(
+                        SstSrc{ abs_p, static_cast<uint32_t>(aligned / Config::kDefaultPageSize), fsz - aligned, 0 });
+            }
         }
 
-        // 3) k 路归并：所有源按 MVCCKey (pk asc, ts desc) 有序。对每个 pk，按 ts 降序取首个
-        //    ts<=snapshot 的可见版本；非 tombstone 则 yield。全程流式，不物化结果集。
-        struct Cursor {
-            const std::vector<MemEntry>* vec;
-            std::size_t pos;
+        // 从某 SSTable 数据区读 n 字节（跨页则逐页经 Buffer Pool pin/copy/unpin，不跨 co_yield 持 pin）。
+        auto read_bytes = [&](const SstSrc& s, std::size_t off, std::size_t n) -> std::string {
+            std::string out;
+            out.reserve(n);
+            std::size_t got = 0;
+            while (got < n) {
+                std::size_t cur_off = off + got;
+                uint32_t page = s.offset_pages + static_cast<uint32_t>(cur_off / Config::kDefaultPageSize);
+                std::size_t in_page = cur_off % Config::kDefaultPageSize;
+                std::size_t take = std::min(Config::kDefaultPageSize - in_page, n - got);
+                PageId pid{ s.path, page };
+                auto frame = bufpool_.pin(pid);
+                out.append(frame->data.data() + in_page, take);
+                bufpool_.unpin(frame);
+                got += take;
+            }
+            return out;
         };
-        std::vector<Cursor> cur;
-        cur.push_back({ &mem_copy, 0 });
-        for (const auto& sp: ssts)
-            cur.push_back({ sp.get(), 0 });
+        // 读取 s.pos 处的下一条记录；返回 nullopt 表示到达记录末尾（填充/footer/截断）。
+        auto next_rec = [&](SstSrc& s) -> std::optional<MemEntry> {
+            constexpr std::size_t kHdr = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t); // 1+8+4
+            if (s.pos + kHdr > s.data_bytes)
+                return std::nullopt;
+            std::string h = read_bytes(s, s.pos, kHdr);
+            uint8_t type = static_cast<uint8_t>(h[0]);
+            if (type != 1 && type != 2)
+                return std::nullopt; // 非记录类型 → 记录区结束
+            uint64_t ts = 0;
+            uint32_t len = 0;
+            std::memcpy(&ts, h.data() + 1, sizeof(ts));
+            std::memcpy(&len, h.data() + 1 + sizeof(ts), sizeof(len));
+            if (s.pos + kHdr + len > s.data_bytes)
+                return std::nullopt; // 截断 → 结束
+            std::string rec = (len > 0) ? read_bytes(s, s.pos + kHdr, len) : std::string();
+            s.pos += kHdr + len;
+            if (type == 1) {
+                Row row = decode_row(rec, columns, s.path);
+                Value pk = extract_key(row);
+                return MemEntry{ pk, std::move(row), false, ts };
+            }
+            Value pk = rec.empty() ? Value{ NullValue{} } : decode_key(rec);
+            return MemEntry{ pk, Row{}, true, ts };
+        };
+
+        // 3) 可 peek 的 k 路归并源：下标 0 = memtable（向量游标），其余 = SSTable 惰性读取器。
+        std::vector<std::optional<MemEntry>> head(1 + ssts.size());
+        std::size_t mem_pos = 0;
+        auto refill = [&](std::size_t i) {
+            if (i == 0)
+                head[0] = (mem_pos < mem_copy.size()) ? std::optional<MemEntry>(mem_copy[mem_pos++]) : std::nullopt;
+            else
+                head[i] = next_rec(ssts[i - 1]);
+        };
+        for (std::size_t i = 0; i < head.size(); ++i)
+            refill(i);
 
         MVCCKeyCompare cmp;
         ValueEq veq;
         while (true) {
             // 找到所有源当前头部里最小的 MVCCKey，确定下一个待处理 pk。
             int min_i = -1;
-            for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
-                if (cur[i].pos >= cur[i].vec->size())
+            for (int i = 0; i < static_cast<int>(head.size()); ++i) {
+                if (!head[i])
                     continue;
                 if (min_i < 0) {
                     min_i = i;
                     continue;
                 }
-                const MemEntry& ei = (*cur[i].vec)[cur[i].pos];
-                const MemEntry& em = (*cur[min_i].vec)[cur[min_i].pos];
-                if (cmp(MVCCKey{ ei.pk, ei.commit_ts }, MVCCKey{ em.pk, em.commit_ts }))
+                if (cmp(MVCCKey{ head[i]->pk, head[i]->commit_ts }, MVCCKey{ head[min_i]->pk, head[min_i]->commit_ts }))
                     min_i = i;
             }
             if (min_i < 0)
                 break; // 所有源耗尽
 
-            const Value pk = (*cur[min_i].vec)[cur[min_i].pos].pk;
+            const Value pk = head[min_i]->pk;
 
             // 消费该 pk 的所有版本（跨源，按 ts 降序），取首个可见版本。
             bool decided = false;
             MemEntry chosen;
             while (true) {
                 int gi = -1;
-                for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
-                    if (cur[i].pos >= cur[i].vec->size())
+                for (int i = 0; i < static_cast<int>(head.size()); ++i) {
+                    if (!head[i] || !veq(head[i]->pk, pk))
                         continue;
-                    const MemEntry& e = (*cur[i].vec)[cur[i].pos];
-                    if (!veq(e.pk, pk))
-                        continue;
-                    if (gi < 0 || e.commit_ts > (*cur[gi].vec)[cur[gi].pos].commit_ts)
+                    if (gi < 0 || head[i]->commit_ts > head[gi]->commit_ts)
                         gi = i;
                 }
                 if (gi < 0)
                     break; // 该 pk 版本消费完毕
-                const MemEntry& e = (*cur[gi].vec)[cur[gi].pos];
-                if (!decided && e.commit_ts <= snapshot_ts) {
-                    chosen = e;
+                if (!decided && head[gi]->commit_ts <= snapshot_ts) {
+                    chosen = *head[gi];
                     decided = true;
                 }
-                cur[gi].pos++;
+                refill(static_cast<std::size_t>(gi)); // 前进该源
             }
             if (decided && !chosen.tombstone && !chosen.row.values.empty())
                 co_yield std::move(chosen.row);

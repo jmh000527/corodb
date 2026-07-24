@@ -881,6 +881,22 @@ TEST_F(TxnTest, StreamingScanMergesMemtableAndSSTable) {
     EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 4"), 1u);  // 仅 memtable
 }
 
+TEST_F(TxnTest, StreamingScanAcrossManySSTablePages) {
+    exec_ok("CREATE TABLE t (id INT, name TEXT)");
+    for (int i = 1; i <= 500; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", 'row-" + std::to_string(i) + "-padding-xxxxxxxx')");
+    exec_ok("CHECKPOINT"); // flush 到 SSTable，数据跨多页
+    // 流式扫描逐页读取（经 Buffer Pool pin 页，记录跨页正确拼接）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 500u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 250"), 1u);
+    // 更新一条（进 memtable）+ 删一条，再全表流式读，验证跨源归并 + 跨页。
+    exec_ok("UPDATE t SET name = 'updated' WHERE id = 1");
+    exec_ok("DELETE FROM t WHERE id = 500");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 499u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE name = 'updated'"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 500"), 0u);
+}
+
 // =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================
