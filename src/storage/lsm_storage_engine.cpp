@@ -1060,6 +1060,92 @@ namespace corodb {
         return result;
     }
 
+    std::generator<Row> LSMTreeEngine::scan_visible_stream(const std::string& name, const std::vector<Column>& columns,
+                                                           uint64_t snapshot_ts) {
+        load_state_if_needed(name, columns);
+        auto* state = get_or_create_state(name);
+
+        // 1) memtable 快照拷贝（受 memtable_limit 约束，有界）——避免跨 co_yield 持锁阻塞写入。
+        std::vector<MemEntry> mem_copy;
+        {
+            std::shared_lock lock(state->mutex);
+            mem_copy.reserve(state->memtable.size());
+            for (const auto& [k, e]: state->memtable)
+                mem_copy.push_back(MemEntry{ k.pk, e.row, e.tombstone, e.commit_ts });
+        }
+
+        // 2) 各层 SSTable 源（不可变，shared_ptr 到已解码向量；均按 (pk asc, ts desc) 排序）。
+        std::vector<std::shared_ptr<const std::vector<MemEntry>>> ssts;
+        int max_level = 0;
+        while (std::filesystem::exists(level_path(name, max_level + 1)))
+            ++max_level;
+        for (int l = 0; l <= max_level; ++l) {
+            std::string p = (l == 0) ? base_path(name) : level_path(name, l);
+            if (std::filesystem::exists(p))
+                ssts.push_back(read_sstable(p, columns));
+        }
+
+        // 3) k 路归并：所有源按 MVCCKey (pk asc, ts desc) 有序。对每个 pk，按 ts 降序取首个
+        //    ts<=snapshot 的可见版本；非 tombstone 则 yield。全程流式，不物化结果集。
+        struct Cursor {
+            const std::vector<MemEntry>* vec;
+            std::size_t pos;
+        };
+        std::vector<Cursor> cur;
+        cur.push_back({ &mem_copy, 0 });
+        for (const auto& sp: ssts)
+            cur.push_back({ sp.get(), 0 });
+
+        MVCCKeyCompare cmp;
+        ValueEq veq;
+        while (true) {
+            // 找到所有源当前头部里最小的 MVCCKey，确定下一个待处理 pk。
+            int min_i = -1;
+            for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
+                if (cur[i].pos >= cur[i].vec->size())
+                    continue;
+                if (min_i < 0) {
+                    min_i = i;
+                    continue;
+                }
+                const MemEntry& ei = (*cur[i].vec)[cur[i].pos];
+                const MemEntry& em = (*cur[min_i].vec)[cur[min_i].pos];
+                if (cmp(MVCCKey{ ei.pk, ei.commit_ts }, MVCCKey{ em.pk, em.commit_ts }))
+                    min_i = i;
+            }
+            if (min_i < 0)
+                break; // 所有源耗尽
+
+            const Value pk = (*cur[min_i].vec)[cur[min_i].pos].pk;
+
+            // 消费该 pk 的所有版本（跨源，按 ts 降序），取首个可见版本。
+            bool decided = false;
+            MemEntry chosen;
+            while (true) {
+                int gi = -1;
+                for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
+                    if (cur[i].pos >= cur[i].vec->size())
+                        continue;
+                    const MemEntry& e = (*cur[i].vec)[cur[i].pos];
+                    if (!veq(e.pk, pk))
+                        continue;
+                    if (gi < 0 || e.commit_ts > (*cur[gi].vec)[cur[gi].pos].commit_ts)
+                        gi = i;
+                }
+                if (gi < 0)
+                    break; // 该 pk 版本消费完毕
+                const MemEntry& e = (*cur[gi].vec)[cur[gi].pos];
+                if (!decided && e.commit_ts <= snapshot_ts) {
+                    chosen = e;
+                    decided = true;
+                }
+                cur[gi].pos++;
+            }
+            if (decided && !chosen.tombstone && !chosen.row.values.empty())
+                co_yield std::move(chosen.row);
+        }
+    }
+
     /**
      * @brief 重写LSM树表的所有数据
      * @param name 表名

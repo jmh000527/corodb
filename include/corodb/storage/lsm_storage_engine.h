@@ -89,6 +89,11 @@ namespace corodb {
         [[nodiscard]] std::vector<Row> scan_visible(const std::string& name, const std::vector<Column>& columns,
                                                     uint64_t snapshot_ts) override;
 
+        /** @brief MVCC 流式扫描：对 memtable 快照 + 各 SSTable 源做 k 路归并，逐行惰性 yield。 */
+        [[nodiscard]] std::generator<Row> scan_visible_stream(const std::string& name,
+                                                              const std::vector<Column>& columns,
+                                                              uint64_t snapshot_ts) override;
+
         /** @brief 列出表的所有索引列名。 */
         [[nodiscard]] std::vector<std::string> list_indexes(const std::string& table) const override;
 

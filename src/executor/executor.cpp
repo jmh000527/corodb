@@ -326,9 +326,6 @@ namespace corodb {
         // snapshot_ts 生效时走快照读路径，既覆盖事务内一致性，也覆盖自动提交查询。
         std::unordered_set<Value, ValueHash, ValueEq> emitted_buffer_keys;
         const uint64_t snapshot_ts = sess ? sess->snapshot_ts : 0;
-        // 存储型表一律走 scan_visible（去除 rows_ 全量常驻）；无 snapshot 时取最新已提交（MAX）。
-        // 仅无存储的纯内存表（测试夹具）读 rows_。
-        const bool from_storage = plan.table->has_storage();
         // 只有 SERIALIZABLE 隔离才记录读集，提交阶段再做验证。
         const bool track_read_set = sess && sess->in_transaction() && sess->isolation == IsolationLevel::Serializable;
         // Serializable 幻读防护：读取时记录表的 write_version。
@@ -342,44 +339,26 @@ namespace corodb {
                 return;
             sess->read_set[plan.table->name()].insert(row.values.front());
         };
-        if (from_storage) {
-            auto rows = plan.table->scan_visible(snapshot_ts != 0 ? snapshot_ts : std::numeric_limits<uint64_t>::max());
-            check_timeout(ctx);
-            for (const auto& row: rows) {
-                if (buf && !row.values.empty()) {
-                    const Value& pk = row.values.front();
-                    if (buf->deletes.count(pk))
-                        continue;
-                    auto it = buf->upserts.find(pk);
-                    if (it != buf->upserts.end()) {
-                        record_read_pk(row);
-                        co_yield make_record_from_row(*plan.table, it->second, binding);
-                        emitted_buffer_keys.insert(pk);
-                        continue;
-                    }
+        // 流式扫描：存储型表逐行归并获取（不物化全量结果）；无 snapshot 时取最新已提交（MAX）；
+        // 无存储的纯内存表（测试夹具）则 yield rows_。
+        const uint64_t snap = snapshot_ts != 0 ? snapshot_ts : std::numeric_limits<uint64_t>::max();
+        check_timeout(ctx);
+        for (auto&& row: plan.table->scan_visible_stream(snap)) {
+            if (buf && !row.values.empty()) {
+                const Value& pk = row.values.front();
+                if (buf->deletes.count(pk))
+                    continue;
+                auto it = buf->upserts.find(pk);
+                if (it != buf->upserts.end()) {
+                    record_read_pk(row);
+                    co_yield make_record_from_row(*plan.table, it->second, binding);
+                    emitted_buffer_keys.insert(pk);
+                    continue;
                 }
-                record_read_pk(row);
-                check_timeout(ctx);
-                co_yield make_record_from_row(*plan.table, row, binding);
             }
-        } else {
+            record_read_pk(row);
             check_timeout(ctx);
-            for (const auto& row: plan.table->rows()) {
-                if (buf && !row.values.empty()) {
-                    const Value& pk = row.values.front();
-                    if (buf->deletes.count(pk))
-                        continue;
-                    auto it = buf->upserts.find(pk);
-                    if (it != buf->upserts.end()) {
-                        record_read_pk(row);
-                        co_yield make_record_from_row(*plan.table, it->second, binding);
-                        emitted_buffer_keys.insert(pk);
-                        continue;
-                    }
-                }
-                record_read_pk(row);
-                co_yield make_record_from_row(*plan.table, row, binding);
-            }
+            co_yield make_record_from_row(*plan.table, row, binding);
         }
         if (buf) {
             for (const auto& [pk, row]: buf->upserts) {

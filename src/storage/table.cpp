@@ -235,6 +235,16 @@ namespace corodb {
         return storage_->scan_visible(name_, columns_, snapshot_ts);
     }
 
+    std::generator<Row> Table::scan_visible_stream(uint64_t snapshot_ts) const {
+        if (!storage_) {
+            for (const auto& r: rows_)
+                co_yield r;
+            co_return;
+        }
+        for (auto&& r: storage_->scan_visible_stream(name_, columns_, snapshot_ts))
+            co_yield std::move(r);
+    }
+
     std::optional<Row> Table::lookup_visible(const Value& pk, uint64_t snapshot_ts) const {
         if (!storage_) {
             for (const auto& r: rows_) {

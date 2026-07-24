@@ -59,6 +59,15 @@ namespace corodb {
     }
 
     /**
+     * @brief 流式扫描默认实现：基于 scan_visible 物化后逐行 yield（不支持真流式的引擎的退化路径）。
+     */
+    std::generator<Row> StorageEngine::scan_visible_stream(const std::string& name, const std::vector<Column>& columns,
+                                                           uint64_t snapshot_ts) {
+        for (auto& r: scan_visible(name, columns, snapshot_ts))
+            co_yield std::move(r);
+    }
+
+    /**
      * @brief 追加索引条目（默认实现：全量重写；子类可覆盖为增量追加）。
      */
     void StorageEngine::append_index_entry(const std::string& table, const std::string& column, const Value& value,

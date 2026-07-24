@@ -5,6 +5,7 @@
 #pragma once
 
 #include <optional>
+#include <generator>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -125,6 +126,15 @@ namespace corodb {
          */
         [[nodiscard]] virtual std::vector<Row> scan_visible(const std::string& name, const std::vector<Column>& columns,
                                                             uint64_t snapshot_ts);
+
+        /**
+         * @brief MVCC 流式扫描：惰性 yield snapshot_ts 时刻每个 pk 的可见版本（不全量物化结果集）。
+         *
+         * 默认实现基于 scan_visible 物化后逐行 yield；支持流式归并的引擎（LSM）应 override。
+         */
+        [[nodiscard]] virtual std::generator<Row> scan_visible_stream(const std::string& name,
+                                                                      const std::vector<Column>& columns,
+                                                                      uint64_t snapshot_ts);
 
         /** @} */
 

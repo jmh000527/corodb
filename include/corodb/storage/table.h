@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <generator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -170,6 +171,9 @@ namespace corodb {
 
         /** @brief 读取给定快照时间点可见的全部行。 */
         [[nodiscard]] std::vector<Row> scan_visible(uint64_t snapshot_ts) const;
+
+        /** @brief MVCC 流式扫描：惰性 yield 快照可见行（不物化结果集）。 */
+        [[nodiscard]] std::generator<Row> scan_visible_stream(uint64_t snapshot_ts) const;
 
         /** @brief 读取给定快照时间点主键可见的最新版本。 */
         [[nodiscard]] std::optional<Row> lookup_visible(const Value& pk, uint64_t snapshot_ts) const;

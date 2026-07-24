@@ -864,6 +864,23 @@ TEST_F(TxnTest, StorageBackedTableDoesNotMirrorRowsInMemory) {
     EXPECT_TRUE(tbl->rows().empty()) << "writes must not repopulate rows_ for a storage-backed table";
 }
 
+TEST_F(TxnTest, StreamingScanMergesMemtableAndSSTable) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    exec_ok("INSERT INTO t VALUES (1, 10)");
+    exec_ok("INSERT INTO t VALUES (2, 20)");
+    exec_ok("INSERT INTO t VALUES (3, 30)");
+    exec_ok("CHECKPOINT");                        // flush 到 SSTable
+    exec_ok("UPDATE t SET v = 999 WHERE id = 2"); // 新版本进 memtable（需覆盖 SSTable 版本）
+    exec_ok("INSERT INTO t VALUES (4, 40)");      // 仅在 memtable
+    exec_ok("DELETE FROM t WHERE id = 3");        // tombstone 进 memtable（需覆盖 SSTable）
+    // 流式 k 路归并：memtable 版本按 ts 覆盖 SSTable；tombstone 跨源过滤；memtable-only 行包含。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);                // 1,2,4（3 已删）
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 999"), 1u); // id=2 memtable 版本
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 20"), 0u);  // 旧 SSTable 版本不可见
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 3"), 0u);  // tombstone
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 4"), 1u);  // 仅 memtable
+}
+
 // =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================
