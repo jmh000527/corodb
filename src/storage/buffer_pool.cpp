@@ -466,6 +466,36 @@ namespace corodb {
     }
 
     /**
+     * @brief 逐出指定文件的所有缓存页。
+     *
+     * SSTable 以 .tmp→rename 原子替换：新数据以 .tmp 路径为键写入，旧最终路径的缓存页
+     * 在 rename 后已陈旧。此处将这些页整体作废——未固定的直接回收到 free_list（绝不回写脏页，
+     * 否则旧数据会覆盖新文件）；仍被固定的页仅清除脏标志，保留映射待其 unpin 后由 Clock 回收。
+     */
+    void BufferPool::evict_file(const std::string& file) {
+        std::unique_lock lock(latch_);
+        for (auto it = page_table_.begin(); it != page_table_.end();) {
+            if (it->first.file != file) {
+                ++it;
+                continue;
+            }
+            const FrameId fid = it->second;
+            auto& frame = *frames_[fid];
+            // 文件已被整体替换：缓存页内容失效，绝不能回写（否则旧数据覆盖新文件）。
+            frame.dirty.store(false, std::memory_order_relaxed);
+            if (frame.pin_count.load(std::memory_order_relaxed) == 0) {
+                frame.id = PageId{};
+                frame.usage_count.store(0, std::memory_order_relaxed);
+                free_list_.push_back(fid);
+                it = page_table_.erase(it);
+            } else {
+                // 罕见：并发读者仍持有该页；保留映射，待其 unpin 后由 Clock 正常回收（已非脏）。
+                ++it;
+            }
+        }
+    }
+
+    /**
      * @brief 预热缓冲池
      *
      * 预加载指定的页面到缓冲池，提高后续操作的性能。

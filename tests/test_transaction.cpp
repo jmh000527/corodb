@@ -824,6 +824,27 @@ TEST_F(TxnTest, InListIndexReflectsUpdatesAndDeletes) {
     EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age IN (20, 30)"), 0u);
 }
 
+TEST_F(TxnTest, CheckpointThenReadInProcess) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("INSERT INTO t VALUES (1, 10)");
+    for (int a = 11; a <= 20; ++a)
+        exec_ok("UPDATE t SET age = " + std::to_string(a) + " WHERE id = 1");
+    exec_ok("CHECKPOINT");
+    // CHECKPOINT 后同一进程内读取：Buffer Pool 旧页帧必须已失效（否则命中陈旧页读到 0 行）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age = 20"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age = 10"), 0u);
+    // 多行 + 删除，覆盖 flush/compaction 后再读。
+    exec_ok("INSERT INTO t VALUES (2, 200)");
+    exec_ok("INSERT INTO t VALUES (3, 300)");
+    exec_ok("CHECKPOINT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+    exec_ok("DELETE FROM t WHERE id = 2");
+    exec_ok("CHECKPOINT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 2"), 0u);
+}
+
 // =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================

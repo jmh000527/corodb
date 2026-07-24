@@ -499,6 +499,19 @@ namespace corodb {
             if (ec)
                 throw std::runtime_error("Failed to rename SSTable: " + path);
         }
+
+        // SSTable 已被原子替换：失效该路径的所有缓存，避免同进程内（flush/checkpoint/compaction 后）
+        // 读到陈旧数据。根因：Buffer Pool 以最终路径为键缓存的旧页帧未被逐出（新数据写在 .tmp 键下）；
+        // 同时清除解码/页脚缓存，防范 mtime 精度碰撞的次级隐患。
+        bufpool_.evict_file(abs_final);
+        {
+            std::unique_lock dl(sst_decoded_cache_mutex_);
+            sst_decoded_cache_.erase(abs_final);
+        }
+        {
+            std::unique_lock fl(sst_footer_cache_mutex_);
+            sst_footer_cache_.erase(abs_final);
+        }
     }
 
     /**

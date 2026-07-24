@@ -156,6 +156,14 @@ namespace corodb {
         bool flush_page(const PageId& id);
 
         /**
+         * @brief 逐出指定文件的所有缓存页（文件被整体替换后调用）。
+         *
+         * SSTable 以 .tmp→rename 原子替换：新数据以 .tmp 路径为键写入，旧最终路径的缓存页
+         * 在 rename 后已陈旧。未固定的页直接回收（不回写脏页，因其内容对应已被替换的旧文件）。
+         */
+        void evict_file(const std::string& file);
+
+        /**
          * @brief 预热缓冲池，预加载指定页面以提升后续访问性能。
          */
         void warmup(const std::vector<PageId>& ids);
