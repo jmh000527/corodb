@@ -13,6 +13,8 @@
  */
 
 #include <filesystem>
+#include <cstdint>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <memory>
 
@@ -895,6 +897,31 @@ TEST_F(TxnTest, StreamingScanAcrossManySSTablePages) {
     EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 499u);
     EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE name = 'updated'"), 1u);
     EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 500"), 0u);
+}
+
+TEST_F(TxnTest, WalRecoveryToleratesTornOrCorruptTail) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    exec_ok("INSERT INTO t VALUES (1, 10)");
+    exec_ok("INSERT INTO t VALUES (2, 20)");
+    // 关闭 DB，模拟崩溃时 WAL 尾部的撞裂/损坏写入（合法头 + 巨大且损坏的 len）。
+    db.reset();
+    storage_internal::WalManager::instance().clear_all();
+    std::filesystem::path wal = std::filesystem::path(dir->path()) / "t.wal";
+    ASSERT_TRUE(std::filesystem::exists(wal));
+    {
+        std::ofstream ofs(wal, std::ios::binary | std::ios::app);
+        uint8_t type = 11;
+        uint32_t len = 0xFFFFFFF0u; // 巨大且损坏的长度：修复前会尝试分配 ~4GB 而 OOM/崩溃
+        uint32_t checksum = 12345u;
+        ofs.write(reinterpret_cast<char*>(&type), sizeof(type));
+        ofs.write(reinterpret_cast<char*>(&len), sizeof(len));
+        ofs.write(reinterpret_cast<char*>(&checksum), sizeof(checksum));
+        ofs.write("garbage", 7); // 远少于 len 声称的字节
+    }
+    // 重启：恢复必须读到前 2 行，安全忽略撞裂尾部（不 OOM、不崩溃）。
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
 }
 
 // =====================================================================

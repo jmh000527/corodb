@@ -328,6 +328,10 @@ namespace corodb::storage_internal {
      */
     std::vector<WalRecord> wal_read_records(const std::filesystem::path& path) {
         std::vector<WalRecord> records;
+        std::error_code ec;
+        const std::uintmax_t file_size = std::filesystem::file_size(path, ec);
+        if (ec)
+            return records;
         std::ifstream wal(path, std::ios::binary);
         if (!wal)
             return records;
@@ -346,12 +350,21 @@ namespace corodb::storage_internal {
             wal.read(reinterpret_cast<char*>(&checksum), sizeof(checksum));
             if (!wal)
                 break;
+            // 防御损坏/撞裂的 len：记录负载不可能超过文件剩余字节，否则视为撞裂尾部
+            // （避免因垃圾 len 直接分配巨大字符串而 OOM）。
+            const std::streampos sp = wal.tellg();
+            if (sp < 0)
+                break;
+            const std::uintmax_t pos = static_cast<std::uintmax_t>(sp);
+            if (pos > file_size || len > file_size - pos)
+                break;
             std::string rec(len, '\0');
             wal.read(rec.data(), len);
             if (!wal)
                 break;
+            // 校验失败 → 日志在此损坏/结束，停止读取（标准 WAL 做法：不跨过损坏点）。
             if (compute_payload_checksum(rec) != checksum)
-                continue;
+                break;
             records.push_back(WalRecord{ type, std::move(rec) });
         }
         return records;
