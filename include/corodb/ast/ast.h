@@ -297,10 +297,13 @@ namespace corodb {
     };
 
     /** @brief SQL IN / NOT IN 表达式。 */
+    struct SelectStmt; // 前向声明：IN (SELECT ...) 非相关子查询
+
     struct InExpr {
-        Expression expr;                ///< 左侧表达式
-        std::vector<Expression> values; ///< 值列表
-        bool negated{ false };          ///< 是否为 NOT IN
+        Expression expr;                    ///< 左侧表达式
+        std::vector<Expression> values;     ///< 值列表
+        bool negated{ false };              ///< 是否为 NOT IN
+        std::shared_ptr<SelectStmt> subquery; ///< IN (SELECT ...) 子查询（执行前由处理器代换为 values）
     };
 
     /** @brief SQL BETWEEN / NOT BETWEEN 表达式。 */

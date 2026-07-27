@@ -674,20 +674,25 @@ namespace corodb {
         // 检查 NOT IN / NOT BETWEEN / NOT LIKE
         bool negated = match_keyword("NOT");
 
-        // 检查 IN (value, ...)
+        // 检查 IN (value, ...) / IN (SELECT ...)
         if (match_keyword("IN")) {
             expect_text("(");
-            std::vector<Expression> values;
-            values.push_back(parse_expression());
-            while (match_text(",")) {
-                values.push_back(parse_expression());
-            }
-            expect_text(")");
-
             InExpr in_expr;
             in_expr.expr = std::move(lhs);
-            in_expr.values = std::move(values);
             in_expr.negated = negated;
+            if (peek_upper() == "SELECT") {
+                // 非相关子查询：执行前由查询处理器求值并代换为字面量 values。
+                Statement sub = parse_select();
+                in_expr.subquery = std::make_shared<SelectStmt>(std::move(std::get<SelectStmt>(sub)));
+            } else {
+                std::vector<Expression> values;
+                values.push_back(parse_expression());
+                while (match_text(",")) {
+                    values.push_back(parse_expression());
+                }
+                in_expr.values = std::move(values);
+            }
+            expect_text(")");
             return BoolExpr::make_in(std::move(in_expr));
         }
 

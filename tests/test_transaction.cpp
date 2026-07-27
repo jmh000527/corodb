@@ -1054,6 +1054,80 @@ TEST_F(TxnTest, CompositePrimaryKeySurvivesRestart) {
 }
 
 // =====================================================================
+// 非相关 IN (SELECT ...) 子查询
+// =====================================================================
+
+TEST_F(TxnTest, InSelectSubqueryBasics) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'hr')");
+    exec_ok("INSERT INTO emp VALUES (1, 1)");
+    exec_ok("INSERT INTO emp VALUES (2, 2)");
+    exec_ok("INSERT INTO emp VALUES (3, 1)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM emp WHERE dept_id IN (SELECT id FROM dept WHERE name = 'eng')"),
+              2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM emp WHERE dept_id NOT IN (SELECT id FROM dept WHERE name = 'eng')"),
+              1u);
+    // 空子查询：IN → 0 行；NOT IN → 全部。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM emp WHERE dept_id IN (SELECT id FROM dept WHERE name = 'none')"),
+              0u);
+    EXPECT_EQ(
+            count_rows(*db, sess, "SELECT * FROM emp WHERE dept_id NOT IN (SELECT id FROM dept WHERE name = 'none')"),
+            3u);
+    // 多列子查询：报错。
+    EXPECT_THROW((void) db->execute("SELECT * FROM emp WHERE id IN (SELECT * FROM dept)", sess), std::runtime_error);
+}
+
+TEST_F(TxnTest, NestedInSelectSubquery) {
+    exec_ok("CREATE TABLE a (id INT)");
+    exec_ok("CREATE TABLE b (id INT)");
+    exec_ok("CREATE TABLE c (id INT)");
+    exec_ok("INSERT INTO a VALUES (1)");
+    exec_ok("INSERT INTO a VALUES (2)");
+    exec_ok("INSERT INTO b VALUES (2)");
+    exec_ok("INSERT INTO b VALUES (3)");
+    exec_ok("INSERT INTO c VALUES (2)");
+    // 中间步骤：内层无 WHERE 的单层子查询。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM c WHERE id IN (SELECT id FROM c)"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM b WHERE id IN (SELECT id FROM c)"), 1u);
+    // a ∩ (b ∩ c) = {2}
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))"),
+              1u);
+}
+
+TEST_F(TxnTest, DmlWithInSelectSubquery) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT, active INT)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'hr')");
+    exec_ok("INSERT INTO emp VALUES (1, 1, 1)");
+    exec_ok("INSERT INTO emp VALUES (2, 2, 1)");
+    exec_ok("INSERT INTO emp VALUES (3, 1, 1)");
+    exec_ok("UPDATE emp SET active = 0 WHERE dept_id IN (SELECT id FROM dept WHERE name = 'hr')");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM emp WHERE active = 0"), 1u);
+    exec_ok("DELETE FROM emp WHERE dept_id IN (SELECT id FROM dept WHERE name = 'eng')");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM emp"), 1u);
+}
+
+TEST_F(TxnTest, InSelectSubqueryUsesIndexAfterSubstitution) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT)");
+    exec_ok("CREATE INDEX idx_emp_dept ON emp (dept_id)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO emp VALUES (1, 1)");
+    // 代换后外层应命中 IN→IndexScan。
+    auto r = db->execute("EXPLAIN SELECT * FROM emp WHERE dept_id IN (SELECT id FROM dept WHERE name = 'eng')", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+}
+
+// =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================
 

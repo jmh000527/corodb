@@ -908,7 +908,7 @@ cd build && ctest -j8
 
 | 特性 | 状态 |
 |------|------|
-| 子查询 (`IN (SELECT ...)`) | 不支持 |
+| 子查询 | 支持非相关 `IN / NOT IN (SELECT ...)`（WHERE 中，可嵌套；代换后可命中索引）；相关子查询/EXISTS 不支持 |
 | `IS NULL / IS NOT NULL` | 不支持 |
 | `RIGHT JOIN` / `FULL JOIN` | 仅 INNER 和 LEFT |
 | `SAVEPOINT` / 嵌套事务 | 不支持 |
@@ -1031,7 +1031,7 @@ cd build && ctest -j8
 ### 计划中
 
 - 基于代价的优化器（CBO）
-- 子查询（`IN / EXISTS`）
+- 相关子查询与 `EXISTS`（非相关 `IN (SELECT ...)` 已支持）
 - `SAVEPOINT` 嵌套事务
 - TLS 传输加密
 - WAL 压缩

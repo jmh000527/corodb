@@ -185,6 +185,8 @@ namespace corodb {
                 if (!expr.in_expr.has_value())
                     throw std::runtime_error("[Executor] Missing IN expression");
                 const auto& in = *expr.in_expr;
+                if (in.subquery)
+                    throw std::runtime_error("[Executor] Unresolved IN subquery (must be resolved before execution)");
                 Value lhs = ExpressionEvaluator::eval(record, in.expr);
                 if (std::holds_alternative<NullValue>(lhs))
                     return SqlBool::Unknown;

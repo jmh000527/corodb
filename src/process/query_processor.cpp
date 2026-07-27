@@ -242,6 +242,9 @@ namespace corodb {
         if (auto* prep = std::get_if<PrepareStmt>(&stmt)) {
             Parser inner_parser;
             Statement inner_stmt = inner_parser.parse(prep->sql);
+            // 非相关 IN (SELECT ...)：PREPARE 时代换（值随计划一并固化，与 PREPARE 的计划冻结语义一致）。
+            if (stmt_has_subquery(inner_stmt))
+                resolve_subqueries(inner_stmt, session, 0);
             auto plan = build_physical_plan(inner_stmt);
             session->prepared_stmts[prep->name] = std::move(plan);
             ProcessedQuery q;
@@ -297,6 +300,9 @@ namespace corodb {
         // 2) EXPLAIN
         if (std::holds_alternative<std::shared_ptr<ExplainStmt>>(stmt)) {
             const auto& ex = std::get<std::shared_ptr<ExplainStmt>>(stmt);
+            // 非相关 IN (SELECT ...)：先代换再规划（EXPLAIN 展示代换后的计划）。
+            if (stmt_has_subquery(ex->inner))
+                resolve_subqueries(ex->inner, session, 0);
             const auto& inner = ex->inner;
             const bool dml_or_select =
                     std::holds_alternative<SelectStmt>(inner) || std::holds_alternative<InsertStmt>(inner) ||
@@ -350,6 +356,11 @@ namespace corodb {
             const bool ddl_op = is_ddl(stmt);
             const bool is_select = std::holds_alternative<SelectStmt>(stmt);
 
+            // 非相关 IN (SELECT ...)：先执行子查询并代换为字面量 IN 列表（数据相关，跳过计划缓存）。
+            const bool had_subquery = stmt_has_subquery(stmt);
+            if (had_subquery)
+                resolve_subqueries(stmt, session, 0);
+
             // Invalidate plan cache and prepared statements on DDL.
             if (ddl_op) {
                 plan_cache_.invalidate_all();
@@ -368,14 +379,14 @@ namespace corodb {
 
             // Check plan cache for SELECT only (DML has different values per statement).
             std::shared_ptr<PlanNode> shared_plan;
-            if (is_select) {
+            if (is_select && !had_subquery) {
                 std::string normalized = normalize_sql(sql);
                 shared_plan = plan_cache_.lookup(normalized);
             }
             if (!shared_plan) {
                 auto plan = build_physical_plan(stmt);
                 shared_plan = std::move(plan);
-                if (is_select) {
+                if (is_select && !had_subquery) {
                     plan_cache_.insert(normalize_sql(sql), shared_plan);
                 }
             }
@@ -431,6 +442,83 @@ namespace corodb {
             }
             throw;
         }
+    }
+
+    bool QueryProcessor::bool_has_subquery(const BoolExpr& e) {
+        if (e.in_expr.has_value() && e.in_expr->subquery)
+            return true;
+        if (e.left && bool_has_subquery(*e.left))
+            return true;
+        return e.right && bool_has_subquery(*e.right);
+    }
+
+    bool QueryProcessor::stmt_has_subquery(const Statement& stmt) {
+        const std::optional<BoolExpr>* where = nullptr;
+        if (const auto* s = std::get_if<SelectStmt>(&stmt))
+            where = &s->where;
+        else if (const auto* u = std::get_if<UpdateStmt>(&stmt))
+            where = &u->where;
+        else if (const auto* d = std::get_if<DeleteStmt>(&stmt))
+            where = &d->where;
+        return where && where->has_value() && bool_has_subquery(**where);
+    }
+
+    /**
+     * @brief 执行并代换 BoolExpr 树中的非相关 IN (SELECT ...) 子查询。
+     *
+     * 子查询先于外层规划执行（同会话/同快照），结果代换为字面量 IN 列表——外层因此
+     * 可自然命中 IN→IndexScan 优化；空结果遵循 SQL 语义（IN→FALSE，NOT IN→TRUE，含 NULL 三值）。
+     */
+    void QueryProcessor::resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth) {
+        if (depth > 8)
+            throw std::runtime_error("[Process] Subquery nesting too deep");
+        if (e.left)
+            resolve_subqueries_in_bool(*e.left, session, depth);
+        if (e.right)
+            resolve_subqueries_in_bool(*e.right, session, depth);
+        if (!e.in_expr.has_value() || !e.in_expr->subquery)
+            return;
+        // 先递归解析子查询自身 WHERE 中的嵌套子查询。
+        Statement sub{ SelectStmt(*e.in_expr->subquery) };
+        resolve_subqueries(sub, session, depth + 1);
+        // 执行子查询，收集单列结果为字面量 IN 列表。
+        auto plan = build_physical_plan(sub);
+        ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+        if (session->statement_timeout_ms > 0)
+            ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(session->statement_timeout_ms);
+        Executor ex{ ctx };
+        std::vector<Expression> values;
+        // 自动提交语句：清除上一条语句遗留的过期 snapshot_ts，子查询读最新已提交；
+        // 事务内则沿用事务快照（与外层一致的读视图）。
+        const uint64_t saved_snap = session->snapshot_ts;
+        if (!session->in_transaction())
+            session->snapshot_ts = 0;
+        try {
+            auto gen = ex.run(plan.get());
+            for (auto&& rec: gen) {
+                if (rec.values.size() != 1)
+                    throw std::runtime_error("[Process] IN subquery must return exactly one column");
+                values.push_back(Expression{ Literal{ rec.values.front() } });
+            }
+        } catch (...) {
+            session->snapshot_ts = saved_snap;
+            throw;
+        }
+        session->snapshot_ts = saved_snap;
+        e.in_expr->values = std::move(values);
+        e.in_expr->subquery.reset();
+    }
+
+    void QueryProcessor::resolve_subqueries(Statement& stmt, const std::shared_ptr<Session>& session, int depth) {
+        std::optional<BoolExpr>* where = nullptr;
+        if (auto* s = std::get_if<SelectStmt>(&stmt))
+            where = &s->where;
+        else if (auto* u = std::get_if<UpdateStmt>(&stmt))
+            where = &u->where;
+        else if (auto* d = std::get_if<DeleteStmt>(&stmt))
+            where = &d->where;
+        if (where && where->has_value())
+            resolve_subqueries_in_bool(**where, session, depth);
     }
 
 } // namespace corodb

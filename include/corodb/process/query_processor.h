@@ -90,6 +90,14 @@ namespace corodb {
     private:
         std::unique_ptr<PlanNode> build_physical_plan(const Statement& stmt);
 
+        /** @brief 语句 WHERE 中是否含未解析的 IN (SELECT ...) 子查询。 */
+        [[nodiscard]] static bool stmt_has_subquery(const Statement& stmt);
+        [[nodiscard]] static bool bool_has_subquery(const BoolExpr& e);
+
+        /** @brief 递归执行并代换 WHERE 中的非相关 IN (SELECT ...) 子查询为字面量 IN 列表。 */
+        void resolve_subqueries(Statement& stmt, const std::shared_ptr<Session>& session, int depth);
+        void resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth);
+
         /** @brief 构建 SHOW STATUS 的状态指标行生成器。 */
         [[nodiscard]] std::generator<Record> build_status_rows();
 
