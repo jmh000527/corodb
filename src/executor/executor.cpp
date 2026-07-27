@@ -99,11 +99,11 @@ namespace corodb {
                 validate_value(cols[i], row.values[i]);
         }
 
-        /** @brief 提取一行的 int64 主键（约定首列）；非 int64 首列返回 nullopt（无主键表）。 */
-        inline std::optional<Value> row_pk(const Row& row) {
+        /** @brief 提取一行的存储主键（schema 感知，支持复合主键）；空行返回 nullopt（无主键表）。 */
+        inline std::optional<Value> row_pk(const Table& t, const Row& row) {
             if (row.values.empty())
                 return std::nullopt;
-            return row.values.front();
+            return t.row_key(row);
         }
 
         /**
@@ -337,7 +337,7 @@ namespace corodb {
                 return;
             if (row.values.empty())
                 return;
-            sess->read_set[plan.table->name()].insert(row.values.front());
+            sess->read_set[plan.table->name()].insert(plan.table->row_key(row));
         };
         // 流式扫描：存储型表逐行归并获取（不物化全量结果）；无 snapshot 时取最新已提交（MAX）；
         // 无存储的纯内存表（测试夹具）则 yield rows_。
@@ -345,7 +345,7 @@ namespace corodb {
         check_timeout(ctx);
         for (auto&& row: plan.table->scan_visible_stream(snap)) {
             if (buf && !row.values.empty()) {
-                const Value& pk = row.values.front();
+                const Value pk = plan.table->row_key(row);
                 if (buf->deletes.count(pk))
                     continue;
                 auto it = buf->upserts.find(pk);
@@ -411,7 +411,7 @@ namespace corodb {
                     return;
                 if (row.values.empty())
                     return;
-                sess->read_set[idx->table->name()].insert(row.values.front());
+                sess->read_set[idx->table->name()].insert(idx->table->row_key(row));
             };
 
             // 索引列在表中的下标（用于可见性重查过滤陈旧超集条目）。
@@ -1459,7 +1459,7 @@ namespace corodb {
                         ins->table->insert_batch({ std::move(r) });
                         continue;
                     }
-                    Value pk = r.values.front();
+                    Value pk = ins->table->row_key(r);
                     // 主键唯一性：本事务已删除该 pk 则允许重插；否则缓冲已有或已提交可见即为重复键。
                     if (tbuf.deletes.count(pk) == 0) {
                         if (tbuf.upserts.count(pk) > 0)
@@ -1479,7 +1479,7 @@ namespace corodb {
             {
                 std::unordered_set<Value, ValueHash, ValueEq> seen_pks;
                 for (const auto& r: batch_rows) {
-                    auto pk = row_pk(r);
+                    auto pk = row_pk(*ins->table, r);
                     if (!pk.has_value())
                         continue;
                     if (!seen_pks.insert(*pk).second)
@@ -1531,7 +1531,7 @@ namespace corodb {
                 for (const auto& base_row: base) {
                     if (base_row.values.empty())
                         continue;
-                    Value pk = base_row.values.front();
+                    Value pk = upd->table->row_key(base_row);
                     if (tbuf.deletes.count(pk))
                         continue;
                     auto upsert_it = tbuf.upserts.find(pk);
@@ -1548,7 +1548,7 @@ namespace corodb {
                     std::unordered_set<Value, ValueHash, ValueEq> rows_pk;
                     for (const auto& r: base) {
                         if (!r.values.empty())
-                            rows_pk.insert(r.values.front());
+                            rows_pk.insert(upd->table->row_key(r));
                     }
                     for (const auto& [pk, _]: tbuf.upserts) {
                         if (!rows_pk.count(pk))
@@ -1633,7 +1633,7 @@ namespace corodb {
                 for (const auto& base_row: base) {
                     if (base_row.values.empty())
                         continue;
-                    Value pk = base_row.values.front();
+                    Value pk = del->table->row_key(base_row);
                     if (tbuf.deletes.count(pk))
                         continue;
                     auto upsert_it = tbuf.upserts.find(pk);
@@ -1651,7 +1651,7 @@ namespace corodb {
                     std::unordered_set<Value, ValueHash, ValueEq> rows_pk;
                     for (const auto& r: base) {
                         if (!r.values.empty())
-                            rows_pk.insert(r.values.front());
+                            rows_pk.insert(del->table->row_key(r));
                     }
                     for (const auto& [pk, row]: tbuf.upserts) {
                         if (!rows_pk.count(pk) && matches(row))
@@ -1678,7 +1678,7 @@ namespace corodb {
                             continue;
                     }
                     if (!row.values.empty())
-                        deleted_keys.push_back(row.values.front());
+                        deleted_keys.push_back(del->table->row_key(row));
                 }
             } else {
                 // 纯内存表：就地从 rows_ 删除。
@@ -1690,7 +1690,7 @@ namespace corodb {
                             return false;
                     }
                     if (!row.values.empty())
-                        deleted_keys.push_back(row.values.front());
+                        deleted_keys.push_back(del->table->row_key(row));
                     return true;
                 });
             }

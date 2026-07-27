@@ -151,7 +151,7 @@ namespace corodb {
                         std::erase_if(rows, [&](const Row& row) -> bool {
                             if (row.values.empty())
                                 return false;
-                            return tbuf.deletes.count(row.values.front()) > 0;
+                            return tbuf.deletes.count(tbl->row_key(row)) > 0;
                         });
                     }
                     if (!tbuf.upserts.empty()) {
@@ -159,7 +159,7 @@ namespace corodb {
                         idx_by_pk.reserve(rows.size());
                         for (std::size_t i = 0; i < rows.size(); ++i) {
                             if (!rows[i].values.empty())
-                                idx_by_pk[rows[i].values.front()] = i;
+                                idx_by_pk[tbl->row_key(rows[i])] = i;
                         }
                         for (auto& [pk, row]: tbuf.upserts) {
                             auto it = idx_by_pk.find(pk);

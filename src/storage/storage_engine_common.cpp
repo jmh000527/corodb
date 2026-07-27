@@ -699,6 +699,29 @@ namespace corodb::storage_internal {
     }
 
     /**
+     * @brief 提取一行的主键 Value（schema 感知）。
+     *
+     * 标记 PRIMARY KEY 的列 ≥2 时为复合主键：键 = 各 PK 列 encode_key（write_value，自定界）
+     * 的拼接字节串（字符串 Value，可判等/可比较，对 memtable/WAL/SSTable/锁透明）；
+     * 否则（0/1 个 PK 列）维持「首列即键」的历史约定，行为零变化。
+     */
+    Value extract_key(const Row& row, const std::vector<Column>& columns) {
+        std::size_t pk_count = 0;
+        for (const auto& c: columns)
+            if (c.primary_key)
+                ++pk_count;
+        if (pk_count < 2)
+            return extract_key(row);
+        std::string composite;
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (!columns[i].primary_key)
+                continue;
+            composite += encode_key(i < row.values.size() ? row.values[i] : Value{ NullValue{} });
+        }
+        return Value{ std::move(composite) };
+    }
+
+    /**
      * @brief 将主键 Value 编码为字节串（复用 write_value）。
      */
     std::string encode_key(const Value& key) {

@@ -317,6 +317,9 @@ namespace corodb::storage_internal {
     [[nodiscard]] int64_t extract_int_key(const Row& row);
     /** @brief 提取一行的主键 Value（约定首列；空行返回 NULL）。 */
     [[nodiscard]] Value extract_key(const Row& row);
+    /** @brief 提取一行的主键 Value（schema 感知）：标记 PRIMARY KEY 的列 ≥2 时为复合主键
+     *  （各 PK 列 encode_key 拼接的字符串 Value）；否则维持「首列即键」的历史约定。 */
+    [[nodiscard]] Value extract_key(const Row& row, const std::vector<Column>& columns);
     /** @brief 将主键 Value 编码为字节串（复用 write_value，用于 WAL/SSTable/Bloom）。 */
     [[nodiscard]] std::string encode_key(const Value& key);
     /** @brief 从字节串解码主键 Value（与 encode_key 对应）。 */

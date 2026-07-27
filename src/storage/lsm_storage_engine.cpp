@@ -336,7 +336,7 @@ namespace corodb {
                 break;
             if (type == 1) {
                 Row row = decode_row(rec, columns, path);
-                Value pk = extract_key(row);
+                Value pk = extract_key(row, columns);
                 rows.emplace_back(MemEntry{ pk, std::move(row), false, commit_ts });
             } else if (type == 2) {
                 // Tombstone 记录存放 encode_key(pk) 字节串。
@@ -568,7 +568,7 @@ namespace corodb {
                 state->memtable[MVCCKey{ key, 0 }] = MemEntry{ key, Row{}, true, 0 };
             } else if (rec.type == 1) {
                 Row r = decode_row(rec.payload, schema, name);
-                Value key = extract_key(r);
+                Value key = extract_key(r, schema);
                 state->memtable[MVCCKey{ key, 0 }] = MemEntry{ key, r, false, 0 };
             } else if (rec.type == 12) {
                 // 墓碑（含 ts）：payload = [8B ts][encode_key(pk)]
@@ -590,7 +590,7 @@ namespace corodb {
                     continue; // 提交未封口的撕裂插入，丢弃
                 std::string row_bytes = rec.payload.substr(sizeof(uint64_t));
                 Row r = decode_row(row_bytes, schema, name);
-                Value key = extract_key(r);
+                Value key = extract_key(r, schema);
                 state->memtable[MVCCKey{ key, ts }] = MemEntry{ key, r, false, ts };
             }
         }
@@ -702,7 +702,7 @@ namespace corodb {
         std::unique_lock lock(state->mutex);     // 独占锁保护表状态
         load_state_locked(state, name, columns); // 加载状态（如果需要）
 
-        Value key = extract_key(row); // 提取主键 Value
+        Value key = extract_key(row, columns); // 提取主键 Value（schema 感知，支持复合主键）
 
         std::string rec = encode_row(row);       // 编码行数据（复用于WAL和大小计算）
         const std::size_t rec_size = rec.size(); // 保存编码后的大小
@@ -1149,7 +1149,7 @@ namespace corodb {
             s.pos += kHdr + len;
             if (type == 1) {
                 Row row = decode_row(rec, columns, s.path);
-                Value pk = extract_key(row);
+                Value pk = extract_key(row, columns);
                 return MemEntry{ pk, std::move(row), false, ts };
             }
             Value pk = rec.empty() ? Value{ NullValue{} } : decode_key(rec);
@@ -1233,7 +1233,7 @@ namespace corodb {
         std::vector<MemEntry> entries;
         entries.reserve(rows.size());
         for (const auto& r: rows) {
-            Value pk = extract_key(r);
+            Value pk = extract_key(r, columns);
             entries.push_back(MemEntry{ pk, r, false, 0 });
         }
         write_sstable(base_path(name), columns, entries);

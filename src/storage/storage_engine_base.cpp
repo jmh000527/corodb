@@ -5,6 +5,8 @@
 
 #include "corodb/storage/storage_engine_base.h"
 
+#include "corodb/storage/storage_engine_common.h"
+
 namespace corodb {
 
     /**
@@ -43,7 +45,7 @@ namespace corodb {
                                                      const Value& pk, uint64_t /*snapshot_ts*/) {
         // 默认退化为全表扫描，不感知 snapshot_ts
         for (const auto& r: load_rows(name, columns)) {
-            if (!r.values.empty() && ValueEq{}(r.values.front(), pk)) {
+            if (!r.values.empty() && ValueEq{}(storage_internal::extract_key(r, columns), pk)) {
                 return r;
             }
         }

@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "corodb/storage/storage_engine.h"
+#include "corodb/storage/storage_engine_common.h"
 
 namespace corodb {
     /**
@@ -272,7 +273,7 @@ namespace corodb {
     std::optional<Row> Table::lookup_visible(const Value& pk, uint64_t snapshot_ts) const {
         if (!storage_) {
             for (const auto& r: rows_) {
-                if (!r.values.empty() && ValueEq{}(r.values.front(), pk)) {
+                if (!r.values.empty() && ValueEq{}(row_key(r), pk)) {
                     return r;
                 }
             }
@@ -388,7 +389,7 @@ namespace corodb {
         for (const auto& row: src) {
             if (row.values.empty())
                 continue;
-            const Value& pk = row.values.front();
+            const Value pk = row_key(row);
             std::vector<Value> key_vals;
             key_vals.reserve(col_idxs.size());
             bool ok = true;
@@ -528,7 +529,7 @@ namespace corodb {
             return;
         if (row.values.empty())
             return; // 无主键列
-        const Value& pk = row.values.front();
+        const Value pk = row_key(row);
         for (const auto& col_name: indexed_columns_) {
             auto ci = find_column(col_name);
             if (!ci || *ci >= row.values.size())
@@ -576,7 +577,7 @@ namespace corodb {
         for (const auto& row: src) {
             if (row.values.empty() || col_idx >= row.values.size())
                 continue;
-            const Value& pk = row.values.front();
+            const Value pk = row_key(row);
             idx.emplace(row.values[col_idx], pk);
             entries.emplace_back(row.values[col_idx], pk);
         }
@@ -592,6 +593,10 @@ namespace corodb {
                 return i;
         }
         return std::nullopt;
+    }
+
+    Value Table::row_key(const Row& row) const {
+        return storage_internal::extract_key(row, columns_);
     }
 
     // ---------------------------------------------------------------------------

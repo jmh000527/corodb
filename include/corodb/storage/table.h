@@ -192,6 +192,9 @@ namespace corodb {
             return storage_ != nullptr;
         }
 
+        /** @brief 行的存储主键（schema 感知）：≥2 个 PRIMARY KEY 列时为复合编码键，否则为首列。 */
+        [[nodiscard]] Value row_key(const Row& row) const;
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }

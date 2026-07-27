@@ -86,7 +86,7 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 - **诊断**: EXPLAIN / EXPLAIN ANALYZE（PostgreSQL 风格计划树 + 算子级耗时与行数）
 - **预处理**: PREPARE / EXECUTE / DEALLOCATE PREPARE（会话级计划注册）
 - **管理**: CHECKPOINT（强制刷盘+全层级压缩+截断 WAL）、SHOW STATUS
-- **约束**: 写入时强制 NOT NULL / 类型匹配 / 主键唯一性
+- **约束**: 写入时强制 NOT NULL / 类型匹配 / 主键唯一性（支持多列 `PRIMARY KEY` 标记的复合主键）
 
 ### 网络与持久性
 - **Multi-Reactor 模式**: Main Reactor 接受连接 → Sub Reactor I/O 线程池（Round-Robin）处理读写 → Worker 线程池执行 SQL

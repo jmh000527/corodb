@@ -1002,6 +1002,58 @@ TEST_F(TxnTest, CompositeIndexSurvivesRestart) {
 }
 
 // =====================================================================
+// 复合主键（多列 PRIMARY KEY）
+// =====================================================================
+
+TEST_F(TxnTest, CompositePrimaryKeyCrudAndUniqueness) {
+    exec_ok("CREATE TABLE t (a INT PRIMARY KEY, b TEXT PRIMARY KEY, v INT)");
+    exec_ok("INSERT INTO t VALUES (1, 'x', 10)");
+    exec_ok("INSERT INTO t VALUES (1, 'y', 20)"); // 同 a 不同 b：允许
+    exec_ok("INSERT INTO t VALUES (2, 'x', 30)"); // 同 b 不同 a：允许
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+    // 组合重复：拒绝
+    EXPECT_THROW((void) db->execute("INSERT INTO t VALUES (1, 'x', 99)", sess), std::runtime_error);
+    // UPDATE / DELETE 按组合行正确定位
+    exec_ok("UPDATE t SET v = 11 WHERE a = 1 AND b = 'x'");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = 11"), 1u);
+    exec_ok("DELETE FROM t WHERE a = 1 AND b = 'y'");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+    // 删除后可重插同组合
+    exec_ok("INSERT INTO t VALUES (1, 'y', 21)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+}
+
+TEST_F(TxnTest, CompositePrimaryKeyTransactionSemantics) {
+    exec_ok("CREATE TABLE t (a INT PRIMARY KEY, b TEXT PRIMARY KEY, v INT)");
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (1, 'x', 10)");
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 0u);
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (1, 'x', 10)");
+    exec_ok("INSERT INTO t VALUES (1, 'y', 20)"); // 同事务内同 a 不同 b：允许
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+}
+
+TEST_F(TxnTest, CompositePrimaryKeySurvivesRestart) {
+    exec_ok("CREATE TABLE t (a INT PRIMARY KEY, b TEXT PRIMARY KEY, v INT)");
+    exec_ok("INSERT INTO t VALUES (1, 'x', 10)");
+    exec_ok("INSERT INTO t VALUES (1, 'y', 20)");
+    exec_ok("CHECKPOINT");                        // 前两行落 SSTable
+    exec_ok("INSERT INTO t VALUES (2, 'x', 30)"); // 此行仅在 WAL，靠回放恢复
+    db.reset();
+    storage_internal::WalManager::instance().clear_all();
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 3u);
+    // 重启后组合唯一性仍强制 + 可继续写。
+    EXPECT_THROW((void) db->execute("INSERT INTO t VALUES (1, 'x', 99)", sess), std::runtime_error);
+    exec_ok("INSERT INTO t VALUES (2, 'y', 40)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 4u);
+}
+
+// =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================
 
