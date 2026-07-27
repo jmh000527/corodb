@@ -222,7 +222,19 @@ TEST_F(ParserTest, CreateIndex) {
     const auto& create_idx = std::get<CreateIndexStmt>(stmt);
     EXPECT_EQ(create_idx.index_name, "idx_name");
     EXPECT_EQ(create_idx.table, "users");
-    EXPECT_EQ(create_idx.column, "name");
+    ASSERT_EQ(create_idx.columns.size(), 1u);
+    EXPECT_EQ(create_idx.columns[0], "name");
+}
+
+TEST_F(ParserTest, CreateIndexMultiColumn) {
+    auto stmt = parser.parse("CREATE INDEX idx_ab ON t (a, b, c)");
+    ASSERT_TRUE(std::holds_alternative<CreateIndexStmt>(stmt));
+    const auto& ci = std::get<CreateIndexStmt>(stmt);
+    EXPECT_EQ(ci.index_name, "idx_ab");
+    ASSERT_EQ(ci.columns.size(), 3u);
+    EXPECT_EQ(ci.columns[0], "a");
+    EXPECT_EQ(ci.columns[1], "b");
+    EXPECT_EQ(ci.columns[2], "c");
 }
 
 // ============================================================================

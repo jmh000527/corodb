@@ -273,6 +273,68 @@ namespace corodb::opt {
             }
         }
 
+        // 复合等值索引：合取 a=x AND b=y ... 且某复合索引的列集均被等值叶覆盖 → 复合 IndexScan。
+        if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::And) {
+            const auto& scan = std::get<LogicalScan>(f.child->node);
+            if (scan.table && !scan.table->composite_indexes().empty()) {
+                // 展开 AND 树，收集等值叶 (列名→字面量)；记录是否存在非等值残差叶。
+                std::unordered_map<std::string, Value> eqs;
+                bool only_equalities = true;
+                std::vector<const BoolExpr*> stack{ &f.predicate };
+                while (!stack.empty()) {
+                    const BoolExpr* e = stack.back();
+                    stack.pop_back();
+                    if (e->kind == BoolExpr::Kind::And) {
+                        if (e->left)
+                            stack.push_back(e->left.get());
+                        if (e->right)
+                            stack.push_back(e->right.get());
+                        continue;
+                    }
+                    if (e->kind == BoolExpr::Kind::Comparison && e->cmp.has_value() && e->cmp->op == CompareOp::Eq) {
+                        const ColumnRef* c = std::get_if<ColumnRef>(&e->cmp->lhs);
+                        const Literal* l = std::get_if<Literal>(&e->cmp->rhs);
+                        if (!c) {
+                            c = std::get_if<ColumnRef>(&e->cmp->rhs);
+                            l = std::get_if<Literal>(&e->cmp->lhs);
+                        }
+                        if (c && l) {
+                            eqs.emplace(c->name, l->value);
+                            continue;
+                        }
+                    }
+                    only_equalities = false; // 存在非「列=字面量」的叶
+                }
+                // 选列集被完全覆盖且列数最多的复合索引。
+                const std::string* best = nullptr;
+                const std::vector<std::string>* best_cols = nullptr;
+                for (const auto& [iname, cols]: scan.table->composite_indexes()) {
+                    bool all = true;
+                    for (const auto& cn: cols)
+                        if (!eqs.count(cn)) {
+                            all = false;
+                            break;
+                        }
+                    if (all && (!best_cols || cols.size() > best_cols->size())) {
+                        best = &iname;
+                        best_cols = &cols;
+                    }
+                }
+                if (best && best_cols) {
+                    std::vector<Value> key;
+                    key.reserve(best_cols->size());
+                    for (const auto& cn: *best_cols)
+                        key.push_back(eqs.at(cn));
+                    auto idx_scan = std::make_unique<IndexScanPlan>(scan.table, scan.alias, *best, *best_cols,
+                                                                   std::move(key));
+                    // 合取恰好只由该索引列的等值构成 → 无残差，直接返回；否则叠加 Filter 复查全谓词。
+                    if (only_equalities && eqs.size() == best_cols->size())
+                        return idx_scan;
+                    return std::make_unique<FilterPlan>(std::move(idx_scan), f.predicate);
+                }
+            }
+        }
+
         auto child = visit(*f.child);
         return std::make_unique<FilterPlan>(std::move(child), f.predicate);
     }
@@ -603,17 +665,19 @@ namespace corodb::opt {
                         if (!table) {
                             throw std::runtime_error("[PhysicalPlanner] Unknown table: " + s.table);
                         }
-                        bool found = false;
-                        for (const auto& c: table->columns()) {
-                            if (c.name == s.column) {
-                                found = true;
-                                break;
+                        for (const auto& ic: s.columns) {
+                            bool found = false;
+                            for (const auto& c: table->columns()) {
+                                if (c.name == ic) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                throw std::runtime_error("[PhysicalPlanner] Unknown column for index: " + ic);
                             }
                         }
-                        if (!found) {
-                            throw std::runtime_error("[PhysicalPlanner] Unknown column for index: " + s.column);
-                        }
-                        return std::make_unique<CreateIndexPlan>(std::move(table), s.index_name, s.column);
+                        return std::make_unique<CreateIndexPlan>(std::move(table), s.index_name, s.columns);
                     } else if constexpr (std::is_same_v<T, DropTableStmt>) {
                         return std::make_unique<DropTablePlan>(s.table, s.if_exists, catalog_, storage_);
                     } else if constexpr (std::is_same_v<T, DropIndexStmt>) {

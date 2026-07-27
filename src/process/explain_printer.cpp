@@ -148,7 +148,15 @@ namespace corodb {
             }
             if (const auto* idx = dynamic_cast<const IndexScanPlan*>(plan)) {
                 oss << in << "Index Scan on " << idx->table->name() << "\n";
-                if (idx->is_in) {
+                if (idx->is_composite) {
+                    oss << ai << "Index Cond: (";
+                    for (std::size_t i = 0; i < idx->composite_columns.size(); ++i) {
+                        if (i)
+                            oss << " AND ";
+                        oss << idx->composite_columns[i] << " = " << value_to_string(idx->composite_key[i]);
+                    }
+                    oss << ") using " << idx->index_name << "\n";
+                } else if (idx->is_in) {
                     oss << ai << "Index Cond: (" << idx->column << " IN (";
                     for (std::size_t i = 0; i < idx->in_keys.size(); ++i) {
                         if (i)

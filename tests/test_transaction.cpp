@@ -925,6 +925,83 @@ TEST_F(TxnTest, WalRecoveryToleratesTornOrCorruptTail) {
 }
 
 // =====================================================================
+// 复合（多列）等值索引
+// =====================================================================
+
+TEST_F(TxnTest, CompositeIndexScanReturnsCorrectRows) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT, age INT)");
+    exec_ok("CREATE INDEX idx_city_age ON t (city, age)");
+    exec_ok("INSERT INTO t VALUES (1, 'bj', 20)");
+    exec_ok("INSERT INTO t VALUES (2, 'bj', 30)");
+    exec_ok("INSERT INTO t VALUES (3, 'sh', 20)");
+    exec_ok("INSERT INTO t VALUES (4, 'sh', 30)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 30"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age = 20 AND city = 'sh'"), 1u); // 列顺序无关
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 99"), 0u);
+}
+
+TEST_F(TxnTest, CompositeIndexUsesIndexScan) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT, age INT)");
+    exec_ok("CREATE INDEX idx_city_age ON t (city, age)");
+    exec_ok("INSERT INTO t VALUES (1, 'bj', 20)");
+    auto r = db->execute("EXPLAIN SELECT * FROM t WHERE city = 'bj' AND age = 20", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+    EXPECT_NE(plan.find("idx_city_age"), std::string::npos) << plan;
+}
+
+TEST_F(TxnTest, CompositeIndexReflectsUpdatesAndDeletes) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT, age INT)");
+    exec_ok("CREATE INDEX idx_city_age ON t (city, age)");
+    exec_ok("INSERT INTO t VALUES (1, 'bj', 20)");
+    exec_ok("INSERT INTO t VALUES (2, 'bj', 30)");
+    exec_ok("UPDATE t SET age = 99 WHERE id = 1"); // (bj,20) → (bj,99)
+    exec_ok("DELETE FROM t WHERE id = 2");         // 删 (bj,30)
+    // 超集索引仍含陈旧 (bj,20)→1、(bj,30)→2，可见性重查须过滤。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 20"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 30"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 99"), 1u);
+}
+
+TEST_F(TxnTest, CompositeIndexWithResidualPredicate) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT, age INT, score INT)");
+    exec_ok("CREATE INDEX idx_city_age ON t (city, age)");
+    exec_ok("INSERT INTO t VALUES (1, 'bj', 20, 5)");
+    exec_ok("INSERT INTO t VALUES (2, 'bj', 20, 9)");
+    // 残差谓词 score > 6 由 Filter 复查（IndexScan + Filter）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 20 AND score > 6"), 1u);
+}
+
+TEST_F(TxnTest, CompositeIndexSurvivesRestart) {
+    exec_ok("CREATE TABLE t (id INT, city TEXT, age INT)");
+    exec_ok("CREATE INDEX idx_city_age ON t (city, age)");
+    exec_ok("INSERT INTO t VALUES (1, 'bj', 20)");
+    exec_ok("INSERT INTO t VALUES (2, 'sh', 30)");
+    // 重启：复合索引定义 + 条目应恢复并继续可用/可维护。
+    db.reset();
+    storage_internal::WalManager::instance().clear_all();
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 20"), 1u);
+    exec_ok("INSERT INTO t VALUES (3, 'bj', 20)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE city = 'bj' AND age = 20"), 2u);
+    // 确认重启后仍走复合 IndexScan。
+    auto r = db->execute("EXPLAIN SELECT * FROM t WHERE city = 'bj' AND age = 20", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("idx_city_age"), std::string::npos) << plan;
+}
+
+// =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================
 

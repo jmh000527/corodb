@@ -137,6 +137,13 @@ namespace corodb {
               in_keys(std::move(keys)) {
         }
 
+        /** @brief 构造复合等值索引扫描计划节点（WHERE a=? AND b=?）。 */
+        IndexScanPlan(std::shared_ptr<Table> t, std::string alias_name, std::string idx_name,
+                      std::vector<std::string> comp_cols, std::vector<Value> comp_key)
+            : table(std::move(t)), alias(std::move(alias_name)), index_name(std::move(idx_name)), is_composite(true),
+              composite_columns(std::move(comp_cols)), composite_key(std::move(comp_key)) {
+        }
+
         std::shared_ptr<Table> table;    ///< 要扫描的表
         std::string alias;               ///< 表的别名
         std::string column;              ///< 索引列名
@@ -148,6 +155,10 @@ namespace corodb {
         bool high_inclusive{ false };    ///< 上界是否含等
         bool is_in{ false };             ///< 是否为 IN 多键扫描
         std::vector<Value> in_keys;      ///< IN 值列表（is_in=true 时使用）
+        bool is_composite{ false };                 ///< 是否为复合等值扫描
+        std::string index_name;                     ///< 复合索引名（is_composite=true 时使用）
+        std::vector<std::string> composite_columns; ///< 复合索引列（用于查询期重查）
+        std::vector<Value> composite_key;           ///< 复合键各列值（与 composite_columns 同序）
     };
 
     /** @brief 过滤计划节点，保留满足谓词的记录。 */
@@ -334,13 +345,13 @@ namespace corodb {
     /** @brief 创建索引计划节点。 */
     struct CreateIndexPlan : PlanNode {
         /** @brief 构造创建索引计划节点。 */
-        CreateIndexPlan(std::shared_ptr<Table> t, std::string idx_name, std::string col)
-            : table(std::move(t)), index_name(std::move(idx_name)), column(std::move(col)) {
+        CreateIndexPlan(std::shared_ptr<Table> t, std::string idx_name, std::vector<std::string> cols)
+            : table(std::move(t)), index_name(std::move(idx_name)), columns(std::move(cols)) {
         }
 
-        std::shared_ptr<Table> table; ///< 目标表
-        std::string index_name;       ///< 索引名称
-        std::string column;           ///< 要索引的列名
+        std::shared_ptr<Table> table;     ///< 目标表
+        std::string index_name;           ///< 索引名称
+        std::vector<std::string> columns; ///< 要索引的列（单/多列）
     };
 
     /** @brief 删除表计划节点。 */

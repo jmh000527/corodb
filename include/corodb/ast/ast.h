@@ -572,9 +572,9 @@ namespace corodb {
 
     /** @brief CREATE INDEX 语句 AST 节点。 */
     struct CreateIndexStmt {
-        std::string index_name; ///< 索引名称
-        std::string table;      ///< 目标表名
-        std::string column;     ///< 索引列名
+        std::string index_name;           ///< 索引名称
+        std::string table;                ///< 目标表名
+        std::vector<std::string> columns; ///< 索引列（单列或多列复合）
     };
 
     /** @brief UPDATE SET 子句中的一个赋值操作。 */

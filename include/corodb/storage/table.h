@@ -140,8 +140,8 @@ namespace corodb {
         /** @brief 重建当前表的全部索引。 */
         void refresh_indexes();
 
-        /** @brief 为指定列创建索引，使用显式索引名（如 `idx_emp_id`）。 */
-        void create_index(const std::string& index_name, const std::string& column);
+        /** @brief 创建索引（单列或多列复合），使用显式索引名。多列为等值复合索引（WHERE a=? AND b=?）。 */
+        void create_index(const std::string& index_name, const std::vector<std::string>& columns);
 
         /** @brief 为指定列创建索引，自动生成索引名 `idx_{table}_{column}`。 */
         void create_index(const std::string& column);
@@ -164,6 +164,10 @@ namespace corodb {
                                                               const std::optional<Value>& low, bool low_inclusive,
                                                               const std::optional<Value>& high,
                                                               bool high_inclusive) const;
+
+        /** @brief 复合等值索引查找：按索引名 + 各列值（须与索引列同序）返回主键集合（去重）。 */
+        [[nodiscard]] std::vector<Value> lookup_index_composite(const std::string& index_name,
+                                                                const std::vector<Value>& key_values) const;
 
         [[nodiscard]] const std::vector<Row>& rows() const noexcept {
             return rows_;
@@ -200,6 +204,12 @@ namespace corodb {
             return indexed_columns_;
         }
 
+        /** @brief 复合索引定义：索引名 → 有序列名列表（供规划器匹配等值合取）。 */
+        [[nodiscard]] const std::unordered_map<std::string, std::vector<std::string>>& composite_indexes()
+                const noexcept {
+            return composite_indexes_;
+        }
+
         /** @brief 单调递增的写计数器（用于 Serializable 幻读检测）。 */
         [[nodiscard]] uint64_t write_counter() const noexcept {
             return write_counter_.load(std::memory_order_acquire);
@@ -223,13 +233,18 @@ namespace corodb {
         std::unordered_set<std::string> indexed_columns_;
         /// 二级索引：列名 → (列值 → 主键)，有序 multimap（支持等值与范围查找），与内存行缓存解耦。
         std::unordered_map<std::string, std::multimap<Value, Value, ValueLess>> indexes_;
-        std::unordered_map<std::string, std::string> index_name_registry_; ///< 索引名 → 列名
+        std::unordered_map<std::string, std::string> index_name_registry_; ///< 索引名 → 列名（复合为 \x1f 连接）
+        /// 复合索引：索引名 → 有序列列表；条目存于 indexes_[索引名]（键为复合编码字符串）。
+        std::unordered_map<std::string, std::vector<std::string>> composite_indexes_;
 
         void index_row(const Row& row);
 
         void update_indexes_for_row(std::size_t rid);
 
         void rebuild_index_for_column(const std::string& column, std::size_t col_idx);
+
+        void rebuild_composite_index(const std::string& index_name, const std::vector<std::string>& columns,
+                                     const std::vector<std::size_t>& col_idxs);
     };
 
     /** @brief 按名称和 OID 管理表对象。 */

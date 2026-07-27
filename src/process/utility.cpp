@@ -70,7 +70,7 @@ namespace corodb {
     void UtilityProcessor::create_index(const CreateIndexPlan& plan) {
         if (!plan.table)
             throw std::runtime_error("[Process] CREATE INDEX missing table");
-        plan.table->create_index(plan.index_name, plan.column);
+        plan.table->create_index(plan.index_name, plan.columns);
     }
 
     /**

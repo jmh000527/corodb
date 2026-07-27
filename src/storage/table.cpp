@@ -134,6 +134,30 @@ namespace corodb {
 
         // 加载索引名注册表（用于支持按名称 DROP INDEX）
         index_name_registry_ = storage_->load_index_registry(name_);
+
+        // 恢复复合索引：注册表值含 \x1f 分隔的多列时，重建其内存条目（单列已由上面循环恢复）。
+        for (const auto& [iname, def]: index_name_registry_) {
+            if (def.find('\x1f') == std::string::npos)
+                continue;
+            std::vector<std::string> cols;
+            std::string cur;
+            for (char ch: def) {
+                if (ch == '\x1f') {
+                    cols.push_back(cur);
+                    cur.clear();
+                } else {
+                    cur.push_back(ch);
+                }
+            }
+            if (!cur.empty())
+                cols.push_back(cur);
+            composite_indexes_[iname] = cols;
+            auto entries = storage_->load_index_rows(name_, iname);
+            auto& idx = indexes_[iname];
+            idx.clear();
+            for (const auto& [ckey, pk]: entries)
+                idx.emplace(ckey, pk);
+        }
     }
 
     /**
@@ -263,45 +287,126 @@ namespace corodb {
     }
 
     /**
-     * @brief 为指定列创建索引（显式指定索引名）
-     * @param index_name 索引名称，如 `idx_emp_salary`
-     * @param column     要索引的列名
-     * @throw std::runtime_error 如果列不存在
+     * @brief 将复合键的各列值编码为一个自定界、可判等的字节串（等值索引键）。
+     *
+     * 每个 Value 前置 1 字节类型标签，字符串再前置 4 字节长度，拼接后可无歧义区分不同元组。
+     * 仅用于等值查找（不保证跨类型顺序），故不影响单列有序索引的范围语义。
      */
-    void Table::create_index(const std::string& index_name, const std::string& column) {
-        std::size_t col_idx = columns_.size();
-        for (std::size_t i = 0; i < columns_.size(); ++i) {
-            if (columns_[i].name == column) {
-                col_idx = i;
-                break;
+    static Value encode_composite(const std::vector<Value>& vals) {
+        std::string out;
+        for (const auto& v: vals) {
+            if (std::holds_alternative<NullValue>(v)) {
+                out.push_back('\0');
+            } else if (std::holds_alternative<int64_t>(v)) {
+                out.push_back('\1');
+                int64_t x = std::get<int64_t>(v);
+                out.append(reinterpret_cast<const char*>(&x), sizeof(x));
+            } else if (std::holds_alternative<double>(v)) {
+                out.push_back('\2');
+                double d = std::get<double>(v);
+                out.append(reinterpret_cast<const char*>(&d), sizeof(d));
+            } else {
+                const std::string& s = std::get<std::string>(v);
+                out.push_back('\3');
+                uint32_t n = static_cast<uint32_t>(s.size());
+                out.append(reinterpret_cast<const char*>(&n), sizeof(n));
+                out.append(s);
             }
         }
-        if (col_idx == columns_.size())
-            throw std::runtime_error("[Table] Unknown column: " + column);
-
-        if (!indexed_columns_.count(column)) {
-            // 索引尚不存在：创建文件并构建内存索引
-            if (storage_)
-                storage_->create_index_file(name_, column);
-            indexed_columns_.insert(column);
-            rebuild_index_for_column(column, col_idx);
-        }
-
-        // 无论索引是否刚创建，始终注册名称映射（幂等操作）
-        if (!index_name.empty()) {
-            index_name_registry_[index_name] = column;
-            if (storage_)
-                storage_->save_index_registry(name_, index_name_registry_);
-        }
+        return Value{ out };
     }
 
     /**
-     * @brief 为指定列创建索引（自动生成索引名 `idx_{table}_{column}`）
-     * @param column 要索引的列名
-     * @throw std::runtime_error 如果列不存在
+     * @brief 创建索引（单列有序索引或多列复合等值索引），显式指定索引名。
+     * @param index_name 索引名称
+     * @param columns    索引列（1 列 → 有序索引；>1 列 → 复合等值索引）
+     * @throw std::runtime_error 如果任一列不存在
+     */
+    void Table::create_index(const std::string& index_name, const std::vector<std::string>& columns) {
+        if (columns.empty())
+            return;
+        std::vector<std::size_t> col_idxs;
+        col_idxs.reserve(columns.size());
+        for (const auto& c: columns) {
+            auto ci = find_column(c);
+            if (!ci)
+                throw std::runtime_error("[Table] Unknown column: " + c);
+            col_idxs.push_back(*ci);
+        }
+
+        if (columns.size() == 1) {
+            // 单列：沿用有序 multimap 索引（支持 =/范围/BETWEEN/IN）。
+            const std::string& column = columns[0];
+            if (!indexed_columns_.count(column)) {
+                if (storage_)
+                    storage_->create_index_file(name_, column);
+                indexed_columns_.insert(column);
+                rebuild_index_for_column(column, col_idxs[0]);
+            }
+            if (!index_name.empty())
+                index_name_registry_[index_name] = column;
+        } else {
+            // 多列：复合等值索引，条目存于 indexes_[index_name]（键为复合编码字符串）。
+            if (!composite_indexes_.count(index_name)) {
+                composite_indexes_[index_name] = columns;
+                if (storage_)
+                    storage_->create_index_file(name_, index_name);
+                rebuild_composite_index(index_name, columns, col_idxs);
+            }
+            // 定义持久化：注册表值 = 列名以 \x1f 连接（重启时据此重建复合索引）。
+            std::string joined;
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                if (i)
+                    joined.push_back('\x1f');
+                joined += columns[i];
+            }
+            if (!index_name.empty())
+                index_name_registry_[index_name] = joined;
+        }
+
+        if (!index_name.empty() && storage_)
+            storage_->save_index_registry(name_, index_name_registry_);
+    }
+
+    /**
+     * @brief 为单列创建索引（自动生成索引名 `idx_{table}_{column}`）。
      */
     void Table::create_index(const std::string& column) {
-        create_index("idx_" + name_ + "_" + column, column);
+        create_index("idx_" + name_ + "_" + column, std::vector<std::string>{ column });
+    }
+
+    /**
+     * @brief 从可见快照重建复合等值索引（内存 + 持久化）。
+     */
+    void Table::rebuild_composite_index(const std::string& index_name, const std::vector<std::string>& /*columns*/,
+                                        const std::vector<std::size_t>& col_idxs) {
+        auto& idx = indexes_[index_name];
+        idx.clear();
+        std::vector<Row> src = storage_ ? storage_->scan_visible(name_, columns_, UINT64_MAX) : rows_;
+        std::vector<std::pair<Value, Value>> entries;
+        entries.reserve(src.size());
+        for (const auto& row: src) {
+            if (row.values.empty())
+                continue;
+            const Value& pk = row.values.front();
+            std::vector<Value> key_vals;
+            key_vals.reserve(col_idxs.size());
+            bool ok = true;
+            for (std::size_t ci: col_idxs) {
+                if (ci >= row.values.size()) {
+                    ok = false;
+                    break;
+                }
+                key_vals.push_back(row.values[ci]);
+            }
+            if (!ok)
+                continue;
+            Value ckey = encode_composite(key_vals);
+            idx.emplace(ckey, pk);
+            entries.emplace_back(std::move(ckey), pk);
+        }
+        if (storage_)
+            storage_->write_index_rows(name_, index_name, entries);
     }
 
     /**
@@ -386,6 +491,22 @@ namespace corodb {
         return out;
     }
 
+    std::vector<Value> Table::lookup_index_composite(const std::string& index_name,
+                                                     const std::vector<Value>& key_values) const {
+        std::vector<Value> out;
+        auto it = indexes_.find(index_name);
+        if (it == indexes_.end())
+            return out;
+        Value ckey = encode_composite(key_values);
+        std::unordered_set<Value, ValueHash, ValueEq> seen;
+        auto range = it->second.equal_range(ckey);
+        for (auto iter = range.first; iter != range.second; ++iter) {
+            if (seen.insert(iter->second).second)
+                out.push_back(iter->second);
+        }
+        return out;
+    }
+
     /**
      * @brief 为单行增量维护所有二级索引（value→pk 超集条目）。
      * @param rid rows_ 中的行下标（仅用于取行数据）。
@@ -403,7 +524,7 @@ namespace corodb {
      * 从而在 MVCC（含索引列被更新）下保持正确。
      */
     void Table::index_row(const Row& row) {
-        if (indexed_columns_.empty())
+        if (indexed_columns_.empty() && composite_indexes_.empty())
             return;
         if (row.values.empty())
             return; // 无主键列
@@ -416,6 +537,26 @@ namespace corodb {
             indexes_[col_name].emplace(v, pk);
             if (storage_)
                 storage_->append_index_entry(name_, col_name, v, pk);
+        }
+        // 复合等值索引维护（超集 + 查询期重查）。
+        for (const auto& [iname, cols]: composite_indexes_) {
+            std::vector<Value> key_vals;
+            key_vals.reserve(cols.size());
+            bool ok = true;
+            for (const auto& c: cols) {
+                auto ci = find_column(c);
+                if (!ci || *ci >= row.values.size()) {
+                    ok = false;
+                    break;
+                }
+                key_vals.push_back(row.values[*ci]);
+            }
+            if (!ok)
+                continue;
+            Value ckey = encode_composite(key_vals);
+            indexes_[iname].emplace(ckey, pk);
+            if (storage_)
+                storage_->append_index_entry(name_, iname, ckey, pk);
         }
     }
 

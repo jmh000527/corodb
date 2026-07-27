@@ -416,6 +416,13 @@ namespace corodb {
 
             // 索引列在表中的下标（用于可见性重查过滤陈旧超集条目）。
             const std::size_t col_idx = idx->table->find_column(idx->column).value_or(0);
+            // 复合索引各列下标（复合等值重查用）。
+            std::vector<std::size_t> comp_idxs;
+            if (idx->is_composite) {
+                comp_idxs.reserve(idx->composite_columns.size());
+                for (const auto& cn: idx->composite_columns)
+                    comp_idxs.push_back(idx->table->find_column(cn).value_or(0));
+            }
             // 无 snapshot（sessionless / 非 MVCC）时取最新已提交版本。
             const uint64_t snap = (snapshot_ts != 0) ? snapshot_ts : std::numeric_limits<uint64_t>::max();
 
@@ -447,9 +454,24 @@ namespace corodb {
                 }
                 return true;
             };
+            // 复合等值：所有复合列都需与键相等（超集重查）；否则回退到单列值匹配。
+            auto row_matches = [&](const Row& row) -> bool {
+                if (idx->is_composite) {
+                    for (std::size_t i = 0; i < comp_idxs.size(); ++i) {
+                        if (comp_idxs[i] >= row.values.size())
+                            return false;
+                        if (!ValueEq{}(row.values[comp_idxs[i]], idx->composite_key[i]))
+                            return false;
+                    }
+                    return true;
+                }
+                return col_idx < row.values.size() && matches(row.values[col_idx]);
+            };
             // 通过索引取候选主键；对每个 pk 做可见性重查 + 键匹配重查。
             std::vector<Value> pks;
-            if (idx->is_in) {
+            if (idx->is_composite) {
+                pks = idx->table->lookup_index_composite(idx->index_name, idx->composite_key);
+            } else if (idx->is_in) {
                 // IN：多个等值点查的并集（去重）。
                 std::unordered_set<Value, ValueHash, ValueEq> seen_pk;
                 for (const auto& k: idx->in_keys) {
@@ -475,7 +497,7 @@ namespace corodb {
                     auto bit = buf->upserts.find(pk);
                     if (bit != buf->upserts.end()) {
                         const Row& br = bit->second; // 事务缓冲覆盖：用缓冲行，且需仍匹配索引键
-                        if (col_idx < br.values.size() && matches(br.values[col_idx])) {
+                        if (row_matches(br)) {
                             record_idx_read(br);
                             co_yield make_record_from_row(*idx->table, br, binding);
                         }
@@ -487,7 +509,7 @@ namespace corodb {
                 if (!row.has_value())
                     continue; // 已删除 / 不可见
                 // 可见性重查：超集索引可能含陈旧值，需确认可见版本的索引列仍满足键条件。
-                if (col_idx >= row->values.size() || !matches(row->values[col_idx]))
+                if (!row_matches(*row))
                     continue;
                 emitted.insert(pk);
                 record_idx_read(*row);
@@ -498,7 +520,7 @@ namespace corodb {
                 for (const auto& [pk, row]: buf->upserts) {
                     if (emitted.count(pk))
                         continue;
-                    if (col_idx < row.values.size() && matches(row.values[col_idx]))
+                    if (row_matches(row))
                         co_yield make_record_from_row(*idx->table, row, binding);
                 }
             }

@@ -418,13 +418,16 @@ namespace corodb {
         expect_keyword("ON");                      // 期望ON关键字
         std::string table = consume_identifier();  // 解析表名
         expect_text("(");                          // 期望左括号
-        std::string column = consume_identifier(); // 解析索引列
+        std::vector<std::string> columns;
+        columns.push_back(consume_identifier()); // 第一个索引列
+        while (match_text(","))
+            columns.push_back(consume_identifier()); // 额外的复合列
         expect_text(")");                          // 期望右括号
 
         CreateIndexStmt stmt;               // 构造CREATE INDEX语句对象
         stmt.index_name = std::move(index); // 设置索引名
         stmt.table = std::move(table);      // 设置表名
-        stmt.column = std::move(column);    // 设置索引列
+        stmt.columns = std::move(columns);  // 设置索引列（单/多列）
         return stmt;                        // 返回CREATE INDEX语句对象
     }
 
