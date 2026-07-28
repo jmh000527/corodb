@@ -1127,6 +1127,22 @@ TEST_F(TxnTest, InSelectSubqueryUsesIndexAfterSubstitution) {
     EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
 }
 
+TEST_F(TxnTest, ExistsSubquery) {
+    exec_ok("CREATE TABLE t (id INT)");
+    exec_ok("CREATE TABLE u (id INT)");
+    exec_ok("INSERT INTO t VALUES (1)");
+    exec_ok("INSERT INTO t VALUES (2)");
+    // 非空 → 全部行；空 → 0 行；NOT EXISTS 取反。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE EXISTS (SELECT * FROM t WHERE id = 1)"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE EXISTS (SELECT * FROM u)"), 0u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE NOT EXISTS (SELECT * FROM u)"), 2u);
+    // 与其他谓词组合。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE id = 1 AND EXISTS (SELECT * FROM t WHERE id = 2)"), 1u);
+    exec_ok("INSERT INTO u VALUES (9)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE EXISTS (SELECT * FROM u)"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE NOT EXISTS (SELECT * FROM u)"), 0u);
+}
+
 // =====================================================================
 // CBO：行数统计驱动的 JOIN 重排
 // =====================================================================

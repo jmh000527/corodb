@@ -635,6 +635,17 @@ namespace corodb {
      * @return 解析后的布尔表达式
      */
     BoolExpr Parser::parse_bool_atom() {
+        // EXISTS (SELECT ...)：非相关子查询，执行前由处理器代换为恒真/恒假；NOT EXISTS 由外层 Not 节点组合。
+        if (match_keyword("EXISTS")) {
+            expect_text("(");
+            Statement sub = parse_select();
+            expect_text(")");
+            InExpr in_expr;
+            in_expr.expr = Literal::from_int(1); // 占位，不参与求值
+            in_expr.exists_only = true;
+            in_expr.subquery = std::make_shared<SelectStmt>(std::move(std::get<SelectStmt>(sub)));
+            return BoolExpr::make_in(std::move(in_expr));
+        }
         if (match_text("(")) {             // 解析括号内的表达式
             auto expr = parse_bool_expr(); // 递归解析布尔表达式
             expect_text(")");              // 期望右括号

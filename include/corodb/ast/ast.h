@@ -304,6 +304,7 @@ namespace corodb {
         std::vector<Expression> values;     ///< 值列表
         bool negated{ false };              ///< 是否为 NOT IN
         std::shared_ptr<SelectStmt> subquery; ///< IN (SELECT ...) 子查询（执行前由处理器代换为 values）
+        bool exists_only{ false };            ///< EXISTS (SELECT ...) 模式：仅判断子查询是否有行
     };
 
     /** @brief SQL BETWEEN / NOT BETWEEN 表达式。 */

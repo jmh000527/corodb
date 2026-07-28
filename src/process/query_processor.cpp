@@ -487,7 +487,9 @@ namespace corodb {
         if (session->statement_timeout_ms > 0)
             ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(session->statement_timeout_ms);
         Executor ex{ ctx };
+        const bool exists_only = e.in_expr->exists_only;
         std::vector<Expression> values;
+        bool found = false;
         // 自动提交语句：清除上一条语句遗留的过期 snapshot_ts，子查询读最新已提交；
         // 事务内则沿用事务快照（与外层一致的读视图）。
         const uint64_t saved_snap = session->snapshot_ts;
@@ -496,6 +498,10 @@ namespace corodb {
         try {
             auto gen = ex.run(plan.get());
             for (auto&& rec: gen) {
+                if (exists_only) {
+                    found = true;
+                    break; // EXISTS 只需存在性，取到首行即止
+                }
                 if (rec.values.size() != 1)
                     throw std::runtime_error("[Process] IN subquery must return exactly one column");
                 values.push_back(Expression{ Literal{ rec.values.front() } });
@@ -505,6 +511,15 @@ namespace corodb {
             throw;
         }
         session->snapshot_ts = saved_snap;
+        if (exists_only) {
+            // 代换为恒真/恒假比较（NOT EXISTS 由外层 Not 节点组合求值）。
+            Comparison c;
+            c.op = CompareOp::Eq;
+            c.lhs = Literal::from_int(1);
+            c.rhs = Literal::from_int(found ? 1 : 0);
+            e = BoolExpr::make_comparison(std::move(c));
+            return;
+        }
         e.in_expr->values = std::move(values);
         e.in_expr->subquery.reset();
     }
