@@ -20,8 +20,16 @@ namespace corodb {
             return begin(session);
         if (std::holds_alternative<CommitStmt>(stmt))
             return commit(session);
-        if (std::holds_alternative<RollbackStmt>(stmt))
+        if (std::holds_alternative<RollbackStmt>(stmt)) {
+            const auto& rb = std::get<RollbackStmt>(stmt);
+            if (rb.savepoint.has_value())
+                return rollback_to_savepoint(*rb.savepoint, session);
             return rollback(session);
+        }
+        if (std::holds_alternative<SavepointStmt>(stmt))
+            return savepoint(std::get<SavepointStmt>(stmt).name, session);
+        if (std::holds_alternative<ReleaseSavepointStmt>(stmt))
+            return release_savepoint(std::get<ReleaseSavepointStmt>(stmt).name, session);
         if (std::holds_alternative<SetTransactionStmt>(stmt))
             return set_transaction(std::get<SetTransactionStmt>(stmt), session);
         return std::nullopt;
@@ -38,6 +46,7 @@ namespace corodb {
         uint64_t txn_id = txn_manager_.begin();
         (void)storage_.begin_transaction();
         session.current_txn_id = txn_id;
+        session.savepoints.clear();
         if (session.isolation == IsolationLevel::RepeatableRead || session.isolation == IsolationLevel::Serializable) {
             auto rts = txn_manager_.get_read_ts(txn_id);
             session.snapshot_ts = rts.value_or(0);
@@ -192,6 +201,7 @@ namespace corodb {
         session.write_buffer.clear();
         session.read_set.clear();
         session.table_read_versions.clear();
+        session.savepoints.clear();
         session.current_txn_id = 0;
         session.snapshot_ts = 0;
         // 提交成功后释放行锁，允许其他事务继续
@@ -215,11 +225,58 @@ namespace corodb {
         session.write_buffer.clear();
         session.read_set.clear();
         session.table_read_versions.clear();
+        session.savepoints.clear();
         row_locks_.release_all(txn_id);
         txn_manager_.rollback(txn_id);
         bool ok_eng = storage_.rollback_transaction(txn_id);
         return TxnControlResult{ ok_eng ? std::string("Transaction rolled back")
                                         : std::string("Transaction rollback failed") };
+    }
+
+    /**
+     * @brief 在当前事务内建立命名保存点（写缓冲/读集深拷贝快照）。
+     */
+    TxnControlResult TransactionController::savepoint(const std::string& name, Session& session) {
+        if (session.current_txn_id == 0)
+            throw std::runtime_error("[Process] SAVEPOINT can only be used inside a transaction");
+        session.savepoints.push_back(
+                Savepoint{ name, session.write_buffer, session.read_set, session.table_read_versions });
+        return TxnControlResult{ "SAVEPOINT " + name };
+    }
+
+    /**
+     * @brief 回滚到保存点：恢复建立时的写缓冲/读集快照，事务继续；保存点自身保留（可重复回滚），
+     * 其后建立的保存点销毁。保存点之后获得的行锁保守地保持到事务结束（不影响正确性）。
+     */
+    TxnControlResult TransactionController::rollback_to_savepoint(const std::string& name, Session& session) {
+        if (session.current_txn_id == 0)
+            throw std::runtime_error("[Process] ROLLBACK TO SAVEPOINT can only be used inside a transaction");
+        for (std::size_t i = session.savepoints.size(); i > 0; --i) {
+            auto& sp = session.savepoints[i - 1];
+            if (sp.name != name)
+                continue;
+            session.write_buffer = sp.write_buffer;
+            session.read_set = sp.read_set;
+            session.table_read_versions = sp.table_read_versions;
+            session.savepoints.resize(i); // 保留自身，销毁其后的保存点
+            return TxnControlResult{ "ROLLBACK TO SAVEPOINT " + name };
+        }
+        throw std::runtime_error("[Process] Savepoint not found: " + name);
+    }
+
+    /**
+     * @brief 销毁保存点（及其后建立的保存点），不回滚数据。
+     */
+    TxnControlResult TransactionController::release_savepoint(const std::string& name, Session& session) {
+        if (session.current_txn_id == 0)
+            throw std::runtime_error("[Process] RELEASE SAVEPOINT can only be used inside a transaction");
+        for (std::size_t i = session.savepoints.size(); i > 0; --i) {
+            if (session.savepoints[i - 1].name != name)
+                continue;
+            session.savepoints.resize(i - 1);
+            return TxnControlResult{ "RELEASE SAVEPOINT " + name };
+        }
+        throw std::runtime_error("[Process] Savepoint not found: " + name);
     }
 
     /**

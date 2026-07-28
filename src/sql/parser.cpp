@@ -85,7 +85,16 @@ namespace corodb {
         if (head == "COMMIT")
             return parse_commit(); // 解析COMMIT语句
         if (head == "ROLLBACK")
-            return parse_rollback(); // 解析ROLLBACK语句
+            return parse_rollback(); // 解析ROLLBACK语句（含 ROLLBACK TO SAVEPOINT）
+        if (head == "SAVEPOINT") {
+            consume(); // 消费 SAVEPOINT
+            return SavepointStmt{ consume_identifier() };
+        }
+        if (head == "RELEASE") {
+            consume();                  // 消费 RELEASE
+            match_keyword("SAVEPOINT"); // 可选的 SAVEPOINT 关键字
+            return ReleaseSavepointStmt{ consume_identifier() };
+        }
         if (head == "CHECKPOINT")
             return parse_checkpoint(); // 解析 CHECKPOINT
         if (head == "SHOW")
@@ -1303,6 +1312,13 @@ namespace corodb {
      */
     RollbackStmt Parser::parse_rollback() {
         consume(); // 消费 ROLLBACK
+        // ROLLBACK TO [SAVEPOINT] name：回滚到保存点，事务继续。
+        if (match_keyword("TO")) {
+            match_keyword("SAVEPOINT"); // 可选
+            RollbackStmt stmt;
+            stmt.savepoint = consume_identifier();
+            return stmt;
+        }
         // 可选: TRANSACTION 关键字
         if (peek_upper() == "TRANSACTION") {
             consume();

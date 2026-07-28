@@ -1144,6 +1144,53 @@ TEST_F(TxnTest, ExistsSubquery) {
 }
 
 // =====================================================================
+// SAVEPOINT / ROLLBACK TO / RELEASE
+// =====================================================================
+
+TEST_F(TxnTest, SavepointRollbackToAndRelease) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    exec_ok("BEGIN");
+    exec_ok("INSERT INTO t VALUES (1, 10)");
+    exec_ok("SAVEPOINT sp1");
+    exec_ok("INSERT INTO t VALUES (2, 20)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 2u);
+    exec_ok("ROLLBACK TO SAVEPOINT sp1");
+    // 回滚到 sp1：只剩第 1 行；事务仍活跃。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 1u);
+    // 可再写入并重复回滚（保存点自身保留）。
+    exec_ok("INSERT INTO t VALUES (3, 30)");
+    exec_ok("ROLLBACK TO sp1"); // 省略 SAVEPOINT 关键字
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 1u);
+    exec_ok("COMMIT");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 1u);
+}
+
+TEST_F(TxnTest, SavepointErrorsAndScoping) {
+    exec_ok("CREATE TABLE t (id INT)");
+    // 事务外使用报错。
+    EXPECT_THROW((void) db->execute("SAVEPOINT s", sess), std::runtime_error);
+    EXPECT_THROW((void) db->execute("ROLLBACK TO SAVEPOINT s", sess), std::runtime_error);
+    EXPECT_THROW((void) db->execute("RELEASE SAVEPOINT s", sess), std::runtime_error);
+    exec_ok("BEGIN");
+    exec_ok("SAVEPOINT a");
+    exec_ok("INSERT INTO t VALUES (1)");
+    exec_ok("SAVEPOINT b");
+    exec_ok("INSERT INTO t VALUES (2)");
+    // 回滚到 a 销毁 b。
+    exec_ok("ROLLBACK TO SAVEPOINT a");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 0u);
+    EXPECT_THROW((void) db->execute("ROLLBACK TO SAVEPOINT b", sess), std::runtime_error);
+    // RELEASE 后不可再回滚到该点；数据不回滚。
+    exec_ok("INSERT INTO t VALUES (3)");
+    exec_ok("SAVEPOINT c");
+    exec_ok("RELEASE SAVEPOINT c");
+    EXPECT_THROW((void) db->execute("ROLLBACK TO SAVEPOINT c", sess), std::runtime_error);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 1u);
+    exec_ok("ROLLBACK");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t"), 0u);
+}
+
+// =====================================================================
 // RIGHT / FULL JOIN
 // =====================================================================
 

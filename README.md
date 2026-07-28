@@ -897,7 +897,7 @@ cd build && ctest -j8
 | 查询 | `SELECT [DISTINCT] cols FROM t [alias] [JOIN ... ON ...] [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET n]`；`SELECT ... UNION [ALL] SELECT ...`（同种拼接，非 ALL 全局去重） |
 | JOIN | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL JOIN`（均支持 `[OUTER]`） |
 | 聚合 | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` |
-| 事务 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL {READ UNCOMMITTED \| READ COMMITTED \| REPEATABLE READ \| SERIALIZABLE}` |
+| 事务 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name`, `SET TRANSACTION ISOLATION LEVEL {READ UNCOMMITTED \| READ COMMITTED \| REPEATABLE READ \| SERIALIZABLE}` |
 | 计划 | `EXPLAIN stmt`, `EXPLAIN ANALYZE stmt` |
 | 预处理 | `PREPARE name FROM 'sql'`, `EXECUTE name`, `DEALLOCATE PREPARE [name \| ALL]` |
 | 管理 | `CREATE USER user 'pwd'`, `AUTH user 'pwd'`, `CHECKPOINT`, `SHOW STATUS` |
@@ -911,7 +911,7 @@ cd build && ctest -j8
 | 子查询 | 支持 `IN / NOT IN (SELECT ...)` 与 `EXISTS / NOT EXISTS (SELECT ...)`（WHERE 中，可嵌套）；非相关先代换可命中索引，相关子查询逐外层行求值（引用外层列须带表名/别名限定） |
 | `IS NULL / IS NOT NULL` | 支持（含 `NULL` 字面量写入/更新，三值逻辑） |
 | `UNION [ALL]` | 支持（同种拼接；混合 UNION/UNION ALL 暂不支持） |
-| `SAVEPOINT` / 嵌套事务 | 不支持 |
+| 嵌套事务 | `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` 已支持（写缓冲快照式；保存点后获得的行锁保持到事务结束） |
 | TLS 加密传输 | 不支持 |
 
 ---

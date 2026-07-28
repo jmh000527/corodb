@@ -54,6 +54,14 @@ namespace corodb {
         }
     };
 
+    /** @brief 事务内命名保存点：建立时的写缓冲/读集快照（ROLLBACK TO 恢复）。 */
+    struct Savepoint {
+        std::string name;
+        TxnWriteBuffer write_buffer;
+        std::unordered_map<std::string, std::unordered_set<Value, ValueHash, ValueEq>> read_set;
+        std::unordered_map<std::string, uint64_t> table_read_versions;
+    };
+
     /** @brief 单个客户端连接的运行时状态（每连接一份，彼此隔离）。 */
     struct Session {
         uint64_t current_txn_id{ 0 };      ///< 当前活跃事务 ID（0 = 无事务）
@@ -65,6 +73,9 @@ namespace corodb {
         /// Serializable 幻读防护：记录各表在读取时的 write_version。
         std::unordered_map<std::string, uint64_t> table_read_versions;
         uint64_t statement_timeout_ms{ 0 }; ///< 0 = 无超时
+
+        /// SAVEPOINT 栈（事务内有效；COMMIT/ROLLBACK/BEGIN 清空）。
+        std::vector<Savepoint> savepoints;
 
         /// 预处理语句注册表：名称 → 缓存的物理计划。
         std::unordered_map<std::string, std::shared_ptr<PlanNode>> prepared_stmts;

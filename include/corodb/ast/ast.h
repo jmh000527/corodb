@@ -672,7 +672,18 @@ namespace corodb {
      * ```
      */
     struct RollbackStmt {
-        // 目前不需要额外字段
+        /// 非空时为 ROLLBACK TO [SAVEPOINT] name（回滚到保存点，事务继续）；空 = 整事务回滚。
+        std::optional<std::string> savepoint;
+    };
+
+    /** @struct SavepointStmt @brief SAVEPOINT name 语句，在事务内建立命名保存点。 */
+    struct SavepointStmt {
+        std::string name; ///< 保存点名称
+    };
+
+    /** @struct ReleaseSavepointStmt @brief RELEASE [SAVEPOINT] name 语句，销毁保存点（不回滚数据）。 */
+    struct ReleaseSavepointStmt {
+        std::string name; ///< 保存点名称
     };
 
     /** @struct CheckpointStmt @brief CHECKPOINT 语句，强制刷盘并截断 WAL。 */
@@ -731,6 +742,7 @@ namespace corodb {
     /** @brief SQL 语句（所有支持语句类型的 variant）。 */
     using Statement = std::variant<SelectStmt, InsertStmt, UpdateStmt, DeleteStmt, CreateStmt, CreateIndexStmt,
                                    DropTableStmt, DropIndexStmt, BeginStmt, CommitStmt, RollbackStmt,
+                                   SavepointStmt, ReleaseSavepointStmt,
                                    CheckpointStmt, ShowStatusStmt,
                                    PrepareStmt, ExecuteStmt, DeallocateStmt, AuthStmt, CreateUserStmt,
                                    SetTransactionStmt, std::shared_ptr<ExplainStmt>>;

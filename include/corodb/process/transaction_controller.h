@@ -53,6 +53,9 @@ namespace corodb {
         TxnControlResult begin(Session& session);
         TxnControlResult commit(Session& session);
         TxnControlResult rollback(Session& session);
+        TxnControlResult savepoint(const std::string& name, Session& session);
+        TxnControlResult rollback_to_savepoint(const std::string& name, Session& session);
+        TxnControlResult release_savepoint(const std::string& name, Session& session);
         TxnControlResult set_transaction(const SetTransactionStmt& stmt, Session& session);
 
         TransactionManager& txn_manager_;
