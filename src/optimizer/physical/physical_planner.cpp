@@ -394,10 +394,12 @@ namespace corodb::opt {
      *        按 ON 条件和子树排序状态选择最优物理实现。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_join(const LogicalJoin& j) {
-        // P2: Inner + 等值 + 双侧表名清晰 → HashJoin；否则 NestedLoop。
-        // P3: 若 Inner + 等值 且 双侧 child 为 LogicalSort，且 sort key 顶层
-        //     恰好分别等于左/右等值键 → MergeJoin（避免重复排序）。
-        if ((j.join_type == JoinType::Inner || j.join_type == JoinType::Left) && j.on.has_value()) {
+        // P2: 等值 + 双侧表名清晰 → HashJoin（Inner/Left/Right/Full 均支持，执行器带 matched 标记 +
+        //     收尾补 NULL）；否则 NestedLoop。
+        // P3: 若等值且双侧 child 为 LogicalSort，且 sort key 顶层恰好分别等于左/右等值键 → MergeJoin。
+        if ((j.join_type == JoinType::Inner || j.join_type == JoinType::Left || j.join_type == JoinType::Right ||
+             j.join_type == JoinType::Full) &&
+            j.on.has_value()) {
             std::unordered_set<std::string> ltabs, rtabs;
             if (j.left)
                 collect_plan_tables(*j.left, ltabs);

@@ -895,7 +895,7 @@ cd build && ctest -j8
 | DDL | `CREATE TABLE name (col type, ...)`, `DROP TABLE name`, `CREATE INDEX idx ON t (col)` / `ON t (a, b, ...)`（多列为复合等值索引）, `DROP INDEX idx` |
 | DML | `INSERT INTO t VALUES (v1, v2, ...)`, `UPDATE t SET col = v WHERE ...`, `DELETE FROM t WHERE ...` |
 | 查询 | `SELECT [DISTINCT] cols FROM t [alias] [JOIN ... ON ...] [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET n]`；`SELECT ... UNION [ALL] SELECT ...`（同种拼接，非 ALL 全局去重） |
-| JOIN | `INNER JOIN`, `LEFT JOIN` |
+| JOIN | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL JOIN`（均支持 `[OUTER]`） |
 | 聚合 | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` |
 | 事务 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL {READ UNCOMMITTED \| READ COMMITTED \| REPEATABLE READ \| SERIALIZABLE}` |
 | 计划 | `EXPLAIN stmt`, `EXPLAIN ANALYZE stmt` |
@@ -910,7 +910,7 @@ cd build && ctest -j8
 |------|------|
 | 子查询 | 支持 `IN / NOT IN (SELECT ...)` 与 `EXISTS / NOT EXISTS (SELECT ...)`（WHERE 中，可嵌套）；非相关先代换可命中索引，相关子查询逐外层行求值（引用外层列须带表名/别名限定） |
 | `IS NULL / IS NOT NULL` | 支持（含 `NULL` 字面量写入/更新，三值逻辑） |
-| `RIGHT JOIN` / `FULL JOIN` | 仅 INNER 和 LEFT；`UNION [ALL]` 已支持（混合 UNION/UNION ALL 暂不支持） |
+| `UNION [ALL]` | 支持（同种拼接；混合 UNION/UNION ALL 暂不支持） |
 | `SAVEPOINT` / 嵌套事务 | 不支持 |
 | TLS 加密传输 | 不支持 |
 

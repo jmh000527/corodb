@@ -1144,6 +1144,36 @@ TEST_F(TxnTest, ExistsSubquery) {
 }
 
 // =====================================================================
+// RIGHT / FULL JOIN
+// =====================================================================
+
+TEST_F(TxnTest, RightAndFullJoin) {
+    exec_ok("CREATE TABLE l (id INT, v INT)");
+    exec_ok("CREATE TABLE r (id INT, w INT)");
+    exec_ok("INSERT INTO l VALUES (1, 10)");
+    exec_ok("INSERT INTO l VALUES (2, 20)");
+    exec_ok("INSERT INTO r VALUES (2, 200)");
+    exec_ok("INSERT INTO r VALUES (3, 300)");
+    // RIGHT JOIN：右侧全保留 → (2 匹配) + (3 左侧 NULL) = 2 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM l RIGHT JOIN r ON l.id = r.id"), 2u);
+    // FULL JOIN：1(左独) + 2(匹配) + 3(右独) = 3 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM l FULL JOIN r ON l.id = r.id"), 3u);
+    // 右独行的左列为 NULL；左独行的右列为 NULL。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM l RIGHT JOIN r ON l.id = r.id WHERE l.id IS NULL"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM l FULL JOIN r ON l.id = r.id WHERE l.id IS NULL"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM l FULL JOIN r ON l.id = r.id WHERE r.id IS NULL"), 1u);
+    // 等值 RIGHT/FULL 应升级为 Hash Join（不再回退 NestedLoop）。
+    auto er = db->execute("EXPLAIN SELECT * FROM l RIGHT JOIN r ON l.id = r.id", sess);
+    ASSERT_TRUE(er.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *er.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Hash Join"), std::string::npos) << plan;
+}
+
+// =====================================================================
 // UNION / UNION ALL
 // =====================================================================
 
