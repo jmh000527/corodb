@@ -102,7 +102,8 @@ namespace corodb {
 
         /** @brief 递归执行并代换 WHERE 中的非相关 IN (SELECT ...) 子查询为字面量 IN 列表。 */
         void resolve_subqueries(Statement& stmt, const std::shared_ptr<Session>& session, int depth);
-        void resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth);
+        void resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth,
+                                        bool under_not);
 
         /** @brief 构建 SHOW STATUS 的状态指标行生成器。 */
         [[nodiscard]] std::generator<Record> build_status_rows();

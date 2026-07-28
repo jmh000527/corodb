@@ -190,6 +190,78 @@ namespace corodb {
             }
         }
 
+        // 收集 AND 树的叶指针；遇到非 And 内部节点则整体视为叶。
+        bool flatten_and_leaves(BoolExpr& b, std::vector<BoolExpr*>& leaves) {
+            if (b.kind == BoolExpr::Kind::And) {
+                if (!b.left || !b.right)
+                    return false;
+                return flatten_and_leaves(*b.left, leaves) && flatten_and_leaves(*b.right, leaves);
+            }
+            leaves.push_back(&b);
+            return true;
+        }
+
+        // 去相关化（OPT-1）：尝试把相关 EXISTS 改写为非相关 IN：
+        //   EXISTS (SELECT ... FROM S WHERE S.a = outer.b AND P[非相关])
+        //     → outer.b IN (SELECT S.a FROM S WHERE P)
+        // 条件：子查询无 DISTINCT/GROUP/HAVING/ORDER/LIMIT/UNION；WHERE 为纯 AND 合取；
+        // 恰好一个叶是「本地列 = 外层列」等值且其余叶均非相关。
+        // 注：仅限非 NOT 上下文（NOT EXISTS 与 NOT IN 在结果含 NULL 时语义不同）。
+        std::optional<InExpr> try_decorrelate_exists(const SelectStmt& sub) {
+            if (sub.distinct || !sub.group_by.empty() || sub.having.has_value() || !sub.order_by.empty() ||
+                sub.limit.has_value() || sub.offset.has_value() || !sub.unions.empty())
+                return std::nullopt;
+            if (!sub.where.has_value())
+                return std::nullopt;
+            auto local = subquery_local_names(sub);
+            SelectStmt rewritten{ sub }; // 拷贝（where 深拷贝）
+            std::vector<BoolExpr*> leaves;
+            if (!flatten_and_leaves(*rewritten.where, leaves))
+                return std::nullopt;
+            int corr_idx = -1;
+            ColumnRef local_col, outer_col;
+            for (int i = 0; i < static_cast<int>(leaves.size()); ++i) {
+                bool refs_outer = false;
+                detect_outer_refs_bool(*leaves[i], local, refs_outer);
+                if (!refs_outer)
+                    continue;
+                if (corr_idx >= 0)
+                    return std::nullopt; // 多个相关叶：不改写
+                if (leaves[i]->kind != BoolExpr::Kind::Comparison || !leaves[i]->cmp.has_value() ||
+                    leaves[i]->cmp->op != CompareOp::Eq)
+                    return std::nullopt;
+                const auto* l = std::get_if<ColumnRef>(&leaves[i]->cmp->lhs);
+                const auto* r = std::get_if<ColumnRef>(&leaves[i]->cmp->rhs);
+                if (!l || !r)
+                    return std::nullopt;
+                const bool l_outer = !l->table.empty() && local.count(l->table) == 0;
+                const bool r_outer = !r->table.empty() && local.count(r->table) == 0;
+                if (l_outer == r_outer)
+                    return std::nullopt; // 需恰好一侧本地、一侧外层
+                local_col = l_outer ? *r : *l;
+                outer_col = l_outer ? *l : *r;
+                corr_idx = i;
+            }
+            if (corr_idx < 0)
+                return std::nullopt;
+            // 相关叶替换为恒真（1=1），保持 AND 结构不变。
+            Comparison truec;
+            truec.op = CompareOp::Eq;
+            truec.lhs = Literal::from_int(1);
+            truec.rhs = Literal::from_int(1);
+            *leaves[corr_idx] = BoolExpr::make_comparison(std::move(truec));
+            // 投影改为单列本地列。
+            rewritten.projections.clear();
+            SelectStmt::SelectItem item;
+            item.value = Expression{ local_col };
+            rewritten.projections.push_back(std::move(item));
+            InExpr in;
+            in.expr = Expression{ outer_col };
+            in.negated = false;
+            in.subquery = std::make_shared<SelectStmt>(std::move(rewritten));
+            return in;
+        }
+
     } // namespace
 
     /**
@@ -691,16 +763,26 @@ namespace corodb {
      * 子查询先于外层规划执行（同会话/同快照），结果代换为字面量 IN 列表——外层因此
      * 可自然命中 IN→IndexScan 优化；空结果遵循 SQL 语义（IN→FALSE，NOT IN→TRUE，含 NULL 三值）。
      */
-    void QueryProcessor::resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth) {
+    void QueryProcessor::resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth,
+                                                    bool under_not) {
         if (depth > 8)
             throw std::runtime_error("[Process] Subquery nesting too deep");
+        // NOT 节点翻转上下文（双重否定还原）；去相关化仅在非 NOT 上下文安全。
+        const bool child_not = (e.kind == BoolExpr::Kind::Not) ? !under_not : under_not;
         if (e.left)
-            resolve_subqueries_in_bool(*e.left, session, depth);
+            resolve_subqueries_in_bool(*e.left, session, depth, child_not);
         if (e.right)
-            resolve_subqueries_in_bool(*e.right, session, depth);
+            resolve_subqueries_in_bool(*e.right, session, depth, child_not);
         if (!e.in_expr.has_value() || !e.in_expr->subquery)
             return;
-        // 相关子查询：保留到执行期逐外层行求值（nested apply），不做规划前代换。
+        // 去相关化（OPT-1）：非 NOT 上下文的相关 EXISTS 且模式匹配 → 改写为非相关 IN
+        //（预代换一次执行，可命中索引；避免 O(N×M) 逐外层行 apply）。
+        if (e.in_expr->exists_only && !under_not && subquery_is_correlated(*e.in_expr->subquery)) {
+            if (auto rewritten = try_decorrelate_exists(*e.in_expr->subquery)) {
+                e = BoolExpr::make_in(std::move(*rewritten));
+            }
+        }
+        // 相关子查询（未能去相关化）：保留到执行期逐外层行求值（nested apply），不做规划前代换。
         if (subquery_is_correlated(*e.in_expr->subquery))
             return;
         // 先递归解析子查询自身 WHERE 中的嵌套子查询。
@@ -760,7 +842,7 @@ namespace corodb {
         else if (auto* d = std::get_if<DeleteStmt>(&stmt))
             where = &d->where;
         if (where && where->has_value())
-            resolve_subqueries_in_bool(**where, session, depth);
+            resolve_subqueries_in_bool(**where, session, depth, false);
     }
 
 } // namespace corodb

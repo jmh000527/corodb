@@ -1144,6 +1144,49 @@ TEST_F(TxnTest, ExistsSubquery) {
 }
 
 // =====================================================================
+// 优化器：相关 EXISTS 去相关化（OPT-1）
+// =====================================================================
+
+TEST_F(TxnTest, DecorrelatedExistsHitsIndex) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT)");
+    exec_ok("CREATE INDEX idx_dept_id ON dept (id)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'hr')");
+    exec_ok("INSERT INTO dept VALUES (3, 'empty')");
+    exec_ok("INSERT INTO emp VALUES (1, 1)");
+    exec_ok("INSERT INTO emp VALUES (2, 2)");
+    // 语义不变。
+    EXPECT_EQ(count_rows(*db, sess,
+                         "SELECT * FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.dept_id = dept.id)"),
+              2u);
+    // 去相关化 → 非相关 IN 预代换 → dept.id 有索引时命中 IN→IndexScan
+    //（若仍为逐行 apply，计划只会是 Filter + Seq Scan）。
+    auto r = db->execute("EXPLAIN SELECT * FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.dept_id = dept.id)",
+                         sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+}
+
+TEST_F(TxnTest, NotExistsNotDecorrelatedNullSemantics) {
+    // NOT EXISTS 不可改写为 NOT IN：子查询列含 NULL 时二者语义不同。
+    exec_ok("CREATE TABLE a (id INT)");
+    exec_ok("CREATE TABLE b (id INT, x INT)");
+    exec_ok("INSERT INTO a VALUES (1)");
+    exec_ok("INSERT INTO b VALUES (1, NULL)"); // b.x 为 NULL
+    // EXISTS(b.x = a.id)：NULL 永不等 → FALSE → NOT EXISTS → TRUE → 1 行。
+    // 若被误改写为 a.id NOT IN (NULL) → Unknown → 0 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM a WHERE NOT EXISTS (SELECT * FROM b WHERE b.x = a.id)"), 1u);
+    // 非 NOT 上下文的 EXISTS 同场景：FALSE → 0 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM a WHERE EXISTS (SELECT * FROM b WHERE b.x = a.id)"), 0u);
+}
+
+// =====================================================================
 // SAVEPOINT / ROLLBACK TO / RELEASE
 // =====================================================================
 
