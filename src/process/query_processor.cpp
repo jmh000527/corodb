@@ -334,6 +334,21 @@ namespace corodb {
      * @return 物理计划根节点的 unique_ptr。
      */
     std::unique_ptr<PlanNode> QueryProcessor::build_physical_plan(const Statement& stmt) {
+        // UNION：各臂独立规划后拼为 UnionPlan（去重语义由执行器实现）。
+        if (const auto* sel = std::get_if<SelectStmt>(&stmt); sel && !sel->unions.empty()) {
+            std::vector<std::unique_ptr<PlanNode>> arms;
+            arms.reserve(sel->unions.size() + 1);
+            SelectStmt head{ *sel };
+            head.unions.clear();
+            const bool all = sel->unions[0].all;
+            arms.push_back(build_physical_plan(Statement{ std::move(head) }));
+            for (const auto& u: sel->unions) {
+                SelectStmt arm_stmt{ *u.select };
+                arm_stmt.unions.clear(); // 解析期已放平；防御性清空
+                arms.push_back(build_physical_plan(Statement{ std::move(arm_stmt) }));
+            }
+            return std::make_unique<UnionPlan>(std::move(arms), all);
+        }
         opt::LogicalPlanner lplanner{ catalog_ };
         auto lp = lplanner.plan(stmt);
         opt::RuleSet rules = opt::make_default_rules();
@@ -491,6 +506,15 @@ namespace corodb {
                     std::holds_alternative<SelectStmt>(inner) || std::holds_alternative<InsertStmt>(inner) ||
                     std::holds_alternative<UpdateStmt>(inner) || std::holds_alternative<DeleteStmt>(inner);
             if (dml_or_select) {
+                // UNION：各臂独立规划，直接展示物理 UnionPlan（无单一逻辑树文本）。
+                if (const auto* usel = std::get_if<SelectStmt>(&inner); usel && !usel->unions.empty()) {
+                    std::shared_ptr<PlanNode> shared_plan = build_physical_plan(inner);
+                    ProcessedQuery q;
+                    q.rows = ExplainPrinter::render(shared_plan.get());
+                    q.plan = shared_plan;
+                    q.is_select = true;
+                    return q;
+                }
                 opt::LogicalPlanner lplanner{ catalog_ };
                 auto lp = lplanner.plan(inner);
                 opt::RuleSet rules = opt::make_default_rules();

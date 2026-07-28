@@ -474,6 +474,13 @@ namespace corodb {
         std::vector<Join> joins;               ///< JOIN子句列表
         std::optional<BoolExpr> where;         ///< WHERE条件
 
+        /** @brief UNION 臂：与主查询拼接的后续 SELECT（all=true 为 UNION ALL）。 */
+        struct UnionArm {
+            bool all{ false };                 ///< 是否 UNION ALL（保留重复）
+            std::shared_ptr<SelectStmt> select; ///< 臂查询
+        };
+        std::vector<UnionArm> unions; ///< UNION 臂列表（解析期放平；各臂 all 标志一致）
+
         /** @brief ORDER BY 子句中的一个排序项。 */
         struct OrderByItem {
             std::variant<Expression, AggregateExpr> key; ///< 排序键

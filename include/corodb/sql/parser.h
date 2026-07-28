@@ -53,6 +53,9 @@ namespace corodb {
         /// 解析 SELECT 语句。
         [[nodiscard]] Statement parse_select();
 
+        /// 解析单个 SELECT 主体（不含 UNION 拼接；供 parse_select 收集 UNION 臂）。
+        [[nodiscard]] Statement parse_select_core();
+
         /// 解析 EXPLAIN 语句。
         [[nodiscard]] Statement parse_explain();
 

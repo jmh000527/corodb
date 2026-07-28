@@ -19,7 +19,7 @@ namespace corodb {
          */
         const std::unordered_set<std::string> kSelectReservedKeywords = { "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET",
                                                                           "JOIN",  "LEFT",  "RIGHT", "FULL",  "OUTER",
-                                                                          "ON",    "INNER", "HAVING" };
+                                                                          "ON",    "INNER", "HAVING", "UNION" };
 
         /**
          * @brief SQL保留关键字集合（用于投影项上下文）
@@ -130,6 +130,25 @@ namespace corodb {
      * @return 解析后的SELECT语句对象
      */
     Statement Parser::parse_select() {
+        Statement first = parse_select_core();
+        auto& stmt = std::get<SelectStmt>(first);
+        // UNION [ALL] 拼接：顶层循环收集各臂（臂用 core 解析，不吞后续 UNION，保持放平）。
+        while (match_keyword("UNION")) {
+            SelectStmt::UnionArm arm;
+            arm.all = match_keyword("ALL");
+            Statement next = parse_select_core();
+            arm.select = std::make_shared<SelectStmt>(std::move(std::get<SelectStmt>(next)));
+            stmt.unions.push_back(std::move(arm));
+        }
+        // v1 约束：各臂 UNION/UNION ALL 类型须一致（混合的左结合语义暂不支持）。
+        for (std::size_t i = 1; i < stmt.unions.size(); ++i) {
+            if (stmt.unions[i].all != stmt.unions[0].all)
+                throw std::runtime_error("[Parser] Mixed UNION and UNION ALL is not supported");
+        }
+        return first;
+    }
+
+    Statement Parser::parse_select_core() {
         expect_keyword("SELECT"); // 期望SELECT关键字
 
         // 检查 DISTINCT 关键字

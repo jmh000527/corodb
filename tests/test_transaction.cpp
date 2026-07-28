@@ -1144,6 +1144,30 @@ TEST_F(TxnTest, ExistsSubquery) {
 }
 
 // =====================================================================
+// UNION / UNION ALL
+// =====================================================================
+
+TEST_F(TxnTest, UnionAndUnionAll) {
+    exec_ok("CREATE TABLE a (id INT)");
+    exec_ok("CREATE TABLE b (id INT)");
+    exec_ok("INSERT INTO a VALUES (1)");
+    exec_ok("INSERT INTO a VALUES (2)");
+    exec_ok("INSERT INTO b VALUES (2)");
+    exec_ok("INSERT INTO b VALUES (3)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT id FROM a UNION SELECT id FROM b"), 3u);     // 1,2,3 去重
+    EXPECT_EQ(count_rows(*db, sess, "SELECT id FROM a UNION ALL SELECT id FROM b"), 4u); // 保留重复
+    // 三臂。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM a"), 3u);
+    // 臂内 WHERE。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT id FROM a WHERE id = 1 UNION SELECT id FROM b WHERE id = 3"), 2u);
+    // 列数不一致：执行报错（drain 时抛出）。
+    EXPECT_THROW((void) count_rows(*db, sess, "SELECT id FROM a UNION SELECT id, id FROM b"), std::runtime_error);
+    // 混合 UNION/UNION ALL：解析报错。
+    EXPECT_THROW((void) db->execute("SELECT id FROM a UNION SELECT id FROM b UNION ALL SELECT id FROM a", sess),
+                 std::runtime_error);
+}
+
+// =====================================================================
 // 相关子查询（引用外层行列，执行期逐行 apply）
 // =====================================================================
 

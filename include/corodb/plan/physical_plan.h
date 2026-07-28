@@ -171,6 +171,16 @@ namespace corodb {
         BoolExpr predicate;              ///< 过滤条件
     };
 
+    /** @brief UNION 计划节点：顺序拼接各臂输出；all=false 时全局去重。 */
+    struct UnionPlan : PlanNode {
+        /** @brief 构造 UNION 计划节点。 */
+        UnionPlan(std::vector<std::unique_ptr<PlanNode>> cs, bool all_flag) : children(std::move(cs)), all(all_flag) {
+        }
+
+        std::vector<std::unique_ptr<PlanNode>> children; ///< 各臂子计划（含首臂）
+        bool all{ false };                               ///< UNION ALL（保留重复）
+    };
+
     /** @brief 投影计划节点，可选支持 DISTINCT 去重。 */
     struct ProjectPlan : PlanNode {
         /** @brief 构造投影计划节点。 */

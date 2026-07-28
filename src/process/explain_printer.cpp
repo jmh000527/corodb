@@ -146,6 +146,12 @@ namespace corodb {
                 oss << in << "Seq Scan on " << seq->table->name() << "\n";
                 return;
             }
+            if (const auto* un = dynamic_cast<const UnionPlan*>(plan)) {
+                oss << in << (un->all ? "Union All" : "Union") << "\n";
+                for (const auto& c: un->children)
+                    emit_plan(c.get(), oss, depth + 1);
+                return;
+            }
             if (const auto* idx = dynamic_cast<const IndexScanPlan*>(plan)) {
                 oss << in << "Index Scan on " << idx->table->name() << "\n";
                 if (idx->is_composite) {

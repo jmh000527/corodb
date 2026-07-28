@@ -527,6 +527,33 @@ namespace corodb {
             co_return;
         }
 
+        // 处理 UNION 计划节点：顺序拼接各臂；非 ALL 时全局去重（按行值向量）。
+        if (const auto* un = dynamic_cast<const UnionPlan*>(plan)) {
+            std::set<std::vector<Value>, ValueVectorCompare> seen;
+            std::vector<Binding> out_bindings;
+            bool have_bindings = false;
+            std::size_t ncols = 0;
+            for (const auto& child: un->children) {
+                auto child_gen = execute_plan(ctx, child.get());
+                for (auto&& rec: child_gen) {
+                    if (!have_bindings) {
+                        out_bindings = rec.bindings; // 输出列名取首个产出臂（PG 语义：首臂）
+                        ncols = rec.values.size();
+                        have_bindings = true;
+                    }
+                    if (rec.values.size() != ncols)
+                        throw std::runtime_error("ERROR: UNION arms must return the same number of columns");
+                    if (!un->all && !seen.insert(rec.values).second)
+                        continue;
+                    Record out;
+                    out.values = std::move(rec.values);
+                    out.bindings = out_bindings;
+                    co_yield out;
+                }
+            }
+            co_return;
+        }
+
         // 处理过滤计划节点
         if (const auto* filter = dynamic_cast<const FilterPlan*>(plan)) {
             auto child_gen = execute_plan(ctx, filter->child.get());
