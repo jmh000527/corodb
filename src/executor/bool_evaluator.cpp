@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 
+#include "corodb/executor/execution_context.h"
 #include "corodb/executor/expression_evaluator.h"
 
 namespace corodb {
@@ -141,7 +142,7 @@ namespace corodb {
      * @param record 当前行上下文。
      * @return True / False / Unknown 三值结果。
      */
-    SqlBool BoolEvaluator::eval(const BoolExpr& expr, const Record& record) {
+    SqlBool BoolEvaluator::eval(const BoolExpr& expr, const Record& record, SubqueryRunner* subq) {
         auto and3 = [](SqlBool a, SqlBool b) -> SqlBool {
             if (a == SqlBool::False || b == SqlBool::False)
                 return SqlBool::False;
@@ -172,21 +173,48 @@ namespace corodb {
             case BoolExpr::Kind::And:
                 if (!expr.left || !expr.right)
                     throw std::runtime_error("[Executor] Malformed AND expression");
-                return and3(eval(*expr.left, record), eval(*expr.right, record));
+                return and3(eval(*expr.left, record, subq), eval(*expr.right, record, subq));
             case BoolExpr::Kind::Or:
                 if (!expr.left || !expr.right)
                     throw std::runtime_error("[Executor] Malformed OR expression");
-                return or3(eval(*expr.left, record), eval(*expr.right, record));
+                return or3(eval(*expr.left, record, subq), eval(*expr.right, record, subq));
             case BoolExpr::Kind::Not:
                 if (!expr.left)
                     throw std::runtime_error("[Executor] Malformed NOT expression");
-                return not3(eval(*expr.left, record));
+                return not3(eval(*expr.left, record, subq));
             case BoolExpr::Kind::In: {
                 if (!expr.in_expr.has_value())
                     throw std::runtime_error("[Executor] Missing IN expression");
                 const auto& in = *expr.in_expr;
-                if (in.subquery)
-                    throw std::runtime_error("[Executor] Unresolved IN subquery (must be resolved before execution)");
+                if (in.subquery) {
+                    if (!subq)
+                        throw std::runtime_error(
+                                "[Executor] Unresolved IN subquery (must be resolved before execution)");
+                    // 相关子查询：按当前外层行代换引用后递归执行（nested apply）。
+                    std::vector<Value> vals = subq->run_subquery(*in.subquery, record, in.exists_only);
+                    if (in.exists_only)
+                        return vals.empty() ? SqlBool::False : SqlBool::True; // NOT EXISTS 由外层 Not 处理
+                    Value lhs_v = ExpressionEvaluator::eval(record, in.expr);
+                    if (std::holds_alternative<NullValue>(lhs_v))
+                        return SqlBool::Unknown;
+                    bool found_v = false;
+                    bool null_v = false;
+                    for (const auto& v: vals) {
+                        if (std::holds_alternative<NullValue>(v)) {
+                            null_v = true;
+                            continue;
+                        }
+                        if (lhs_v == v) {
+                            found_v = true;
+                            break;
+                        }
+                    }
+                    if (found_v)
+                        return in.negated ? SqlBool::False : SqlBool::True;
+                    if (null_v)
+                        return SqlBool::Unknown;
+                    return in.negated ? SqlBool::True : SqlBool::False;
+                }
                 Value lhs = ExpressionEvaluator::eval(record, in.expr);
                 if (std::holds_alternative<NullValue>(lhs))
                     return SqlBool::Unknown;

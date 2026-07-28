@@ -908,8 +908,8 @@ cd build && ctest -j8
 
 | 特性 | 状态 |
 |------|------|
-| 子查询 | 支持非相关 `IN / NOT IN (SELECT ...)` 与 `EXISTS / NOT EXISTS (SELECT ...)`（WHERE 中，可嵌套；代换后可命中索引）；相关子查询不支持 |
-| `IS NULL / IS NOT NULL` | 不支持 |
+| 子查询 | 支持 `IN / NOT IN (SELECT ...)` 与 `EXISTS / NOT EXISTS (SELECT ...)`（WHERE 中，可嵌套）；非相关先代换可命中索引，相关子查询逐外层行求值（引用外层列须带表名/别名限定） |
+| `IS NULL / IS NOT NULL` | 支持（含 `NULL` 字面量写入/更新，三值逻辑） |
 | `RIGHT JOIN` / `FULL JOIN` | 仅 INNER 和 LEFT |
 | `SAVEPOINT` / 嵌套事务 | 不支持 |
 | TLS 加密传输 | 不支持 |
@@ -1031,7 +1031,7 @@ cd build && ctest -j8
 ### 计划中
 
 - 基于代价的优化器（CBO）
-- 相关子查询（非相关 `IN (SELECT ...)` / `EXISTS` 已支持）
+- 相关子查询去相关化（当前为逐行 apply，正确优先；`IN`/`EXISTS` 相关与非相关均已支持）
 - `SAVEPOINT` 嵌套事务
 - TLS 传输加密
 - WAL 压缩

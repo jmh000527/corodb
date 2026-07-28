@@ -1144,6 +1144,82 @@ TEST_F(TxnTest, ExistsSubquery) {
 }
 
 // =====================================================================
+// 相关子查询（引用外层行列，执行期逐行 apply）
+// =====================================================================
+
+TEST_F(TxnTest, CorrelatedExistsSubquery) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'hr')");
+    exec_ok("INSERT INTO dept VALUES (3, 'empty')");
+    exec_ok("INSERT INTO emp VALUES (1, 1)");
+    exec_ok("INSERT INTO emp VALUES (2, 1)");
+    exec_ok("INSERT INTO emp VALUES (3, 2)");
+    // 有员工的部门：1,2；无员工：3。
+    EXPECT_EQ(count_rows(*db, sess,
+                         "SELECT * FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.dept_id = dept.id)"),
+              2u);
+    EXPECT_EQ(count_rows(*db, sess,
+                         "SELECT * FROM dept WHERE NOT EXISTS (SELECT * FROM emp WHERE emp.dept_id = dept.id)"),
+              1u);
+    // 别名形式。
+    EXPECT_EQ(count_rows(*db, sess,
+                         "SELECT * FROM dept d WHERE EXISTS (SELECT * FROM emp e WHERE e.dept_id = d.id)"),
+              2u);
+}
+
+TEST_F(TxnTest, CorrelatedInSubquery) {
+    exec_ok("CREATE TABLE t1 (id INT, g INT)");
+    exec_ok("CREATE TABLE t2 (id INT, g INT)");
+    exec_ok("INSERT INTO t1 VALUES (1, 10)");
+    exec_ok("INSERT INTO t1 VALUES (2, 20)");
+    exec_ok("INSERT INTO t2 VALUES (1, 10)");
+    exec_ok("INSERT INTO t2 VALUES (2, 99)");
+    // t1 行中 id 在「t2 中同 g 组」的 id 集合里：仅 (1,10)。
+    EXPECT_EQ(count_rows(*db, sess,
+                         "SELECT * FROM t1 WHERE id IN (SELECT t2.id FROM t2 WHERE t2.g = t1.g)"),
+              1u);
+}
+
+TEST_F(TxnTest, CorrelatedSubqueryInDml) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'empty')");
+    exec_ok("INSERT INTO emp VALUES (1, 1)");
+    // 删掉无员工的部门。
+    exec_ok("DELETE FROM dept WHERE NOT EXISTS (SELECT * FROM emp WHERE emp.dept_id = dept.id)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM dept"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM dept WHERE name = 'eng'"), 1u);
+}
+
+// =====================================================================
+// NULL 字面量与 IS NULL / IS NOT NULL
+// =====================================================================
+
+TEST_F(TxnTest, NullLiteralAndIsNull) {
+    exec_ok("CREATE TABLE t (id INT, v INT, name TEXT NOT NULL)");
+    exec_ok("INSERT INTO t VALUES (1, NULL, 'a')");
+    exec_ok("INSERT INTO t VALUES (2, 20, 'b')");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v IS NULL"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v IS NOT NULL"), 1u);
+    // = NULL 三值语义：Unknown → 不匹配任何行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v = NULL"), 0u);
+    // NOT NULL 列拒绝 NULL。
+    EXPECT_THROW((void) db->execute("INSERT INTO t VALUES (3, 3, NULL)", sess), std::runtime_error);
+    // UPDATE 置 NULL。
+    exec_ok("UPDATE t SET v = NULL WHERE id = 2");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v IS NULL"), 2u);
+    // 重启后 NULL 持久化正确（编码/解码/WAL 回放）。
+    db.reset();
+    storage_internal::WalManager::instance().clear_all();
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE v IS NULL"), 2u);
+}
+
+// =====================================================================
 // CBO：行数统计驱动的 JOIN 重排
 // =====================================================================
 

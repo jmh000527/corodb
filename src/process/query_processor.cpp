@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
+#include <unordered_set>
 #include <utility>
 
 #include "corodb/common/config.h"
@@ -47,7 +49,188 @@ namespace corodb {
             return std::holds_alternative<CreateStmt>(stmt) || std::holds_alternative<CreateIndexStmt>(stmt);
         }
 
+        // ---- 相关子查询支持：作用域/代换/检测 ----
+
+        // 子查询自身 FROM 集（表名与别名）。
+        std::unordered_set<std::string> subquery_local_names(const SelectStmt& s) {
+            std::unordered_set<std::string> names;
+            names.insert(s.from_table);
+            if (s.from_alias.has_value())
+                names.insert(*s.from_alias);
+            for (const auto& j: s.joins) {
+                names.insert(j.table);
+                if (j.alias.has_value())
+                    names.insert(*j.alias);
+            }
+            return names;
+        }
+
+        // 外层行中查找 (表/别名, 列) 绑定的值。
+        std::optional<Value> outer_lookup(const Record& outer, const std::string& table, const std::string& col) {
+            for (std::size_t i = 0; i < outer.bindings.size(); ++i) {
+                if (outer.bindings[i].table == table && outer.bindings[i].column == col)
+                    return outer.values[i];
+            }
+            return std::nullopt;
+        }
+
+        void substitute_outer_refs_bool(BoolExpr& b, const std::unordered_set<std::string>& local,
+                                        const Record& outer);
+
+        // 表达式代换：表限定不属于 local 的列引用 → 外层行字面量；共享节点先克隆再改。
+        void substitute_outer_refs_expr(Expression& e, const std::unordered_set<std::string>& local,
+                                        const Record& outer) {
+            if (auto* ref = std::get_if<ColumnRef>(&e)) {
+                if (!ref->table.empty() && local.count(ref->table) == 0) {
+                    if (auto v = outer_lookup(outer, ref->table, ref->name))
+                        e = Literal{ *v };
+                    // 找不到则保留，规划期报未知列（错误信息清晰）。
+                }
+                return;
+            }
+            if (auto* bin = std::get_if<std::shared_ptr<BinaryExpr>>(&e)) {
+                if (!*bin)
+                    return;
+                auto clone = std::make_shared<BinaryExpr>(**bin);
+                substitute_outer_refs_expr(clone->lhs, local, outer);
+                substitute_outer_refs_expr(clone->rhs, local, outer);
+                e = std::move(clone);
+                return;
+            }
+            if (auto* fn = std::get_if<std::shared_ptr<FunctionExpr>>(&e)) {
+                if (!*fn)
+                    return;
+                auto clone = std::make_shared<FunctionExpr>(**fn);
+                for (auto& a: clone->args)
+                    substitute_outer_refs_expr(a, local, outer);
+                e = std::move(clone);
+                return;
+            }
+        }
+
+        // 布尔树代换；嵌套子查询克隆后在“local ∪ 其自身 FROM 集”作用域下继续代换最外层引用。
+        void substitute_outer_refs_bool(BoolExpr& b, const std::unordered_set<std::string>& local,
+                                        const Record& outer) {
+            if (b.left)
+                substitute_outer_refs_bool(*b.left, local, outer);
+            if (b.right)
+                substitute_outer_refs_bool(*b.right, local, outer);
+            if (b.cmp.has_value()) {
+                substitute_outer_refs_expr(b.cmp->lhs, local, outer);
+                substitute_outer_refs_expr(b.cmp->rhs, local, outer);
+            }
+            if (b.in_expr.has_value()) {
+                substitute_outer_refs_expr(b.in_expr->expr, local, outer);
+                for (auto& v: b.in_expr->values)
+                    substitute_outer_refs_expr(v, local, outer);
+                if (b.in_expr->subquery) {
+                    auto clone = std::make_shared<SelectStmt>(*b.in_expr->subquery);
+                    auto inner_local = local;
+                    for (const auto& n: subquery_local_names(*clone))
+                        inner_local.insert(n);
+                    if (clone->where.has_value())
+                        substitute_outer_refs_bool(*clone->where, inner_local, outer);
+                    b.in_expr->subquery = std::move(clone);
+                }
+            }
+            if (b.between_expr.has_value()) {
+                substitute_outer_refs_expr(b.between_expr->expr, local, outer);
+                substitute_outer_refs_expr(b.between_expr->low, local, outer);
+                substitute_outer_refs_expr(b.between_expr->high, local, outer);
+            }
+        }
+
+        void detect_outer_refs_bool(const BoolExpr& b, const std::unordered_set<std::string>& local, bool& found);
+
+        // 相关性检测：表限定且不属于（自身 ∪ 嵌套自身）FROM 集的列引用。
+        void detect_outer_refs_expr(const Expression& e, const std::unordered_set<std::string>& local, bool& found) {
+            if (const auto* ref = std::get_if<ColumnRef>(&e)) {
+                if (!ref->table.empty() && local.count(ref->table) == 0)
+                    found = true;
+                return;
+            }
+            if (const auto* bin = std::get_if<std::shared_ptr<BinaryExpr>>(&e)) {
+                if (*bin) {
+                    detect_outer_refs_expr((*bin)->lhs, local, found);
+                    detect_outer_refs_expr((*bin)->rhs, local, found);
+                }
+                return;
+            }
+            if (const auto* fn = std::get_if<std::shared_ptr<FunctionExpr>>(&e)) {
+                if (*fn)
+                    for (const auto& a: (*fn)->args)
+                        detect_outer_refs_expr(a, local, found);
+            }
+        }
+
+        void detect_outer_refs_bool(const BoolExpr& b, const std::unordered_set<std::string>& local, bool& found) {
+            if (b.left)
+                detect_outer_refs_bool(*b.left, local, found);
+            if (b.right)
+                detect_outer_refs_bool(*b.right, local, found);
+            if (b.cmp.has_value()) {
+                detect_outer_refs_expr(b.cmp->lhs, local, found);
+                detect_outer_refs_expr(b.cmp->rhs, local, found);
+            }
+            if (b.in_expr.has_value()) {
+                detect_outer_refs_expr(b.in_expr->expr, local, found);
+                for (const auto& v: b.in_expr->values)
+                    detect_outer_refs_expr(v, local, found);
+                if (b.in_expr->subquery && b.in_expr->subquery->where.has_value()) {
+                    auto inner_local = local;
+                    for (const auto& n: subquery_local_names(*b.in_expr->subquery))
+                        inner_local.insert(n);
+                    detect_outer_refs_bool(*b.in_expr->subquery->where, inner_local, found);
+                }
+            }
+            if (b.between_expr.has_value()) {
+                detect_outer_refs_expr(b.between_expr->expr, local, found);
+                detect_outer_refs_expr(b.between_expr->low, local, found);
+                detect_outer_refs_expr(b.between_expr->high, local, found);
+            }
+        }
+
     } // namespace
+
+    /**
+     * @brief 相关子查询运行器：按外层行代换外层引用为字面量后递归规划/执行（nested apply）。
+     *
+     * 逐外层行执行（O(N×M)），正确性优先；引用外层列须带表名/别名限定。
+     */
+    class QueryProcessor::CorrelatedRunner final : public SubqueryRunner {
+    public:
+        CorrelatedRunner(QueryProcessor& qp, std::shared_ptr<Session> session)
+            : qp_(qp), session_(std::move(session)) {
+        }
+
+        std::vector<Value> run_subquery(const SelectStmt& sub, const Record& outer, bool exists_only) override {
+            SelectStmt resolved{ sub };
+            auto local = subquery_local_names(resolved);
+            if (resolved.where.has_value())
+                substitute_outer_refs_bool(*resolved.where, local, outer);
+            Statement stmt{ std::move(resolved) };
+            auto plan = qp_.build_physical_plan(stmt);
+            ExecutionContext ctx{ session_, &qp_.row_locks_, &qp_.catalog_, &qp_.storage_, &qp_.txn_manager_ };
+            ctx.subquery_runner = this; // 支持嵌套相关子查询
+            Executor ex{ ctx };
+            std::vector<Value> out;
+            auto gen = ex.run(plan.get());
+            for (auto&& rec: gen) {
+                if (exists_only) {
+                    out.push_back(Value{ static_cast<int64_t>(1) });
+                    break; // 存在性短路
+                }
+                if (rec.values.size() != 1)
+                    throw std::runtime_error("[Process] IN subquery must return exactly one column");
+                out.push_back(rec.values.front());
+            }
+            return out;
+        }
+
+    private:
+        QueryProcessor& qp_;
+        std::shared_ptr<Session> session_;
+    };
 
     std::generator<Record> QueryProcessor::build_status_rows() {
         std::vector<Binding> bindings;
@@ -321,6 +504,8 @@ namespace corodb {
                     // EXPLAIN ANALYZE：带性能分析执行。
                     txn_ctrl_.prepare_for_statement(inner, *session);
                     ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+                    CorrelatedRunner analyze_runner(*this, session);
+                    ctx.subquery_runner = &analyze_runner; // 相关子查询支持（行内 drain，栈生命周期安全）
                     if (session->statement_timeout_ms > 0) {
                         ctx.deadline = std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds(session->statement_timeout_ms);
@@ -403,6 +588,9 @@ namespace corodb {
             txn_ctrl_.prepare_for_statement(stmt, *session);
 
             ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+            // 相关子查询运行器：执行期逐外层行代换 + 递归执行（随 generator 一同保活）。
+            auto subq_runner = std::make_shared<CorrelatedRunner>(*this, session);
+            ctx.subquery_runner = subq_runner.get();
 
             // Set query deadline from session timeout.
             if (session->statement_timeout_ms > 0) {
@@ -416,12 +604,14 @@ namespace corodb {
                 auto gen = executor->run(shared_plan.get());
                 ProcessedQuery q;
                 q.rows = std::move(gen);
-                // 用 plan 字段一并保活 plan 与 executor。
+                // 用 plan 字段一并保活 plan、executor 与子查询运行器。
                 struct Keeper {
                     std::shared_ptr<PlanNode> plan;
                     std::shared_ptr<Executor> exec;
+                    std::shared_ptr<SubqueryRunner> runner;
                 };
-                q.plan = std::shared_ptr<void>(std::make_shared<Keeper>(Keeper{ shared_plan, executor }));
+                q.plan = std::shared_ptr<void>(
+                        std::make_shared<Keeper>(Keeper{ shared_plan, executor, subq_runner }));
                 q.is_select = true;
                 return q;
             }
@@ -442,6 +632,14 @@ namespace corodb {
             }
             throw;
         }
+    }
+
+    bool QueryProcessor::subquery_is_correlated(const SelectStmt& sub) {
+        if (!sub.where.has_value())
+            return false;
+        bool found = false;
+        detect_outer_refs_bool(*sub.where, subquery_local_names(sub), found);
+        return found;
     }
 
     bool QueryProcessor::bool_has_subquery(const BoolExpr& e) {
@@ -478,12 +676,17 @@ namespace corodb {
             resolve_subqueries_in_bool(*e.right, session, depth);
         if (!e.in_expr.has_value() || !e.in_expr->subquery)
             return;
+        // 相关子查询：保留到执行期逐外层行求值（nested apply），不做规划前代换。
+        if (subquery_is_correlated(*e.in_expr->subquery))
+            return;
         // 先递归解析子查询自身 WHERE 中的嵌套子查询。
         Statement sub{ SelectStmt(*e.in_expr->subquery) };
         resolve_subqueries(sub, session, depth + 1);
         // 执行子查询，收集单列结果为字面量 IN 列表。
         auto plan = build_physical_plan(sub);
         ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+        CorrelatedRunner pre_runner(*this, session);
+        ctx.subquery_runner = &pre_runner; // 支持非相关子查询内部嵌套相关子查询
         if (session->statement_timeout_ms > 0)
             ctx.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(session->statement_timeout_ms);
         Executor ex{ ctx };

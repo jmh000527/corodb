@@ -21,6 +21,21 @@ namespace corodb {
     class RowLockManager;
     class TransactionManager;
     class StorageEngine;
+    struct SelectStmt;
+    struct Record;
+
+    /**
+     * @brief 相关子查询求值器（由 QueryProcessor 注入）。
+     *
+     * 执行期逐外层行求值：先把子查询中引用外层表的列按 outer 行代换为字面量，
+     * 再递归规划/执行（nested apply）。exists_only 时取到首行即短路。
+     */
+    class SubqueryRunner {
+    public:
+        virtual ~SubqueryRunner() = default;
+        /** @return 单列结果值列表；exists_only 时非空即表示存在（至多含 1 个占位值）。 */
+        virtual std::vector<Value> run_subquery(const SelectStmt& sub, const Record& outer, bool exists_only) = 0;
+    };
 
     /**
      * @brief 算子执行所需的全部上下文（显式参数，禁用 TLS）。
@@ -39,6 +54,8 @@ namespace corodb {
         TransactionManager* txn_manager{ nullptr };
         /// 查询截止时间（steady_clock）。默认 = epoch = 无超时。
         std::chrono::steady_clock::time_point deadline{};
+        /// 相关子查询求值器（可为空；为空时遇到未解析子查询报错）。
+        SubqueryRunner* subquery_runner{ nullptr };
     };
 
 } // namespace corodb

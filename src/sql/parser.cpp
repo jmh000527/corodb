@@ -859,6 +859,11 @@ namespace corodb {
         }
         if (peek_is_identifier()) {
             auto ident = peek_upper(); // 查看标识符
+            // NULL 字面量（SQL 保留字，不作列名）
+            if (ident == "NULL") {
+                consume();
+                return Literal::null();
+            }
             // 解析聚合函数
             if (ident == "COUNT" || ident == "SUM" || ident == "AVG" || ident == "MIN" || ident == "MAX") {
                 return parse_aggregate(); // 解析聚合函数
@@ -1025,6 +1030,10 @@ namespace corodb {
      */
     Value Parser::parse_literal() {
         const auto& tok = consume(); // 消费当前token
+        // NULL 字面量
+        if (to_upper(tok.text) == "NULL") {
+            return Value{ NullValue{} };
+        }
         // 解析整数字面量
         if (!tok.text.empty() && std::isdigit(static_cast<unsigned char>(tok.text[0]))) {
             return Value{ static_cast<int64_t>(std::stoll(tok.text)) }; // 返回整数值

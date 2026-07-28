@@ -90,6 +90,12 @@ namespace corodb {
     private:
         std::unique_ptr<PlanNode> build_physical_plan(const Statement& stmt);
 
+        /** @brief 相关子查询运行器（执行期逐外层行代换引用 + 递归规划/执行，nested apply）。 */
+        class CorrelatedRunner;
+
+        /** @brief 子查询是否引用了其 FROM 集之外的表限定列（即相关子查询）。 */
+        [[nodiscard]] static bool subquery_is_correlated(const SelectStmt& sub);
+
         /** @brief 语句 WHERE 中是否含未解析的 IN (SELECT ...) 子查询。 */
         [[nodiscard]] static bool stmt_has_subquery(const Statement& stmt);
         [[nodiscard]] static bool bool_has_subquery(const BoolExpr& e);

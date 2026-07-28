@@ -34,8 +34,8 @@ namespace corodb {
         inline Value eval_expression(const Record& r, const Expression& e) {
             return ExpressionEvaluator::eval(r, e);
         }
-        inline SqlBool evaluate_bool_expr(const BoolExpr& e, const Record& r) {
-            return BoolEvaluator::eval(e, r);
+        inline SqlBool evaluate_bool_expr(const BoolExpr& e, const Record& r, SubqueryRunner* subq = nullptr) {
+            return BoolEvaluator::eval(e, r, subq);
         }
         inline int compare_order(const Value& a, const Value& b) {
             return BoolEvaluator::compare_order(a, b);
@@ -532,7 +532,7 @@ namespace corodb {
             auto child_gen = execute_plan(ctx, filter->child.get());
             for (auto&& rec: child_gen) {
                 // 只返回满足过滤条件的记录
-                if (evaluate_bool_expr(filter->predicate, rec) == SqlBool::True) {
+                if (evaluate_bool_expr(filter->predicate, rec, ctx.subquery_runner) == SqlBool::True) {
                     co_yield rec;
                 }
             }
@@ -1511,7 +1511,7 @@ namespace corodb {
 
                 auto apply_row_update = [&](const Row& base_row) -> std::optional<Row> {
                     Record rec = make_record_from_row(*upd->table, base_row, upd->table->name());
-                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
+                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec, ctx.subquery_runner) != SqlBool::True)
                         return std::nullopt;
                     Row new_row = base_row;
                     for (const auto& a: upd->assignments) {
@@ -1573,7 +1573,7 @@ namespace corodb {
                 auto base = upd->table->scan_visible(std::numeric_limits<uint64_t>::max());
                 for (const auto& row: base) {
                     Record rec = make_record_from_row(*upd->table, row, upd->table->name());
-                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
+                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec, ctx.subquery_runner) != SqlBool::True)
                         continue;
                     Row new_row = row;
                     for (const auto& a: upd->assignments) {
@@ -1589,7 +1589,7 @@ namespace corodb {
                 auto& rows = upd->table->rows_mut();
                 for (auto& row: rows) {
                     Record rec = make_record_from_row(*upd->table, row, upd->table->name());
-                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec) != SqlBool::True)
+                    if (upd->where.has_value() && evaluate_bool_expr(*upd->where, rec, ctx.subquery_runner) != SqlBool::True)
                         continue;
                     std::vector<std::pair<std::size_t, Value>> pending;
                     pending.reserve(upd->assignments.size());
@@ -1622,7 +1622,7 @@ namespace corodb {
                     if (!del->where.has_value())
                         return true;
                     Record rec = make_record_from_row(*del->table, row, del->table->name());
-                    return evaluate_bool_expr(*del->where, rec) == SqlBool::True;
+                    return evaluate_bool_expr(*del->where, rec, ctx.subquery_runner) == SqlBool::True;
                 };
 
                 // 基线可见行：存储型走 scan_visible，纯内存表读 rows_。
@@ -1674,7 +1674,7 @@ namespace corodb {
                 for (const auto& row: base) {
                     if (del->where.has_value()) {
                         Record rec = make_record_from_row(*del->table, row, del->table->name());
-                        if (evaluate_bool_expr(*del->where, rec) != SqlBool::True)
+                        if (evaluate_bool_expr(*del->where, rec, ctx.subquery_runner) != SqlBool::True)
                             continue;
                     }
                     if (!row.values.empty())
@@ -1686,7 +1686,7 @@ namespace corodb {
                 std::erase_if(rows, [&](const Row& row) -> bool {
                     if (del->where.has_value()) {
                         Record rec = make_record_from_row(*del->table, row, del->table->name());
-                        if (evaluate_bool_expr(*del->where, rec) != SqlBool::True)
+                        if (evaluate_bool_expr(*del->where, rec, ctx.subquery_runner) != SqlBool::True)
                             return false;
                     }
                     if (!row.values.empty())
