@@ -94,6 +94,10 @@ namespace corodb {
                                                               const std::vector<Column>& columns,
                                                               uint64_t snapshot_ts) override;
 
+        /** @brief 行数粗估：memtable 条目数 + SSTable 文件字节/经验记录大小（不解码，供优化器用）。 */
+        [[nodiscard]] std::size_t estimate_row_count(const std::string& name,
+                                                     const std::vector<Column>& columns) override;
+
         /** @brief 列出表的所有索引列名。 */
         [[nodiscard]] std::vector<std::string> list_indexes(const std::string& table) const override;
 

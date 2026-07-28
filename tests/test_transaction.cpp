@@ -1128,6 +1128,34 @@ TEST_F(TxnTest, InSelectSubqueryUsesIndexAfterSubstitution) {
 }
 
 // =====================================================================
+// CBO：行数统计驱动的 JOIN 重排
+// =====================================================================
+
+TEST_F(TxnTest, JoinReorderUsesRowCountStats) {
+    exec_ok("CREATE TABLE big (id INT, sid INT)");
+    exec_ok("CREATE TABLE small (id INT, name TEXT)");
+    for (int i = 1; i <= 60; ++i)
+        exec_ok("INSERT INTO big VALUES (" + std::to_string(i) + ", " + std::to_string(i % 2 + 1) + ")");
+    exec_ok("INSERT INTO small VALUES (1, 'a')");
+    exec_ok("INSERT INTO small VALUES (2, 'b')");
+    // 大表写在前；行数统计应将小表移到左侧（计划树先打印小表）。
+    auto r = db->execute("EXPLAIN SELECT * FROM big JOIN small ON big.sid = small.id", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    const auto pos_small = plan.find("on small");
+    const auto pos_big = plan.find("on big");
+    ASSERT_NE(pos_small, std::string::npos) << plan;
+    ASSERT_NE(pos_big, std::string::npos) << plan;
+    EXPECT_LT(pos_small, pos_big) << plan;
+    // 结果正确性不受重排影响。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM big JOIN small ON big.sid = small.id"), 60u);
+}
+
+// =====================================================================
 // T9.5.1: TransactionManager::min_active_read_ts 单测
 // =====================================================================
 

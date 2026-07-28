@@ -599,6 +599,10 @@ namespace corodb {
         return storage_internal::extract_key(row, columns_);
     }
 
+    std::size_t Table::estimated_row_count() const {
+        return storage_ ? storage_->estimate_row_count(name_, columns_) : rows_.size();
+    }
+
     // ---------------------------------------------------------------------------
     // Catalog
     // ---------------------------------------------------------------------------

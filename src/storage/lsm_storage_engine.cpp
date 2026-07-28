@@ -1060,6 +1060,31 @@ namespace corodb {
         return result;
     }
 
+    std::size_t LSMTreeEngine::estimate_row_count(const std::string& name, const std::vector<Column>& columns) {
+        load_state_if_needed(name, columns);
+        auto* state = get_or_create_state(name);
+        std::size_t est = 0;
+        {
+            std::shared_lock lock(state->mutex);
+            est = state->memtable.size(); // 多版本条目数，作行数近似
+        }
+        // SSTable 各层按文件字节 / 经验记录大小粗估（不解码；空表文件仅头+footer，忽略）。
+        int max_level = 0;
+        while (std::filesystem::exists(level_path(name, max_level + 1)))
+            ++max_level;
+        for (int l = 0; l <= max_level; ++l) {
+            std::string p = (l == 0) ? base_path(name) : level_path(name, l);
+            std::error_code ec;
+            if (!std::filesystem::exists(p, ec) || ec)
+                continue;
+            const auto sz = std::filesystem::file_size(p, ec);
+            if (ec || sz <= 2 * Config::kDefaultPageSize)
+                continue;
+            est += static_cast<std::size_t>(sz) / 64;
+        }
+        return est;
+    }
+
     std::generator<Row> LSMTreeEngine::scan_visible_stream(const std::string& name, const std::vector<Column>& columns,
                                                            uint64_t snapshot_ts) {
         load_state_if_needed(name, columns);

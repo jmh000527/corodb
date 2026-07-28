@@ -6,25 +6,30 @@
 #include <algorithm>
 
 #include "corodb/optimizer/logical/join_reorder_rule.h"
+#include "corodb/storage/table.h"
 
 namespace corodb::opt {
 
     namespace detail {
 
-        // 估算子树的相对大小（以节点数量为代理指标）
+        // 估算子树基数：Scan 用存储引擎的行数粗估（真实统计），其余节点做简单传播：
+        // Filter 按经验选择率 1/3，Aggregate 按 1/10，Join 取两侧较大者（保守）。
         std::size_t estimate_subtree_size(const LogicalPlan& p) {
             return std::visit(
                     [&](const auto& n) -> std::size_t {
                         using T = std::decay_t<decltype(n)>;
                         if constexpr (std::is_same_v<T, LogicalScan>) {
-                            return 1;
+                            return n.table ? std::max<std::size_t>(n.table->estimated_row_count(), 1) : 1;
                         } else if constexpr (std::is_same_v<T, LogicalJoin>) {
                             std::size_t l = n.left ? estimate_subtree_size(*n.left) : 0;
                             std::size_t r = n.right ? estimate_subtree_size(*n.right) : 0;
-                            return std::max<std::size_t>(l, r) + 1;
+                            return std::max<std::size_t>(std::max(l, r), 1);
                         } else if constexpr (std::is_same_v<T, LogicalAggregate>) {
                             std::size_t c = n.child ? estimate_subtree_size(*n.child) : 0;
-                            return (c + 1) / 2;
+                            return std::max<std::size_t>(c / 10, 1);
+                        } else if constexpr (std::is_same_v<T, LogicalFilter>) {
+                            std::size_t c = n.child ? estimate_subtree_size(*n.child) : 0;
+                            return std::max<std::size_t>(c / 3, 1);
                         } else if constexpr (requires { n.child; }) {
                             return n.child ? estimate_subtree_size(*n.child) : 0;
                         } else if constexpr (std::is_same_v<T, LogicalDML>) {

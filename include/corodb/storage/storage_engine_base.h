@@ -124,8 +124,17 @@ namespace corodb {
          *
          * 默认实现退化为 load_rows（最新已提交快照）。LSM 会 override。
          */
-        [[nodiscard]] virtual std::vector<Row> scan_visible(const std::string& name, const std::vector<Column>& columns,
+        [[nodiscard]] virtual std::vector<Row> scan_visible(const std::string& name,
+                                                            const std::vector<Column>& columns,
                                                             uint64_t snapshot_ts);
+
+        /**
+         * @brief 粗略估算表当前可见行数（供优化器 JOIN 排序等启发式决策，不要求精确）。
+         *
+         * 默认实现退化为 load_rows 计数；LSM override 为 memtable 条目数 + SSTable 文件字节粗估。
+         */
+        [[nodiscard]] virtual std::size_t estimate_row_count(const std::string& name,
+                                                             const std::vector<Column>& columns);
 
         /**
          * @brief MVCC 流式扫描：惰性 yield snapshot_ts 时刻每个 pk 的可见版本（不全量物化结果集）。

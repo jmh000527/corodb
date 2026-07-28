@@ -39,6 +39,13 @@ namespace corodb {
     }
 
     /**
+     * @brief 粗略估算表当前可见行数（默认退化实现：全量加载计数）。
+     */
+    std::size_t StorageEngine::estimate_row_count(const std::string& name, const std::vector<Column>& columns) {
+        return load_rows(name, columns).size();
+    }
+
+    /**
      * @brief 按主键点查可见行（默认退化为全表扫描，不感知 snapshot_ts）。
      */
     std::optional<Row> StorageEngine::lookup_visible(const std::string& name, const std::vector<Column>& columns,

@@ -430,6 +430,13 @@ TEST(R5JoinReorder, SwapsWhenLeftIsLargerNestedJoin) {
     cat.register_table(std::make_shared<Table>("a", std::vector<Column>{ Column{ "a", "id", TypeKind::Int64, 1, 1 } }));
     cat.register_table(std::make_shared<Table>("b", std::vector<Column>{ Column{ "b", "id", TypeKind::Int64, 1, 2 } }));
     cat.register_table(std::make_shared<Table>("c", std::vector<Column>{ Column{ "c", "id", TypeKind::Int64, 1, 3 } }));
+    // 行数统计驱动：给 a/b 填充行使 (a JOIN b) 基数更大，c 保持小表。
+    for (int i = 0; i < 5; ++i) {
+        Row r;
+        r.values = { Value{ static_cast<int64_t>(i) } };
+        cat.lookup("a")->rows_mut().push_back(r);
+        cat.lookup("b")->rows_mut().push_back(r);
+    }
     // 解析器不一定支持括号嵌套——退而求其次，直接构造 LogicalPlan
     auto a_scan = LogicalPlan::make_scan(cat.lookup("a"));
     auto b_scan = LogicalPlan::make_scan(cat.lookup("b"));
@@ -666,7 +673,14 @@ TEST(SingleRule_ProjectionMerge, MergesAdjacentProjects) {
 
 TEST(SingleRule_JoinReorder, SwapsLargerLeft) {
     auto cat = make_catalog_with_users_orders();
-    // 构造 Join(Join(Scan, Scan), Scan) — 左侧子树 size=2, 右侧 size=1
+    // 行数统计驱动：给 orders 填充行，使左侧 (users JOIN orders) 基数大于右侧 users。
+    for (int i = 0; i < 6; ++i) {
+        Row r;
+        r.values = { Value{ static_cast<int64_t>(i) }, Value{ static_cast<int64_t>(i) },
+                     Value{ static_cast<int64_t>(i) } };
+        cat.lookup("orders")->rows_mut().push_back(r);
+    }
+    // 构造 Join(Join(Scan, Scan), Scan) — 左侧子树基数大, 右侧小
     auto s1 = LogicalPlan::make_scan(cat.lookup("users"));
     auto s2 = LogicalPlan::make_scan(cat.lookup("orders"));
     auto s3 = LogicalPlan::make_scan(cat.lookup("users"));

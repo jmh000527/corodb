@@ -195,6 +195,9 @@ namespace corodb {
         /** @brief 行的存储主键（schema 感知）：≥2 个 PRIMARY KEY 列时为复合编码键，否则为首列。 */
         [[nodiscard]] Value row_key(const Row& row) const;
 
+        /** @brief 估算当前可见行数（优化器启发式用；存储型走引擎粗估，纯内存表取 rows_）。 */
+        [[nodiscard]] std::size_t estimated_row_count() const;
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }
