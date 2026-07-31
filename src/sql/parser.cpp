@@ -7,6 +7,7 @@
 
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace corodb {
@@ -74,6 +75,8 @@ namespace corodb {
             return parse_drop(); // 解析DROP语句
         if (head == "SELECT")
             return parse_select(); // 解析SELECT语句
+        if (head == "WITH")
+            return parse_with_select(); // 解析 WITH ... SELECT（CTE 内联改写）
         if (head == "INSERT")
             return parse_insert(); // 解析INSERT语句
         if (head == "UPDATE")
@@ -155,6 +158,137 @@ namespace corodb {
                 throw std::runtime_error("[Parser] Mixed UNION and UNION ALL is not supported");
         }
         return first;
+    }
+
+    namespace {
+
+        // 将表达式中限定为 from 表名的列引用改限定为 to（CTE 内联后基表被别名遮盖）。
+        void requalify_expr(Expression& e, const std::string& from, const std::string& to) {
+            if (auto* ref = std::get_if<ColumnRef>(&e)) {
+                if (ref->table == from)
+                    ref->table = to;
+                return;
+            }
+            if (auto* bin = std::get_if<std::shared_ptr<BinaryExpr>>(&e)) {
+                if (*bin) {
+                    requalify_expr((*bin)->lhs, from, to);
+                    requalify_expr((*bin)->rhs, from, to);
+                }
+                return;
+            }
+            if (auto* fn = std::get_if<std::shared_ptr<FunctionExpr>>(&e)) {
+                if (*fn)
+                    for (auto& a: (*fn)->args)
+                        requalify_expr(a, from, to);
+            }
+        }
+
+        void requalify_bool(BoolExpr& b, const std::string& from, const std::string& to) {
+            if (b.left)
+                requalify_bool(*b.left, from, to);
+            if (b.right)
+                requalify_bool(*b.right, from, to);
+            if (b.cmp.has_value()) {
+                requalify_expr(b.cmp->lhs, from, to);
+                requalify_expr(b.cmp->rhs, from, to);
+            }
+            if (b.in_expr.has_value()) {
+                requalify_expr(b.in_expr->expr, from, to);
+                for (auto& v: b.in_expr->values)
+                    requalify_expr(v, from, to);
+            }
+            if (b.between_expr.has_value()) {
+                requalify_expr(b.between_expr->expr, from, to);
+                requalify_expr(b.between_expr->low, from, to);
+                requalify_expr(b.between_expr->high, from, to);
+            }
+        }
+
+        /// CTE 定义（v1：body 限 SELECT * FROM 单表 [WHERE ...]）。
+        struct CteDef {
+            std::string base_table;
+            std::optional<BoolExpr> where;
+        };
+
+    } // namespace
+
+    /**
+     * @brief 解析 WITH name AS (SELECT ...) [, ...] SELECT ...（CTE v1，解析期内联）。
+     *
+     * body 限制为 `SELECT * FROM 单表 [WHERE ...]`；主查询（含 UNION 臂）中对 CTE 名的引用
+     * 改写为基表 + 别名（无显式别名时别名 = CTE 名），body WHERE 合取并入引用处
+     *（FROM 位置并入主 WHERE；INNER/LEFT JOIN 并入 ON；RIGHT/FULL + body WHERE 拒绝，
+     * ON 合并与输入预过滤在该两类外连接下不等价）。
+     */
+    Statement Parser::parse_with_select() {
+        expect_keyword("WITH");
+        std::unordered_map<std::string, CteDef> ctes;
+        while (true) {
+            std::string name = consume_identifier();
+            expect_keyword("AS");
+            expect_text("(");
+            Statement body_stmt = parse_select();
+            expect_text(")");
+            auto& body = std::get<SelectStmt>(body_stmt);
+            const bool star_only = body.projections.size() == 1 &&
+                                   std::holds_alternative<Expression>(body.projections[0].value) &&
+                                   std::holds_alternative<ColumnRef>(
+                                           std::get<Expression>(body.projections[0].value)) &&
+                                   std::get<ColumnRef>(std::get<Expression>(body.projections[0].value)).name == "*";
+            if (!star_only || !body.joins.empty() || body.distinct || !body.group_by.empty() ||
+                body.having.has_value() || !body.order_by.empty() || body.limit.has_value() ||
+                body.offset.has_value() || !body.unions.empty() || body.from_alias.has_value()) {
+                throw std::runtime_error("[Parser] CTE body must be 'SELECT * FROM table [WHERE ...]' (v1)");
+            }
+            CteDef def;
+            def.base_table = body.from_table;
+            def.where = std::move(body.where);
+            if (!ctes.emplace(std::move(name), std::move(def)).second)
+                throw std::runtime_error("[Parser] Duplicate CTE name");
+            if (!match_text(","))
+                break;
+        }
+        Statement main_stmt = parse_select();
+        auto& main_sel = std::get<SelectStmt>(main_stmt);
+
+        // 对单个 SelectStmt 内联改写 CTE 引用。
+        auto inline_into = [&](SelectStmt& s) {
+            if (auto it = ctes.find(s.from_table); it != ctes.end()) {
+                const std::string alias = s.from_alias.value_or(s.from_table);
+                s.from_table = it->second.base_table;
+                s.from_alias = alias;
+                if (it->second.where.has_value()) {
+                    BoolExpr merged = *it->second.where; // 深拷贝
+                    requalify_bool(merged, it->second.base_table, alias);
+                    s.where = s.where.has_value() ? BoolExpr::make_and(std::move(merged), std::move(*s.where))
+                                                  : std::optional<BoolExpr>(std::move(merged));
+                }
+            }
+            for (auto& j: s.joins) {
+                auto jit = ctes.find(j.table);
+                if (jit == ctes.end())
+                    continue;
+                if (jit->second.where.has_value() && (j.type == JoinType::Right || j.type == JoinType::Full))
+                    throw std::runtime_error(
+                            "[Parser] CTE with WHERE is not supported on the RIGHT/FULL JOIN side (v1)");
+                const std::string alias = j.alias.value_or(j.table);
+                j.table = jit->second.base_table;
+                j.alias = alias;
+                if (jit->second.where.has_value()) {
+                    BoolExpr merged = *jit->second.where;
+                    requalify_bool(merged, jit->second.base_table, alias);
+                    if (j.on.has_value())
+                        j.on = BoolExpr::make_and(std::move(merged), std::move(*j.on));
+                    else
+                        j.on = std::move(merged);
+                }
+            }
+        };
+        inline_into(main_sel);
+        for (auto& arm: main_sel.unions)
+            if (arm.select)
+                inline_into(*arm.select);
+        return main_stmt;
     }
 
     Statement Parser::parse_select_core() {

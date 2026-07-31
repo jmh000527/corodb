@@ -894,7 +894,7 @@ cd build && ctest -j8
 |------|------|
 | DDL | `CREATE TABLE name (col type, ...)`, `DROP TABLE name`, `CREATE INDEX idx ON t (col)` / `ON t (a, b, ...)`（多列为复合等值索引）, `DROP INDEX idx` |
 | DML | `INSERT INTO t VALUES (v1, v2, ...)`, `UPDATE t SET col = v WHERE ...`, `DELETE FROM t WHERE ...` |
-| 查询 | `SELECT [DISTINCT] cols FROM t [alias] [JOIN ... ON ...] [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET n]`；`SELECT ... UNION [ALL] SELECT ...`（同种拼接，非 ALL 全局去重） |
+| 查询 | `SELECT [DISTINCT] cols FROM t [alias] [JOIN ... ON ...] [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET n]`；`SELECT ... UNION [ALL] SELECT ...`；`WITH name AS (SELECT * FROM t [WHERE ...]) [,...] SELECT ...`（CTE v1） |
 | JOIN | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL JOIN`（均支持 `[OUTER]`） |
 | 聚合 | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` |
 | 事务 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name`, `SET TRANSACTION ISOLATION LEVEL {READ UNCOMMITTED \| READ COMMITTED \| REPEATABLE READ \| SERIALIZABLE}` |

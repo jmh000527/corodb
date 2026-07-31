@@ -1144,6 +1144,37 @@ TEST_F(TxnTest, ExistsSubquery) {
 }
 
 // =====================================================================
+// CTE（WITH ... AS，v1 内联改写）
+// =====================================================================
+
+TEST_F(TxnTest, CteBasicsAndJoin) {
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT, age INT)");
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("INSERT INTO emp VALUES (1, 1, 30)");
+    exec_ok("INSERT INTO emp VALUES (2, 1, 50)");
+    exec_ok("INSERT INTO emp VALUES (3, 2, 60)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'hr')");
+    // FROM 位置：body WHERE 并入主 WHERE。
+    EXPECT_EQ(count_rows(*db, sess, "WITH old AS (SELECT * FROM emp WHERE age > 40) SELECT * FROM old"), 2u);
+    EXPECT_EQ(count_rows(*db, sess,
+                         "WITH old AS (SELECT * FROM emp WHERE age > 40) SELECT * FROM old WHERE old.dept_id = 1"),
+              1u);
+    // JOIN 位置：body WHERE 并入 ON。
+    EXPECT_EQ(count_rows(*db, sess,
+                         "WITH old AS (SELECT * FROM emp WHERE age > 40) "
+                         "SELECT * FROM dept JOIN old ON dept.id = old.dept_id"),
+              2u);
+    // 多 CTE + 显式别名。
+    EXPECT_EQ(count_rows(*db, sess,
+                         "WITH a AS (SELECT * FROM emp WHERE age > 40), b AS (SELECT * FROM dept) "
+                         "SELECT * FROM a x JOIN b y ON x.dept_id = y.id"),
+              2u);
+    // v1 限制：非 SELECT * body 拒绝。
+    EXPECT_THROW((void) db->execute("WITH c AS (SELECT id FROM emp) SELECT * FROM c", sess), std::runtime_error);
+}
+
+// =====================================================================
 // 优化器：相关 EXISTS 去相关化（OPT-1）
 // =====================================================================
 
