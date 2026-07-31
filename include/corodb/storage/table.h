@@ -201,6 +201,9 @@ namespace corodb {
         /** @brief 已索引列的键域 [min,max]（取自有序索引首尾键，O(1)；超集近似，供优化器估算选择率）。 */
         [[nodiscard]] std::optional<std::pair<Value, Value>> index_min_max(const std::string& column) const;
 
+        /** @brief 已索引列的去重键数（NDV），计到 cap 即提前终止（upper_bound 跳跃，O(cap·log n)）。 */
+        [[nodiscard]] std::size_t index_distinct_count(const std::string& column, std::size_t cap) const;
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }

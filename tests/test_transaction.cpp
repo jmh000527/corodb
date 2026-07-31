@@ -1204,6 +1204,33 @@ TEST_F(TxnTest, NonSelectiveRangeFallsBackToSeqScan) {
     EXPECT_NE(narrow_bt.find("Index Scan"), std::string::npos) << narrow_bt;
 }
 
+TEST_F(TxnTest, LowCardinalityEqualityFallsBackToSeqScan) {
+    exec_ok("CREATE TABLE t (id INT, flag INT, tag INT)");
+    exec_ok("CREATE INDEX idx_flag ON t (flag)");
+    exec_ok("CREATE INDEX idx_tag ON t (tag)");
+    for (int i = 1; i <= 200; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", " + std::to_string(i % 2) + ", " +
+                std::to_string(i) + ")");
+    auto plan_of = [&](const std::string& sql) {
+        auto r = db->execute(sql, sess);
+        std::string plan;
+        for (auto&& rec: *r.rows)
+            for (const auto& v: rec.values)
+                if (std::holds_alternative<std::string>(v))
+                    plan += std::get<std::string>(v) + "\n";
+        return plan;
+    };
+    // 低基数列（NDV=2）等值：命中半表 → 落回 Seq Scan。
+    std::string low = plan_of("EXPLAIN SELECT * FROM t WHERE flag = 1");
+    EXPECT_EQ(low.find("Index Scan"), std::string::npos) << low;
+    // 高基数列（NDV=200）等值：仍走 Index Scan。
+    std::string high = plan_of("EXPLAIN SELECT * FROM t WHERE tag = 42");
+    EXPECT_NE(high.find("Index Scan"), std::string::npos) << high;
+    // 两条路径语义一致。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE flag = 1"), 100u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE tag = 42"), 1u);
+}
+
 TEST_F(TxnTest, CorrelatedInDecorrelation) {
     exec_ok("CREATE TABLE dept (id INT, name TEXT)");
     exec_ok("CREATE TABLE emp (id INT, dept_id INT)");

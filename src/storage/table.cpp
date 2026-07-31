@@ -610,6 +610,17 @@ namespace corodb {
         return std::make_pair(it->second.begin()->first, it->second.rbegin()->first);
     }
 
+    std::size_t Table::index_distinct_count(const std::string& column, std::size_t cap) const {
+        auto it = indexes_.find(column);
+        if (it == indexes_.end())
+            return 0;
+        const auto& m = it->second;
+        std::size_t n = 0;
+        for (auto iter = m.begin(); iter != m.end() && n < cap; iter = m.upper_bound(iter->first))
+            ++n;
+        return n;
+    }
+
     // ---------------------------------------------------------------------------
     // Catalog
     // ---------------------------------------------------------------------------

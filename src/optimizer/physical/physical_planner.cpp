@@ -224,6 +224,22 @@ namespace corodb::opt {
     }
 
     /**
+     * @brief 代价决策（OPT-6）：等值谓词是否值得走索引。
+     *
+     * 低基数列（NDV 极小，如布尔/枚举）上等值命中约 rows/NDV 行；NDV<4 时单键预期覆盖
+     * ≥25% 行，超集索引逐 pk 点查比顺序扫描更贵 → 落回 SeqScan。小表/高基数维持走索引。
+     * NDV 计数带上限（只需判断是否 <4，O(4·log n)）。
+     */
+    static bool equality_worth_index(const Table& t, const std::string& col) {
+        constexpr std::size_t kSmallTable = 128;
+        constexpr std::size_t kLowNdv = 4;
+        if (t.estimated_row_count() < kSmallTable)
+            return true;
+        const std::size_t ndv = t.index_distinct_count(col, kLowNdv);
+        return ndv == 0 || ndv >= kLowNdv; // ndv==0：索引空/未知，保守走索引
+    }
+
+    /**
      * @brief 将 LogicalFilter 翻译为物理计划节点；若满足索引条件则生成 IndexScanPlan，否则生成 FilterPlan。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_filter(const LogicalFilter& f) {
@@ -247,33 +263,37 @@ namespace corodb::opt {
             }
             if (col && lit && scan.table && scan.table->indexed_columns().count(col->name) > 0) {
                 if (op == CompareOp::Eq) {
-                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, lit->value);
-                }
-                std::optional<Value> low, high;
-                bool low_inc = false, high_inc = false;
-                switch (op) {
-                    case CompareOp::Gt:
-                        low = lit->value;
-                        break;
-                    case CompareOp::Ge:
-                        low = lit->value;
-                        low_inc = true;
-                        break;
-                    case CompareOp::Lt:
-                        high = lit->value;
-                        break;
-                    case CompareOp::Le:
-                        high = lit->value;
-                        high_inc = true;
-                        break;
-                    default:
-                        break; // Ne/Like/IsNull 等不走索引
-                }
-                if (low.has_value() || high.has_value()) {
-                    // 代价决策：非选择性范围落回 SeqScan + Filter（顺序流式扫描更优）。
-                    if (range_worth_index(*scan.table, col->name, low, high)) {
-                        return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low),
-                                                               low_inc, std::move(high), high_inc);
+                    // 代价决策：低基数列的等值非选择性，落回 SeqScan + Filter。
+                    if (equality_worth_index(*scan.table, col->name)) {
+                        return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, lit->value);
+                    }
+                } else {
+                    std::optional<Value> low, high;
+                    bool low_inc = false, high_inc = false;
+                    switch (op) {
+                        case CompareOp::Gt:
+                            low = lit->value;
+                            break;
+                        case CompareOp::Ge:
+                            low = lit->value;
+                            low_inc = true;
+                            break;
+                        case CompareOp::Lt:
+                            high = lit->value;
+                            break;
+                        case CompareOp::Le:
+                            high = lit->value;
+                            high_inc = true;
+                            break;
+                        default:
+                            break; // Ne/Like/IsNull 等不走索引
+                    }
+                    if (low.has_value() || high.has_value()) {
+                        // 代价决策：非选择性范围落回 SeqScan + Filter（顺序流式扫描更优）。
+                        if (range_worth_index(*scan.table, col->name, low, high)) {
+                            return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low),
+                                                                   low_inc, std::move(high), high_inc);
+                        }
                     }
                 }
             }
