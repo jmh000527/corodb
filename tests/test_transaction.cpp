@@ -1204,6 +1204,27 @@ TEST_F(TxnTest, NonSelectiveRangeFallsBackToSeqScan) {
     EXPECT_NE(narrow_bt.find("Index Scan"), std::string::npos) << narrow_bt;
 }
 
+TEST_F(TxnTest, TopNOrderByLimitCorrectness) {
+    exec_ok("CREATE TABLE t (id INT, v INT)");
+    // 乱序插入 100 行（v = (id*37) % 100，一一对应打乱）。
+    for (int i = 1; i <= 100; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", " + std::to_string((i * 37) % 100) + ")");
+    // Top-N 路径（OrderBy+Limit 下推 K 元堆）：结果须与全排序语义一致。
+    auto vals_of = [&](const std::string& sql) {
+        std::vector<int64_t> out;
+        auto r = db->execute(sql, sess);
+        for (auto&& rec: *r.rows)
+            out.push_back(std::get<int64_t>(rec.values[1]));
+        return out;
+    };
+    EXPECT_EQ(vals_of("SELECT * FROM t ORDER BY v LIMIT 3"), (std::vector<int64_t>{ 0, 1, 2 }));
+    EXPECT_EQ(vals_of("SELECT * FROM t ORDER BY v DESC LIMIT 3"), (std::vector<int64_t>{ 99, 98, 97 }));
+    // OFFSET 裁剪：K=limit+offset 后外层 Limit 跳过 offset。
+    EXPECT_EQ(vals_of("SELECT * FROM t ORDER BY v LIMIT 3 OFFSET 2"), (std::vector<int64_t>{ 2, 3, 4 }));
+    // LIMIT 超过行数：全量返回。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t ORDER BY v LIMIT 500"), 100u);
+}
+
 TEST_F(TxnTest, NotExistsNotDecorrelatedNullSemantics) {
     // NOT EXISTS 不可改写为 NOT IN：子查询列含 NULL 时二者语义不同。
     exec_ok("CREATE TABLE a (id INT)");

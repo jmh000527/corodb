@@ -604,7 +604,10 @@ namespace corodb::opt {
     }
 
     /**
-     * @brief 将 LogicalLimit 翻译为 LimitPlan。
+     * @brief 将 LogicalLimit 翻译为 LimitPlan；若 child 为 OrderByPlan 则下推 Top-N 提示。
+     *
+     * 执行器对带 limit 的 OrderByPlan 用 K 元堆（K=limit+offset）只保前 K 小，
+     * 代替全量物化 + 全排序；外层 LimitPlan 保留负责 offset 裁剪。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_limit(const LogicalLimit& l) {
         auto child = l.child ? visit(*l.child) : nullptr;
@@ -613,6 +616,12 @@ namespace corodb::opt {
             lim = static_cast<int64_t>(*l.limit);
         if (l.offset.has_value())
             off = static_cast<int64_t>(*l.offset);
+        if (lim.has_value()) {
+            if (auto* ob = dynamic_cast<OrderByPlan*>(child.get())) {
+                ob->limit = lim;
+                ob->offset = off;
+            }
+        }
         return std::make_unique<LimitPlan>(std::move(child), lim, off);
     }
 
