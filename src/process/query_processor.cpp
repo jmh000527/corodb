@@ -207,6 +207,70 @@ namespace corodb {
         // 条件：子查询无 DISTINCT/GROUP/HAVING/ORDER/LIMIT/UNION；WHERE 为纯 AND 合取；
         // 恰好一个叶是「本地列 = 外层列」等值且其余叶均非相关。
         // 注：仅限非 NOT 上下文（NOT EXISTS 与 NOT IN 在结果含 NULL 时语义不同）。
+        // 去相关化 OPT-5（相关 IN）：
+        //   outer.b IN (SELECT S.col FROM S WHERE S.x = outer.b AND P[非相关])
+        //   → outer.b IN (SELECT S.col FROM S WHERE P)
+        // 条件：外层 IN 左表达式为 ColumnRef，子查询 WHERE 纯 AND 合取，恰好一个相关叶为「本地列 = 外层列」
+        // 且外层列与 IN 左表达式一致（等价性保证）；无 DISTINCT/GROUP/LIMIT 等；非 NOT 上下文。
+        std::optional<InExpr> try_decorrelate_in(const InExpr& in) {
+            if (in.exists_only)
+                return std::nullopt;
+            if (!in.subquery)
+                return std::nullopt;
+            const auto& sub = *in.subquery;
+            if (sub.distinct || !sub.group_by.empty() || sub.having.has_value() || !sub.order_by.empty() ||
+                sub.limit.has_value() || sub.offset.has_value() || !sub.unions.empty())
+                return std::nullopt;
+            if (!sub.where.has_value())
+                return std::nullopt;
+            const auto* outer_col = std::get_if<ColumnRef>(&in.expr);
+            if (!outer_col)
+                return std::nullopt;
+            auto local = subquery_local_names(sub);
+            SelectStmt rewritten{ sub };
+            std::vector<BoolExpr*> leaves;
+            if (!flatten_and_leaves(*rewritten.where, leaves))
+                return std::nullopt;
+            int corr_idx = -1;
+            for (int i = 0; i < static_cast<int>(leaves.size()); ++i) {
+                bool refs_outer = false;
+                detect_outer_refs_bool(*leaves[i], local, refs_outer);
+                if (!refs_outer)
+                    continue;
+                if (corr_idx >= 0)
+                    return std::nullopt;
+                if (leaves[i]->kind != BoolExpr::Kind::Comparison || !leaves[i]->cmp.has_value() ||
+                    leaves[i]->cmp->op != CompareOp::Eq)
+                    return std::nullopt;
+                const auto* l = std::get_if<ColumnRef>(&leaves[i]->cmp->lhs);
+                const auto* r = std::get_if<ColumnRef>(&leaves[i]->cmp->rhs);
+                if (!l || !r)
+                    return std::nullopt;
+                const bool l_outer = !l->table.empty() && local.count(l->table) == 0;
+                const bool r_outer = !r->table.empty() && local.count(r->table) == 0;
+                if (l_outer == r_outer)
+                    return std::nullopt;
+                const ColumnRef& oc = l_outer ? *l : *r;
+                // 外层列须与 IN 左表达式一致（等价性保证）。
+                if (oc.table != outer_col->table || oc.name != outer_col->name)
+                    return std::nullopt;
+                corr_idx = i;
+            }
+            if (corr_idx < 0)
+                return std::nullopt;
+            // 摘除相关叶（替为恒真 1=1）。
+            Comparison truec;
+            truec.op = CompareOp::Eq;
+            truec.lhs = Literal::from_int(1);
+            truec.rhs = Literal::from_int(1);
+            *leaves[corr_idx] = BoolExpr::make_comparison(std::move(truec));
+            InExpr result;
+            result.expr = in.expr;
+            result.negated = in.negated;
+            result.subquery = std::make_shared<SelectStmt>(std::move(rewritten));
+            return result;
+        }
+
         std::optional<InExpr> try_decorrelate_exists(const SelectStmt& sub) {
             if (sub.distinct || !sub.group_by.empty() || sub.having.has_value() || !sub.order_by.empty() ||
                 sub.limit.has_value() || sub.offset.has_value() || !sub.unions.empty())
@@ -779,6 +843,13 @@ namespace corodb {
         //（预代换一次执行，可命中索引；避免 O(N×M) 逐外层行 apply）。
         if (e.in_expr->exists_only && !under_not && subquery_is_correlated(*e.in_expr->subquery)) {
             if (auto rewritten = try_decorrelate_exists(*e.in_expr->subquery)) {
+                e = BoolExpr::make_in(std::move(*rewritten));
+            }
+        }
+        // 去相关化（OPT-5）：非 NOT 上下文的相关 IN 且模式匹配 → 改写为非相关 IN。
+        if (!e.in_expr->exists_only && !under_not && e.in_expr->subquery &&
+            subquery_is_correlated(*e.in_expr->subquery)) {
+            if (auto rewritten = try_decorrelate_in(*e.in_expr)) {
                 e = BoolExpr::make_in(std::move(*rewritten));
             }
         }

@@ -1204,6 +1204,31 @@ TEST_F(TxnTest, NonSelectiveRangeFallsBackToSeqScan) {
     EXPECT_NE(narrow_bt.find("Index Scan"), std::string::npos) << narrow_bt;
 }
 
+TEST_F(TxnTest, CorrelatedInDecorrelation) {
+    exec_ok("CREATE TABLE dept (id INT, name TEXT)");
+    exec_ok("CREATE TABLE emp (id INT, dept_id INT)");
+    exec_ok("CREATE INDEX idx_dept_id ON dept (id)");
+    exec_ok("INSERT INTO dept VALUES (1, 'eng')");
+    exec_ok("INSERT INTO dept VALUES (2, 'hr')");
+    exec_ok("INSERT INTO dept VALUES (3, 'empty')");
+    exec_ok("INSERT INTO emp VALUES (1, 1)");
+    exec_ok("INSERT INTO emp VALUES (2, 2)");
+    // 相关 IN：去相关化后应命中索引（见 EXPLAIN）。
+    EXPECT_EQ(
+            count_rows(*db, sess, "SELECT * FROM dept WHERE dept.id IN (SELECT emp.dept_id FROM emp WHERE emp.dept_id = dept.id)"),
+            2u);
+    auto r = db->execute(
+            "EXPLAIN SELECT * FROM dept WHERE dept.id IN (SELECT emp.dept_id FROM emp WHERE emp.dept_id = dept.id)",
+            sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+}
+
 TEST_F(TxnTest, TopNOrderByLimitCorrectness) {
     exec_ok("CREATE TABLE t (id INT, v INT)");
     // 乱序插入 100 行（v = (id*37) % 100，一一对应打乱）。
