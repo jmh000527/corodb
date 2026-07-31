@@ -79,6 +79,8 @@ namespace corodb {
 
         /// 预处理语句注册表：名称 → 缓存的物理计划。
         std::unordered_map<std::string, std::shared_ptr<PlanNode>> prepared_stmts;
+        /// 参数化预处理语句：名称 → 原始 SQL（含 ? 占位符，EXECUTE 时代入参数重新规划）。
+        std::unordered_map<std::string, std::string> prepared_sql;
 
         bool authenticated{ false }; ///< 是否已通过认证
         std::string auth_user;       ///< 认证用户名

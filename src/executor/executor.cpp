@@ -86,10 +86,35 @@ namespace corodb {
             }
             const bool is_num = std::holds_alternative<int64_t>(v) || std::holds_alternative<double>(v);
             const bool is_txt = std::holds_alternative<std::string>(v);
-            if (c.type == TypeKind::Text && !is_txt)
-                throw std::runtime_error("ERROR: type mismatch: column '" + c.name + "' expects TEXT");
-            if ((c.type == TypeKind::Int64 || c.type == TypeKind::Float64) && !is_num)
-                throw std::runtime_error("ERROR: type mismatch: column '" + c.name + "' expects a numeric value");
+            switch (c.type) {
+                case TypeKind::Boolean:
+                    if (!std::holds_alternative<int64_t>(v) ||
+                        (std::get<int64_t>(v) != 0 && std::get<int64_t>(v) != 1))
+                        throw std::runtime_error("ERROR: BOOLEAN column '" + c.name + "' accepts only TRUE/FALSE (0/1)");
+                    break;
+                case TypeKind::Date:
+                    if (!is_txt || std::get<std::string>(v).size() < 10)
+                        throw std::runtime_error(
+                                "ERROR: DATE column '" + c.name + "' expects an ISO date string (>= 10 chars)");
+                    break;
+                case TypeKind::Text:
+                    if (!is_txt)
+                        throw std::runtime_error("ERROR: type mismatch: column '" + c.name + "' expects TEXT");
+                    break;
+                case TypeKind::Int64:
+                    if (!is_num)
+                        throw std::runtime_error("ERROR: type mismatch: column '" + c.name +
+                                                 "' expects a numeric value");
+                    break;
+                case TypeKind::Float64:
+                case TypeKind::Decimal:
+                    if (!is_num)
+                        throw std::runtime_error("ERROR: type mismatch: column '" + c.name +
+                                                 "' expects a numeric value");
+                    break;
+                default:
+                    break;
+            }
         }
 
         /** @brief 校验整行是否满足列约束（逐列调用 validate_value）。 */

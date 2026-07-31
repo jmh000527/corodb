@@ -65,10 +65,13 @@ namespace corodb {
 
     /** @brief 数据库支持的基本数据类型枚举。 */
     enum class TypeKind : uint8_t {
-        Int64 = 0,   ///< 64位有符号整数类型，范围：[-2^63, 2^63-1]
-        Text = 1,    ///< 文本字符串类型，UTF-8编码
-        Null = 2,    ///< NULL值类型，表示缺失或未知的值
-        Float64 = 3  ///< IEEE 754 双精度浮点数类型
+        Int64 = 0,    ///< 64位有符号整数类型
+        Text = 1,     ///< 文本字符串类型，UTF-8编码
+        Null = 2,     ///< NULL值类型
+        Float64 = 3,  ///< IEEE 754 双精度浮点数类型
+        Boolean = 4,  ///< 布尔类型（存储为 int64 0/1，域校验拒绝其他值）
+        Date = 5,     ///< 日期类型（ISO-8601 字符串，域校验字典序即时间序）
+        Decimal = 6   ///< 精确小数（存储为 double，未来升级为定点）
     };
 
     /** @brief 通用值类型，可存储 NULL、int64_t、double 或 std::string。 */

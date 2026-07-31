@@ -22,6 +22,12 @@ namespace corodb {
                 return "float64";
             case TypeKind::Null:
                 return "null";
+            case TypeKind::Boolean:
+                return "boolean";
+            case TypeKind::Date:
+                return "date";
+            case TypeKind::Decimal:
+                return "decimal";
         }
         return "unknown";
     }

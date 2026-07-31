@@ -902,7 +902,7 @@ cd build && ctest -j8
 | 预处理 | `PREPARE name FROM 'sql'`, `EXECUTE name`, `DEALLOCATE PREPARE [name \| ALL]` |
 | 管理 | `CREATE USER user 'pwd'`, `AUTH user 'pwd'`, `CHECKPOINT`, `SHOW STATUS` |
 | 运算符 | `=`, `<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `+`, `-`, `*`, `/`, `%`, `\|\|` |
-| 类型 | `INT`, `INT64`, `BIGINT`, `TEXT`, `STRING`, `VARCHAR`, `FLOAT`, `DOUBLE`, `FLOAT64` |
+| 类型 | `INT`, `INT64`, `BIGINT`, `TEXT`, `STRING`, `VARCHAR`, `FLOAT`, `DOUBLE`, `FLOAT64`, `BOOL`/`BOOLEAN`（存 0/1，`TRUE`/`FALSE` 字面量）, `DATE`/`TIMESTAMP`/`DATETIME`（ISO-8601 字符串，字典序即时间序） |
 
 ### 已知限制
 

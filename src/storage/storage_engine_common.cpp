@@ -383,6 +383,12 @@ namespace corodb::storage_internal {
                 return 0;
             case TypeKind::Float64:
                 return 3;
+            case TypeKind::Boolean:
+                return 4;
+            case TypeKind::Date:
+                return 5;
+            case TypeKind::Decimal:
+                return 6;
         }
         return 0;
     }
@@ -396,6 +402,12 @@ namespace corodb::storage_internal {
                 return TypeKind::Text;
             case 3:
                 return TypeKind::Float64;
+            case 4:
+                return TypeKind::Boolean;
+            case 5:
+                return TypeKind::Date;
+            case 6:
+                return TypeKind::Decimal;
             case 0:
             default:
                 return TypeKind::Null;

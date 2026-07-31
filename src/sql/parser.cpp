@@ -520,11 +520,17 @@ namespace corodb {
                 std::string type_kw = to_upper(consume_identifier()); // 解析类型关键字
                 TypeKind type;                                        // 列类型
                 if (type_kw == "INT" || type_kw == "INT64" || type_kw == "BIGINT")
-                    type = TypeKind::Int64; // 整数类型
+                    type = TypeKind::Int64;
+                else if (type_kw == "BOOL" || type_kw == "BOOLEAN")
+                    type = TypeKind::Boolean;
                 else if (type_kw == "TEXT" || type_kw == "STRING" || type_kw == "VARCHAR")
-                    type = TypeKind::Text; // 文本类型
+                    type = TypeKind::Text;
+                else if (type_kw == "DATE" || type_kw == "TIMESTAMP" || type_kw == "DATETIME")
+                    type = TypeKind::Date;
                 else if (type_kw == "FLOAT" || type_kw == "DOUBLE" || type_kw == "FLOAT64")
-                    type = TypeKind::Float64; // 浮点类型
+                    type = TypeKind::Float64;
+                else if (type_kw == "DECIMAL" || type_kw == "NUMERIC")
+                    type = TypeKind::Decimal;
                 else
                     throw std::runtime_error("[Parser] Unsupported column type: " + type_kw);
 
@@ -1021,10 +1027,18 @@ namespace corodb {
         }
         if (peek_is_identifier()) {
             auto ident = peek_upper(); // 查看标识符
-            // NULL 字面量（SQL 保留字，不作列名）
+            // NULL / TRUE / FALSE 字面量（SQL 保留字，不作列名）
             if (ident == "NULL") {
                 consume();
                 return Literal::null();
+            }
+            if (ident == "TRUE") {
+                consume();
+                return Literal::from_int(1);
+            }
+            if (ident == "FALSE") {
+                consume();
+                return Literal::from_int(0);
             }
             // 解析聚合函数
             if (ident == "COUNT" || ident == "SUM" || ident == "AVG" || ident == "MIN" || ident == "MAX") {
@@ -1192,12 +1206,22 @@ namespace corodb {
      */
     Value Parser::parse_literal() {
         const auto& tok = consume(); // 消费当前token
-        // NULL 字面量
-        if (to_upper(tok.text) == "NULL") {
+        // NULL / TRUE / FALSE 字面量
+        const std::string up = to_upper(tok.text);
+        if (up == "NULL") {
             return Value{ NullValue{} };
         }
-        // 解析整数字面量
-        if (!tok.text.empty() && std::isdigit(static_cast<unsigned char>(tok.text[0]))) {
+        if (up == "TRUE") {
+            return Value{ static_cast<int64_t>(1) };
+        }
+        if (up == "FALSE") {
+            return Value{ static_cast<int64_t>(0) };
+        }
+        // 解析整数或浮点字面量
+        if (!tok.text.empty() && (std::isdigit(static_cast<unsigned char>(tok.text[0])) ||
+                                  (tok.text[0] == '-' && tok.text.size() > 1))) {
+            if (tok.text.find('.') != std::string::npos)
+                return Value{ std::stod(tok.text) };
             return Value{ static_cast<int64_t>(std::stoll(tok.text)) }; // 返回整数值
         }
         // 解析字符串字面量（单引号包围）
@@ -1286,9 +1310,14 @@ namespace corodb {
                 }
             }
 
-            // 解析单字符token
+            // 解析单字符token（但小数点后跟数字时属于浮点字面量）
+            if (c == '.' && !current.empty() && std::isdigit(static_cast<unsigned char>(current.back())) &&
+                i + 1 < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i + 1]))) {
+                current.push_back(c); // 小数点并入数字 token
+                continue;
+            }
             if (c == '(' || c == ')' || c == ',' || c == ';' || c == '.' || c == '*' || c == '+' || c == '-' ||
-                c == '/' || c == '=') {
+                c == '/' || c == '=' || c == '?' || c == '%') {
                 flush();     // 刷新当前token
                 push_one(c); // 添加单字符token
                 continue;
@@ -1491,7 +1520,14 @@ namespace corodb {
     ExecuteStmt Parser::parse_execute() {
         consume(); // consume EXECUTE
         std::string name = consume_identifier();
-        return ExecuteStmt{ std::move(name) };
+        std::vector<Value> params;
+        if (match_text("(")) {
+            params.push_back(parse_literal());
+            while (match_text(","))
+                params.push_back(parse_literal());
+            expect_text(")");
+        }
+        return ExecuteStmt{ std::move(name), std::move(params) };
     }
 
     DeallocateStmt Parser::parse_deallocate() {

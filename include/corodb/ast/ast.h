@@ -559,14 +559,14 @@ namespace corodb {
         bool not_null{ false };                  ///< NOT NULL 约束
         std::optional<Expression> default_value; ///< DEFAULT 值
 
-        /** @brief 检查是否为整数类型。 */
+        /** @brief 检查是否为整数型（含布尔）。 */
         [[nodiscard]] bool is_integer() const noexcept {
-            return type == TypeKind::Int64;
+            return type == TypeKind::Int64 || type == TypeKind::Boolean;
         }
 
-        /** @brief 检查是否为字符串类型。 */
+        /** @brief 检查是否为字符串型（含日期）。 */
         [[nodiscard]] bool is_string() const noexcept {
-            return type == TypeKind::Text;
+            return type == TypeKind::Text || type == TypeKind::Date;
         }
 
         /** @brief 检查是否有列约束。 */
@@ -698,9 +698,10 @@ namespace corodb {
         std::string sql;     ///< 要准备的 SQL 文本
     };
 
-    /** @struct ExecuteStmt @brief EXECUTE 语句，执行已缓存的预处理语句。 */
+    /** @struct ExecuteStmt @brief EXECUTE 语句，执行已缓存的预处理语句（可带参数）。 */
     struct ExecuteStmt {
-        std::string name;    ///< 预处理语句名称
+        std::string name;              ///< 预处理语句名称
+        std::vector<Value> params;     ///< 参数值列表（对应 PREPARE SQL 中的 ? 占位符）
     };
 
     /** @struct DeallocateStmt @brief DEALLOCATE PREPARE 语句，清理预处理语句。 */

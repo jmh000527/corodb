@@ -605,15 +605,20 @@ namespace corodb {
             return q;
         }
 
-        // 1d) PREPARE: parse and cache the plan.
+        // 1d) PREPARE: parse and cache the plan (parametric if SQL contains '?').
         if (auto* prep = std::get_if<PrepareStmt>(&stmt)) {
-            Parser inner_parser;
-            Statement inner_stmt = inner_parser.parse(prep->sql);
-            // 非相关 IN (SELECT ...)：PREPARE 时代换（值随计划一并固化，与 PREPARE 的计划冻结语义一致）。
-            if (stmt_has_subquery(inner_stmt))
-                resolve_subqueries(inner_stmt, session, 0);
-            auto plan = build_physical_plan(inner_stmt);
-            session->prepared_stmts[prep->name] = std::move(plan);
+            if (prep->sql.find('?') != std::string::npos) {
+                // 参数化路径：保存原始 SQL，EXECUTE 时代入参数重新规划。
+                session->prepared_sql[prep->name] = prep->sql;
+            } else {
+                // 无参数：沉入规划缓存（旧行为）。
+                Parser inner_parser;
+                Statement inner_stmt = inner_parser.parse(prep->sql);
+                if (stmt_has_subquery(inner_stmt))
+                    resolve_subqueries(inner_stmt, session, 0);
+                auto plan = build_physical_plan(inner_stmt);
+                session->prepared_stmts[prep->name] = std::move(plan);
+            }
             ProcessedQuery q;
             q.message = "PREPARE";
             return q;
@@ -621,25 +626,53 @@ namespace corodb {
 
         // 1e) EXECUTE: run the cached plan.
         if (auto* exec = std::get_if<ExecuteStmt>(&stmt)) {
-            auto it = session->prepared_stmts.find(exec->name);
-            if (it == session->prepared_stmts.end())
-                throw std::runtime_error("[Process] Prepared statement not found: " + exec->name);
-            auto shared_plan = it->second; // shared_ptr<PlanNode>
-
-            txn_ctrl_.prepare_for_statement(stmt, *session);
-            ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
-            if (session->statement_timeout_ms > 0) {
-                ctx.deadline = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(session->statement_timeout_ms);
+            // 参数化 EXECUTE：将 ? 占位符替换为实参重新规划/执行。
+            auto sql_it = session->prepared_sql.find(exec->name);
+            if (sql_it == session->prepared_sql.end()) {
+                // 无参数路径（兼容旧行为）。
+                auto plan_it = session->prepared_stmts.find(exec->name);
+                if (plan_it == session->prepared_stmts.end())
+                    throw std::runtime_error("[Process] Prepared statement not found: " + exec->name);
+                auto shared_plan = plan_it->second;
+                txn_ctrl_.prepare_for_statement(stmt, *session);
+                ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
+                CorrelatedRunner runner(*this, session);
+                ctx.subquery_runner = &runner;
+                if (session->statement_timeout_ms > 0)
+                    ctx.deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(session->statement_timeout_ms);
+                auto executor = std::make_shared<Executor>(ctx);
+                auto gen = executor->run(shared_plan.get());
+                ProcessedQuery q;
+                q.rows = std::move(gen);
+                struct Keeper { std::shared_ptr<PlanNode> plan; std::shared_ptr<Executor> exec; };
+                q.plan = std::shared_ptr<void>(std::make_shared<Keeper>(Keeper{ shared_plan, executor }));
+                q.is_select = true;
+                return q;
             }
-            auto executor = std::make_shared<Executor>(ctx);
-            auto gen = executor->run(shared_plan.get());
-            ProcessedQuery q;
-            q.rows = std::move(gen);
-            struct Keeper { std::shared_ptr<PlanNode> plan; std::shared_ptr<Executor> exec; };
-            q.plan = std::shared_ptr<void>(std::make_shared<Keeper>(Keeper{ shared_plan, executor }));
-            q.is_select = true;
-            return q;
+            // 参数化路径：代入参数重新解析/规划/执行。
+            std::string sql_template = sql_it->second;
+            // 替换 ? 为字面量。
+            std::string resolved;
+            std::size_t param_idx = 0;
+            for (std::size_t i = 0; i < sql_template.size(); ++i) {
+                if (sql_template[i] == '?') {
+                    if (param_idx >= exec->params.size())
+                        throw std::runtime_error("[Process] Not enough parameters for EXECUTE");
+                    const Value& pv = exec->params[param_idx++];
+                    if (std::holds_alternative<NullValue>(pv))
+                        resolved += "NULL";
+                    else if (std::holds_alternative<int64_t>(pv))
+                        resolved += std::to_string(std::get<int64_t>(pv));
+                    else if (std::holds_alternative<double>(pv))
+                        resolved += std::to_string(std::get<double>(pv));
+                    else
+                        resolved += "'" + std::get<std::string>(pv) + "'";
+                } else {
+                    resolved.push_back(sql_template[i]);
+                }
+            }
+            return run(resolved, session);
         }
 
         // 1f) DEALLOCATE PREPARE: remove cached plan(s).

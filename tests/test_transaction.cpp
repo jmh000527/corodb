@@ -1559,8 +1559,55 @@ TEST_F(TxnTest, CorrelatedSubqueryInDml) {
 }
 
 // =====================================================================
+// BOOLEAN / DATE 类型（v1：存储映射 + TRUE/FALSE 字面量）
+// =====================================================================
+
+TEST_F(TxnTest, BooleanAndDateTypes) {
+    exec_ok("CREATE TABLE ev (id INT, done BOOLEAN, at DATE)");
+    exec_ok("INSERT INTO ev VALUES (1, TRUE, '2024-01-15')");
+    exec_ok("INSERT INTO ev VALUES (2, FALSE, '2024-06-01')");
+    exec_ok("INSERT INTO ev VALUES (3, TRUE, '2025-03-20')");
+    // 布尔谓词。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM ev WHERE done = TRUE"), 2u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM ev WHERE done = FALSE"), 1u);
+    exec_ok("UPDATE ev SET done = TRUE WHERE id = 2");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM ev WHERE done = TRUE"), 3u);
+    // 域校验：拒绝非 0/1。
+    EXPECT_THROW((void) db->execute("INSERT INTO ev VALUES (4, 2, '2025-01-01')", sess), std::runtime_error);
+    // 日期范围 + 域校验（拒绝过短字符串）。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM ev WHERE at > '2024-05-01'"), 2u);
+    EXPECT_THROW((void) db->execute("INSERT INTO ev VALUES (5, TRUE, 'bad')", sess), std::runtime_error);
+    // DECIMAL 列。
+    exec_ok("CREATE TABLE m (id INT, price DECIMAL)");
+    exec_ok("INSERT INTO m VALUES (1, 3.14)");
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM m WHERE price > 3.0"), 1u);
+    // 重启持久化。
+    db.reset();
+    storage_internal::WalManager::instance().clear_all();
+    db = std::make_unique<Database>(dir->path());
+    sess = std::make_shared<Session>();
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM ev WHERE done = TRUE"), 3u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM m WHERE price > 3.0"), 1u);
+}
+
+// =====================================================================
 // NULL 字面量与 IS NULL / IS NOT NULL
 // =====================================================================
+
+TEST_F(TxnTest, ParameterizedPrepareExecute) {
+    exec_ok("CREATE TABLE t (id INT, name TEXT)");
+    exec_ok("INSERT INTO t VALUES (1, 'a')");
+    exec_ok("INSERT INTO t VALUES (2, 'b')");
+    exec_ok("INSERT INTO t VALUES (3, 'c')");
+    exec_ok("PREPARE q FROM 'SELECT * FROM t WHERE id = ?'");
+    EXPECT_EQ(count_rows(*db, sess, "EXECUTE q(1)"), 1u);
+    EXPECT_EQ(count_rows(*db, sess, "EXECUTE q(2)"), 1u);
+    // 多参数。
+    exec_ok("PREPARE q2 FROM 'SELECT * FROM t WHERE id > ? AND name = ?'");
+    EXPECT_EQ(count_rows(*db, sess, "EXECUTE q2(1, 'b')"), 1u);
+    // 参数不足报错。
+    EXPECT_THROW((void) db->execute("EXECUTE q()", sess), std::runtime_error);
+}
 
 TEST_F(TxnTest, NullLiteralAndIsNull) {
     exec_ok("CREATE TABLE t (id INT, v INT, name TEXT NOT NULL)");
