@@ -392,21 +392,29 @@ namespace corodb {
 
     // ---- PlanCache ----
 
-    std::shared_ptr<PlanNode> PlanCache::lookup(const std::string& key) {
+    std::shared_ptr<PlanNode> PlanCache::lookup(const std::string& key, uint64_t stats_fingerprint) {
         std::lock_guard lock(mutex_);
         auto it = cache_.find(key);
         if (it == cache_.end())
             return nullptr;
+        // 统计指纹不符：表行数量级已变，烘入计划的代价决策（索引选择/JOIN 顺序）可能陈旧，淘汰重规划。
+        if (it->second.fingerprint != stats_fingerprint) {
+            auto lit = std::find(lru_.begin(), lru_.end(), key);
+            if (lit != lru_.end())
+                lru_.erase(lit);
+            cache_.erase(it);
+            return nullptr;
+        }
         // 移到 MRU 位置
         auto lit = std::find(lru_.begin(), lru_.end(), key);
         if (lit != lru_.end()) {
             lru_.erase(lit);
             lru_.push_back(key);
         }
-        return it->second;
+        return it->second.plan;
     }
 
-    void PlanCache::insert(const std::string& key, std::shared_ptr<PlanNode> plan) {
+    void PlanCache::insert(const std::string& key, uint64_t stats_fingerprint, std::shared_ptr<PlanNode> plan) {
         std::lock_guard lock(mutex_);
         // 容量满时淘汰 LRU 条目。
         while (cache_.size() >= max_entries_ && !lru_.empty()) {
@@ -414,7 +422,7 @@ namespace corodb {
             cache_.erase(lru_key);
             lru_.pop_front();
         }
-        cache_[key] = std::move(plan);
+        cache_[key] = Entry{ std::move(plan), stats_fingerprint };
         lru_.push_back(key);
     }
 
@@ -427,6 +435,31 @@ namespace corodb {
     std::size_t PlanCache::size() const {
         std::lock_guard lock(mutex_);
         return cache_.size();
+    }
+
+    /**
+     * @brief 语句涉及表的统计指纹：各表行数的 log2 桶混入哈希。
+     *
+     * 行数同一量级内指纹稳定（缓存有效），量级变化（如 10→10 万行）即指纹变化，
+     * 使烘入缓存计划的代价决策（索引选择/JOIN 顺序/Top-N）能随数据规模重算。
+     */
+    uint64_t QueryProcessor::stats_fingerprint(const Statement& stmt) const {
+        uint64_t fp = 1469598103934665603ull; // FNV 初值
+        for (const auto& name: extract_table_names(stmt)) {
+            auto tbl = catalog_.lookup(name);
+            if (!tbl)
+                continue;
+            std::size_t rows = tbl->estimated_row_count();
+            unsigned bucket = 0;
+            while (rows > 1) {
+                rows >>= 1;
+                ++bucket;
+            }
+            for (char c: name)
+                fp = (fp ^ static_cast<uint64_t>(c)) * 1099511628211ull;
+            fp = (fp ^ bucket) * 1099511628211ull;
+        }
+        return fp;
     }
 
     std::string QueryProcessor::normalize_sql(const std::string& sql) {
@@ -724,15 +757,17 @@ namespace corodb {
 
             // Check plan cache for SELECT only (DML has different values per statement).
             std::shared_ptr<PlanNode> shared_plan;
+            uint64_t stats_fp = 0;
             if (is_select && !had_subquery) {
+                stats_fp = stats_fingerprint(stmt);
                 std::string normalized = normalize_sql(sql);
-                shared_plan = plan_cache_.lookup(normalized);
+                shared_plan = plan_cache_.lookup(normalized, stats_fp);
             }
             if (!shared_plan) {
                 auto plan = build_physical_plan(stmt);
                 shared_plan = std::move(plan);
                 if (is_select && !had_subquery) {
-                    plan_cache_.insert(normalize_sql(sql), shared_plan);
+                    plan_cache_.insert(normalize_sql(sql), stats_fp, shared_plan);
                 }
             }
             // 3) 分派：DDL → Utility；DML/SELECT → Executor

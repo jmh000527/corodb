@@ -49,15 +49,16 @@ namespace corodb {
     };
 
     /**
-     * @brief 物理计划缓存（LRU eviction，DDL 时全量失效）。
+     * @brief 物理计划缓存（LRU eviction，DDL 时全量失效；附统计指纹防陈旧代价决策）。
      */
     class PlanCache {
     public:
-        /** @brief 根据标准化 SQL 查找缓存的计划，未命中返回 nullptr。 */
-        std::shared_ptr<PlanNode> lookup(const std::string& normalized_sql);
+        /** @brief 根据标准化 SQL + 当前统计指纹查找缓存计划；未命中或指纹不符（表行数量级变化，
+         *  烘入计划的代价决策可能已陈旧）返回 nullptr 并淘汰旧条目。 */
+        std::shared_ptr<PlanNode> lookup(const std::string& normalized_sql, uint64_t stats_fingerprint);
 
-        /** @brief 将标准化 SQL 及其计划插入缓存。 */
-        void insert(const std::string& normalized_sql, std::shared_ptr<PlanNode> plan);
+        /** @brief 将标准化 SQL、统计指纹及其计划插入缓存。 */
+        void insert(const std::string& normalized_sql, uint64_t stats_fingerprint, std::shared_ptr<PlanNode> plan);
 
         /** @brief DDL 后全量清空（表结构变更使所有计划可能失效）。 */
         void invalidate_all();
@@ -69,8 +70,12 @@ namespace corodb {
         [[nodiscard]] std::size_t size() const;
 
     private:
+        struct Entry {
+            std::shared_ptr<PlanNode> plan;
+            uint64_t fingerprint{ 0 };
+        };
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, std::shared_ptr<PlanNode>> cache_;
+        std::unordered_map<std::string, Entry> cache_;
         std::list<std::string> lru_;
         std::size_t max_entries_{ 128 };
     };
@@ -104,6 +109,9 @@ namespace corodb {
         void resolve_subqueries(Statement& stmt, const std::shared_ptr<Session>& session, int depth);
         void resolve_subqueries_in_bool(BoolExpr& e, const std::shared_ptr<Session>& session, int depth,
                                         bool under_not);
+
+        /** @brief 语句涉及表的统计指纹（各表行数 log2 桶混合）；行数量级变化即指纹变化。 */
+        [[nodiscard]] uint64_t stats_fingerprint(const Statement& stmt) const;
 
         /** @brief 构建 SHOW STATUS 的状态指标行生成器。 */
         [[nodiscard]] std::generator<Record> build_status_rows();

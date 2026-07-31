@@ -1204,6 +1204,33 @@ TEST_F(TxnTest, NonSelectiveRangeFallsBackToSeqScan) {
     EXPECT_NE(narrow_bt.find("Index Scan"), std::string::npos) << narrow_bt;
 }
 
+TEST_F(TxnTest, PlanCacheInvalidatesOnRowCountGrowth) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    auto plan_of = [&](const std::string& sql) {
+        auto r = db->execute(sql, sess);
+        std::string plan;
+        for (auto&& rec: *r.rows)
+            for (const auto& v: rec.values)
+                if (std::holds_alternative<std::string>(v))
+                    plan += std::get<std::string>(v) + "\n";
+        return plan;
+    };
+    // 小表时宽范围走索引（并进入计划缓存）。
+    exec_ok("INSERT INTO t VALUES (1, 1)");
+    const std::string q = "SELECT * FROM t WHERE age > 0";
+    EXPECT_EQ(count_rows(*db, sess, q), 1u);
+    std::string small_plan = plan_of("EXPLAIN " + q);
+    EXPECT_NE(small_plan.find("Index Scan"), std::string::npos) << small_plan;
+    // 行数量级增长后：统计指纹变化应使缓存计划失效，重规划落回 Seq Scan。
+    for (int i = 2; i <= 300; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", " + std::to_string(i) + ")");
+    EXPECT_EQ(count_rows(*db, sess, q), 300u); // 经缓存路径执行，正确性不受影响
+    std::string big_plan = plan_of("EXPLAIN " + q);
+    EXPECT_EQ(big_plan.find("Index Scan"), std::string::npos) << big_plan;
+    EXPECT_NE(big_plan.find("Seq Scan"), std::string::npos) << big_plan;
+}
+
 TEST_F(TxnTest, LowCardinalityEqualityFallsBackToSeqScan) {
     exec_ok("CREATE TABLE t (id INT, flag INT, tag INT)");
     exec_ok("CREATE INDEX idx_flag ON t (flag)");
