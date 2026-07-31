@@ -621,6 +621,24 @@ namespace corodb {
         return n;
     }
 
+    std::optional<double> Table::index_range_fraction(const std::string& column, const std::optional<Value>& low,
+                                                      bool low_inclusive, const std::optional<Value>& high,
+                                                      bool high_inclusive, double early_exit_fraction) const {
+        auto it = indexes_.find(column);
+        if (it == indexes_.end() || it->second.empty())
+            return std::nullopt;
+        const auto& m = it->second;
+        const double total = static_cast<double>(m.size());
+        auto begin = low.has_value() ? (low_inclusive ? m.lower_bound(*low) : m.upper_bound(*low)) : m.begin();
+        auto end = high.has_value() ? (high_inclusive ? m.upper_bound(*high) : m.lower_bound(*high)) : m.end();
+        // 计数到超过 early_exit_fraction 即短路（代价决策只需知道“是否超过阈值”）。
+        const std::size_t cap = static_cast<std::size_t>(total * early_exit_fraction) + 1;
+        std::size_t count = 0;
+        for (auto iter = begin; iter != end && count <= cap; ++iter)
+            ++count;
+        return static_cast<double>(count) / total;
+    }
+
     // ---------------------------------------------------------------------------
     // Catalog
     // ---------------------------------------------------------------------------

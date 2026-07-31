@@ -182,17 +182,22 @@ namespace corodb::opt {
     }
 
     /**
-     * @brief 代价决策（OPT-2/3）：范围谓词是否值得走索引。
+     * @brief 代价决策（OPT-2/3，直方图升级）：范围谓词是否值得走索引。
      *
-     * 小表恒走索引（代价差可忽略）；大表用索引键域 [min,max]（O(1) 统计）线性估算覆盖率，
-     * 超过一半视为非选择性——超集索引逐 pk 点查 + 可见性重查比一次顺序流式扫描更贵。
-     * 非数值列/无统计时维持既有行为（走索引）。
+     * 小表恒走索引；大表优先用有序索引的精确分布探针（index_range_fraction，倾斜数据下
+     * 也准确；计数超阈即短路）；探针不可用时回退 min/max 线性插值。覆盖率 >50% 视为
+     * 非选择性——超集索引逐 pk 点查 + 可见性重查比一次顺序流式扫描更贵。
      */
     static bool range_worth_index(const Table& t, const std::string& col, const std::optional<Value>& low,
-                                  const std::optional<Value>& high) {
+                                  bool low_inc, const std::optional<Value>& high, bool high_inc) {
         constexpr std::size_t kSmallTable = 128;
+        constexpr double kThreshold = 0.5;
         if (t.estimated_row_count() < kSmallTable)
             return true;
+        // 精确分布探针（任意可比较类型，含字符串；倾斜分布下准确）。
+        if (auto frac = t.index_range_fraction(col, low, low_inc, high, high_inc, kThreshold))
+            return *frac <= kThreshold;
+        // 回退：min/max 线性插值（仅数值）。
         auto mm = t.index_min_max(col);
         if (!mm)
             return true;
@@ -220,7 +225,7 @@ namespace corodb::opt {
         if (hi <= lo)
             return true; // 空/极窄范围：索引更优
         const double frac = (hi - lo) / (*maxv - *minv);
-        return frac <= 0.5;
+        return frac <= kThreshold;
     }
 
     /**
@@ -290,7 +295,7 @@ namespace corodb::opt {
                     }
                     if (low.has_value() || high.has_value()) {
                         // 代价决策：非选择性范围落回 SeqScan + Filter（顺序流式扫描更优）。
-                        if (range_worth_index(*scan.table, col->name, low, high)) {
+                        if (range_worth_index(*scan.table, col->name, low, low_inc, high, high_inc)) {
                             return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low),
                                                                    low_inc, std::move(high), high_inc);
                         }
@@ -308,8 +313,8 @@ namespace corodb::opt {
             const auto* lo = std::get_if<Literal>(&be.low);
             const auto* hi = std::get_if<Literal>(&be.high);
             if (col && lo && hi && scan.table && scan.table->indexed_columns().count(col->name) > 0 &&
-                range_worth_index(*scan.table, col->name, std::optional<Value>(lo->value),
-                                  std::optional<Value>(hi->value))) {
+                range_worth_index(*scan.table, col->name, std::optional<Value>(lo->value), true,
+                                  std::optional<Value>(hi->value), true)) {
                 return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name,
                                                        std::optional<Value>(lo->value), true,
                                                        std::optional<Value>(hi->value), true);

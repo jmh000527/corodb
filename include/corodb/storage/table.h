@@ -204,6 +204,16 @@ namespace corodb {
         /** @brief 已索引列的去重键数（NDV），计到 cap 即提前终止（upper_bound 跳跃，O(cap·log n)）。 */
         [[nodiscard]] std::size_t index_distinct_count(const std::string& column, std::size_t cap) const;
 
+        /** @brief 范围 [low,high]（按 inclusive 标志）内索引条目占比的精确探针。
+         *
+         * 有序索引即精确分布（等高直方图每桶 1 条的极限形态）：定界后计数，
+         * 超过 early_exit_fraction 即提前终止返回下界估计（规划期一次性代价）。
+         * 无索引/空索引返回 nullopt。 */
+        [[nodiscard]] std::optional<double> index_range_fraction(const std::string& column,
+                                                                 const std::optional<Value>& low, bool low_inclusive,
+                                                                 const std::optional<Value>& high, bool high_inclusive,
+                                                                 double early_exit_fraction) const;
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }

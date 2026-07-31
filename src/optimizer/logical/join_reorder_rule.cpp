@@ -12,8 +12,9 @@ namespace corodb::opt {
 
     namespace detail {
 
-        // 估算子树基数：Scan 用存储引擎的行数粗估（真实统计），其余节点做简单传播：
-        // Filter 按经验选择率 1/3，Aggregate 按 1/10，Join 取两侧较大者（保守）。
+        // 估算子树基数：Scan 用真实行数；Filter 1/3；Aggregate 1/10；
+        // **Join 乘积模型**：内联输出基数 = L×R / max(NDV_join_key_left, NDV_join_key_right)。
+        // 若无等值 ON 或无 NDV（无索引），回退到保守估算 max(L,R)。
         std::size_t estimate_subtree_size(const LogicalPlan& p) {
             return std::visit(
                     [&](const auto& n) -> std::size_t {
@@ -21,8 +22,40 @@ namespace corodb::opt {
                         if constexpr (std::is_same_v<T, LogicalScan>) {
                             return n.table ? std::max<std::size_t>(n.table->estimated_row_count(), 1) : 1;
                         } else if constexpr (std::is_same_v<T, LogicalJoin>) {
-                            std::size_t l = n.left ? estimate_subtree_size(*n.left) : 0;
-                            std::size_t r = n.right ? estimate_subtree_size(*n.right) : 0;
+                            std::size_t l = n.left ? estimate_subtree_size(*n.left) : 1;
+                            std::size_t r = n.right ? estimate_subtree_size(*n.right) : 1;
+                            // 尝试乘积模型：需要等值 ON 条件 + join key NDV。
+                            if (n.on.has_value() && n.on->kind == BoolExpr::Kind::Comparison &&
+                                n.on->cmp.has_value() && n.on->cmp->op == CompareOp::Eq) {
+                                const auto* lk = std::get_if<ColumnRef>(&n.on->cmp->lhs);
+                                const auto* rk = std::get_if<ColumnRef>(&n.on->cmp->rhs);
+                                if (lk && rk) {
+                                    // 从子树的 Scan 取 join key 列的 NDV（需绑定名匹配；任一侧有索引即可）。
+                                    auto ndv_from = [](const LogicalPlan& plan, const ColumnRef& col) -> std::size_t {
+                                        if (plan.kind != LogicalKind::Scan)
+                                            return 0;
+                                        const auto& sc = std::get<LogicalScan>(plan.node);
+                                        if (!sc.table)
+                                            return 0;
+                                        const std::string binding = sc.alias.empty() ? sc.table->name() : sc.alias;
+                                        if (!col.table.empty() && col.table != binding)
+                                            return 0;
+                                        return sc.table->index_distinct_count(col.name, 10000);
+                                    };
+                                    std::size_t ndv = 0;
+                                    for (const auto* key: { lk, rk }) {
+                                        if (n.left)
+                                            ndv = std::max(ndv, ndv_from(*n.left, *key));
+                                        if (n.right)
+                                            ndv = std::max(ndv, ndv_from(*n.right, *key));
+                                    }
+                                    if (ndv > 0) {
+                                        // 乘积模型：|L| * |R| / ndv（ndv=1 即真·笛卡尔积）
+                                        return std::max<std::size_t>((l * r) / ndv, 1);
+                                    }
+                                }
+                            }
+                            // 回退：保守取较大侧
                             return std::max<std::size_t>(std::max(l, r), 1);
                         } else if constexpr (std::is_same_v<T, LogicalAggregate>) {
                             std::size_t c = n.child ? estimate_subtree_size(*n.child) : 0;

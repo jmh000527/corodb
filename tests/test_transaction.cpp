@@ -1235,6 +1235,64 @@ TEST_F(TxnTest, NonSelectiveRangeFallsBackToSeqScan) {
     EXPECT_NE(narrow_bt.find("Index Scan"), std::string::npos) << narrow_bt;
 }
 
+TEST_F(TxnTest, SkewedRangeUsesExactDistribution) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    // 倾斜分布：190 行集中在 [0,9]，10 行散在 [100,1000]。
+    for (int i = 1; i <= 190; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", " + std::to_string(i % 10) + ")");
+    for (int i = 1; i <= 10; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(190 + i) + ", " + std::to_string(i * 100) + ")");
+    auto plan_of = [&](const std::string& sql) {
+        auto r = db->execute(sql, sess);
+        std::string plan;
+        for (auto&& rec: *r.rows)
+            for (const auto& v: rec.values)
+                if (std::holds_alternative<std::string>(v))
+                    plan += std::get<std::string>(v) + "\n";
+        return plan;
+    };
+    // age > 90 仅命中 10 行（5%），但线性 min/max 模型会误判为 91% → 精确探针应走 Index Scan。
+    std::string sel = plan_of("EXPLAIN SELECT * FROM t WHERE age > 90");
+    EXPECT_NE(sel.find("Index Scan"), std::string::npos) << sel;
+    // age < 9 命中 171 行（85%），但线性模型会误判为 0.9% → 精确探针应落回 Seq Scan。
+    std::string nonsel = plan_of("EXPLAIN SELECT * FROM t WHERE age < 9");
+    EXPECT_EQ(nonsel.find("Index Scan"), std::string::npos) << nonsel;
+    // 两条路径语义一致。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age > 90"), 10u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age < 9"), 171u);
+}
+
+TEST_F(TxnTest, JoinProductModelReordersDuplicateKeys) {
+    exec_ok("CREATE TABLE a (id INT, k INT)");
+    exec_ok("CREATE TABLE b (id INT, k INT)");
+    exec_ok("CREATE TABLE c (id INT, v INT)");
+    exec_ok("CREATE INDEX idx_ak ON a (k)");
+    exec_ok("CREATE INDEX idx_bk ON b (k)");
+    // a⋈b 全同键（NDV=1）：乘积模型估 30×30=900；旧 max 模型估 30。
+    for (int i = 1; i <= 30; ++i) {
+        exec_ok("INSERT INTO a VALUES (" + std::to_string(i) + ", 1)");
+        exec_ok("INSERT INTO b VALUES (" + std::to_string(i) + ", 1)");
+    }
+    for (int i = 1; i <= 200; ++i)
+        exec_ok("INSERT INTO c VALUES (" + std::to_string(i) + ", " + std::to_string(i) + ")");
+    // (a⋈b) 估1=900 > c=200 → 乘积模型应把 c 换到左侧（旧模型 30<200 不会换）。
+    auto r = db->execute("EXPLAIN SELECT * FROM a JOIN b ON a.k = b.k JOIN c ON a.id = c.id", sess);
+    ASSERT_TRUE(r.rows.has_value());
+    std::string plan;
+    for (auto&& rec: *r.rows)
+        for (const auto& v: rec.values)
+            if (std::holds_alternative<std::string>(v))
+                plan += std::get<std::string>(v) + "\n";
+    const auto pos_c = plan.find("on c");
+    const auto pos_a = plan.find("on a");
+    ASSERT_NE(pos_c, std::string::npos) << plan;
+    ASSERT_NE(pos_a, std::string::npos) << plan;
+    EXPECT_LT(pos_c, pos_a) << plan;
+    // 重排不影响结果：30×30 对均匹配 c（a.id≤200）→ 900 行。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM a JOIN b ON a.k = b.k JOIN c ON a.id = c.id"), 900u);
+}
+
 TEST_F(TxnTest, PlanCacheInvalidatesOnRowCountGrowth) {
     exec_ok("CREATE TABLE t (id INT, age INT)");
     exec_ok("CREATE INDEX idx_age ON t (age)");
