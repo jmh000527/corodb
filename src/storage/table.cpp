@@ -603,6 +603,13 @@ namespace corodb {
         return storage_ ? storage_->estimate_row_count(name_, columns_) : rows_.size();
     }
 
+    std::optional<std::pair<Value, Value>> Table::index_min_max(const std::string& column) const {
+        auto it = indexes_.find(column);
+        if (it == indexes_.end() || it->second.empty())
+            return std::nullopt;
+        return std::make_pair(it->second.begin()->first, it->second.rbegin()->first);
+    }
+
     // ---------------------------------------------------------------------------
     // Catalog
     // ---------------------------------------------------------------------------

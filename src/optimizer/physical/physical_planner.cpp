@@ -182,6 +182,48 @@ namespace corodb::opt {
     }
 
     /**
+     * @brief 代价决策（OPT-2/3）：范围谓词是否值得走索引。
+     *
+     * 小表恒走索引（代价差可忽略）；大表用索引键域 [min,max]（O(1) 统计）线性估算覆盖率，
+     * 超过一半视为非选择性——超集索引逐 pk 点查 + 可见性重查比一次顺序流式扫描更贵。
+     * 非数值列/无统计时维持既有行为（走索引）。
+     */
+    static bool range_worth_index(const Table& t, const std::string& col, const std::optional<Value>& low,
+                                  const std::optional<Value>& high) {
+        constexpr std::size_t kSmallTable = 128;
+        if (t.estimated_row_count() < kSmallTable)
+            return true;
+        auto mm = t.index_min_max(col);
+        if (!mm)
+            return true;
+        auto to_num = [](const Value& v) -> std::optional<double> {
+            if (const auto* i = std::get_if<int64_t>(&v))
+                return static_cast<double>(*i);
+            if (const auto* d = std::get_if<double>(&v))
+                return *d;
+            return std::nullopt;
+        };
+        auto minv = to_num(mm->first);
+        auto maxv = to_num(mm->second);
+        if (!minv || !maxv || *maxv <= *minv)
+            return true;
+        double lo = *minv;
+        double hi = *maxv;
+        if (low.has_value()) {
+            if (auto l = to_num(*low))
+                lo = std::max(lo, *l);
+        }
+        if (high.has_value()) {
+            if (auto h = to_num(*high))
+                hi = std::min(hi, *h);
+        }
+        if (hi <= lo)
+            return true; // 空/极窄范围：索引更优
+        const double frac = (hi - lo) / (*maxv - *minv);
+        return frac <= 0.5;
+    }
+
+    /**
      * @brief 将 LogicalFilter 翻译为物理计划节点；若满足索引条件则生成 IndexScanPlan，否则生成 FilterPlan。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_filter(const LogicalFilter& f) {
@@ -228,8 +270,11 @@ namespace corodb::opt {
                         break; // Ne/Like/IsNull 等不走索引
                 }
                 if (low.has_value() || high.has_value()) {
-                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low), low_inc,
-                                                           std::move(high), high_inc);
+                    // 代价决策：非选择性范围落回 SeqScan + Filter（顺序流式扫描更优）。
+                    if (range_worth_index(*scan.table, col->name, low, high)) {
+                        return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low),
+                                                               low_inc, std::move(high), high_inc);
+                    }
                 }
             }
         }
@@ -242,7 +287,9 @@ namespace corodb::opt {
             const auto* col = std::get_if<ColumnRef>(&be.expr);
             const auto* lo = std::get_if<Literal>(&be.low);
             const auto* hi = std::get_if<Literal>(&be.high);
-            if (col && lo && hi && scan.table && scan.table->indexed_columns().count(col->name) > 0) {
+            if (col && lo && hi && scan.table && scan.table->indexed_columns().count(col->name) > 0 &&
+                range_worth_index(*scan.table, col->name, std::optional<Value>(lo->value),
+                                  std::optional<Value>(hi->value))) {
                 return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name,
                                                        std::optional<Value>(lo->value), true,
                                                        std::optional<Value>(hi->value), true);

@@ -198,6 +198,9 @@ namespace corodb {
         /** @brief 估算当前可见行数（优化器启发式用；存储型走引擎粗估，纯内存表取 rows_）。 */
         [[nodiscard]] std::size_t estimated_row_count() const;
 
+        /** @brief 已索引列的键域 [min,max]（取自有序索引首尾键，O(1)；超集近似，供优化器估算选择率）。 */
+        [[nodiscard]] std::optional<std::pair<Value, Value>> index_min_max(const std::string& column) const;
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }

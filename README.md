@@ -66,7 +66,7 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 - **Volcano 协程执行器**: C++23 `std::generator` 惰性求值，数据在算子间流水传递
 - **9 种物理算子**: SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit
 - **两段式优化器**: LogicalPlanner → 5 条重写规则定点迭代（最多 16 轮）→ PhysicalPlanner（JOIN 小表左置基于存储引擎行数统计）
-- **算子选择**: 等值/范围/集合索引条件（`=`/`<`/`>`/`BETWEEN`/`IN`）与多列等值合取（`a=? AND b=?` 命中复合索引）→ IndexScan 升级；等值 JOIN → HashJoin / MergeJoin（预排序跳过重排）；GROUP BY 匹配排序 → SortAggregate 吸收 Sort
+- **算子选择**: 等值/范围/集合索引条件（`=`/`<`/`>`/`BETWEEN`/`IN`）与多列等值合取（`a=? AND b=?` 命中复合索引）→ IndexScan 升级（大表非选择性范围按列 min/max 统计代价决策落回 SeqScan）；等值 JOIN → HashJoin / MergeJoin（预排序跳过重排）；GROUP BY 匹配排序 → SortAggregate 吸收 Sort
 - **LRU 计划缓存**: 标准化 SQL 到物理计划的缓存（默认 128 条），DDL 自动失效
 
 ### 事务系统

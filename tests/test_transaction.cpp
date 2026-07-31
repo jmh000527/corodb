@@ -1173,6 +1173,37 @@ TEST_F(TxnTest, DecorrelatedExistsHitsIndex) {
     EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
 }
 
+TEST_F(TxnTest, NonSelectiveRangeFallsBackToSeqScan) {
+    exec_ok("CREATE TABLE t (id INT, age INT)");
+    exec_ok("CREATE INDEX idx_age ON t (age)");
+    for (int i = 1; i <= 200; ++i)
+        exec_ok("INSERT INTO t VALUES (" + std::to_string(i) + ", " + std::to_string(i) + ")");
+    auto plan_of = [&](const std::string& sql) {
+        auto r = db->execute(sql, sess);
+        std::string plan;
+        for (auto&& rec: *r.rows)
+            for (const auto& v: rec.values)
+                if (std::holds_alternative<std::string>(v))
+                    plan += std::get<std::string>(v) + "\n";
+        return plan;
+    };
+    // 宽范围（覆盖几乎全域）：代价决策应落回 Seq Scan。
+    std::string wide = plan_of("EXPLAIN SELECT * FROM t WHERE age > 1");
+    EXPECT_EQ(wide.find("Index Scan"), std::string::npos) << wide;
+    EXPECT_NE(wide.find("Seq Scan"), std::string::npos) << wide;
+    // 窄范围（~5%）：仍走 Index Scan。
+    std::string narrow = plan_of("EXPLAIN SELECT * FROM t WHERE age > 190");
+    EXPECT_NE(narrow.find("Index Scan"), std::string::npos) << narrow;
+    // 两条路径语义一致。
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age > 1"), 199u);
+    EXPECT_EQ(count_rows(*db, sess, "SELECT * FROM t WHERE age > 190"), 10u);
+    // BETWEEN 同样受代价决策管控。
+    std::string wide_bt = plan_of("EXPLAIN SELECT * FROM t WHERE age BETWEEN 2 AND 199");
+    EXPECT_EQ(wide_bt.find("Index Scan"), std::string::npos) << wide_bt;
+    std::string narrow_bt = plan_of("EXPLAIN SELECT * FROM t WHERE age BETWEEN 10 AND 20");
+    EXPECT_NE(narrow_bt.find("Index Scan"), std::string::npos) << narrow_bt;
+}
+
 TEST_F(TxnTest, NotExistsNotDecorrelatedNullSemantics) {
     // NOT EXISTS 不可改写为 NOT IN：子查询列含 NULL 时二者语义不同。
     exec_ok("CREATE TABLE a (id INT)");
