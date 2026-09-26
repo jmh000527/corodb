@@ -473,16 +473,17 @@ TEST_F(StatisticsDbTest, ExplainShowsRowsAnnotation) {
     for (int i = 0; i < 40; ++i)
         EXPECT_TRUE(db_->execute("INSERT INTO t VALUES (" + std::to_string(i) + ")").is_success());
 
-    // ANALYZE 前：无统计回退粗估仍输出 (rows=N)（SeqScan rows=40 来自 estimated_row_count）。
+    // ANALYZE 前：无统计回退粗估仍输出行数（SeqScan rows=40 来自 estimated_row_count）。
     auto r1 = db_->execute("EXPLAIN SELECT * FROM t");
     std::string plan1 = rows_to_text(r1);
-    EXPECT_NE(plan1.find("(rows=40)"), std::string::npos) << plan1;
+    EXPECT_NE(plan1.find("rows=40)"), std::string::npos) << plan1;
 
-    // ANALYZE 后：过滤谓词的行数估计来自统计。
+    // ANALYZE 后：过滤谓词的行数估计来自统计（40 × 0.25 = 10），且带 cost 注解。
     EXPECT_TRUE(db_->execute("ANALYZE TABLE t").is_success());
     auto r2 = db_->execute("EXPLAIN SELECT * FROM t WHERE id < 10");
     std::string plan2 = rows_to_text(r2);
-    EXPECT_NE(plan2.find("(rows="), std::string::npos) << plan2;
+    EXPECT_NE(plan2.find("(cost="), std::string::npos) << plan2;
+    EXPECT_NE(plan2.find("rows=10)"), std::string::npos) << plan2;
     EXPECT_NE(plan2.find("Index Scan"), std::string::npos) << plan2;
 }
 
