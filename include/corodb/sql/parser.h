@@ -109,6 +109,9 @@ namespace corodb {
         /// 解析 SET TRANSACTION ISOLATION LEVEL 语句。
         [[nodiscard]] SetTransactionStmt parse_set();
 
+        /// 解析 ANALYZE 语句。
+        [[nodiscard]] AnalyzeStmt parse_analyze();
+
         /// 解析 SELECT 投影项列表。
         [[nodiscard]] std::vector<SelectStmt::SelectItem> parse_projections();
 

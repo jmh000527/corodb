@@ -16,6 +16,7 @@
 #include "corodb/executor/executor.h"
 #include "corodb/plan/logical_plan.h"
 #include "corodb/process/explain_printer.h"
+#include "corodb/storage/statistics_collector.h"
 
 namespace corodb {
 
@@ -602,6 +603,42 @@ namespace corodb {
             ProcessedQuery q;
             q.rows = build_status_rows();
             q.is_select = true;
+            return q;
+        }
+
+        // 1e) ANALYZE — 采集统计信息并持久化
+        if (auto* ana = std::get_if<AnalyzeStmt>(&stmt)) {
+            const std::string& data_dir = Config::instance().data_dir();
+            // 快照时间戳：事务内用会话快照，自动提交用 0（最新已提交）
+            const uint64_t snap_ts = session->in_transaction() ? session->snapshot_ts : 0;
+
+            StatisticsCollector collector;
+
+            if (ana->table_name.empty()) {
+                // 分析所有表
+                for (const auto& name : catalog_.table_names()) {
+                    auto t = catalog_.lookup(name);
+                    if (t) {
+                        auto stats = collector.collect(*t, snap_ts);
+                        t->update_stats(std::move(stats));
+                        t->save_stats(data_dir);
+                    }
+                }
+            } else {
+                auto t = catalog_.lookup(ana->table_name);
+                if (!t)
+                    throw std::runtime_error("[ANALYZE] Unknown table: " + ana->table_name);
+                auto stats = collector.collect(*t, snap_ts);
+                t->update_stats(std::move(stats));
+                t->save_stats(data_dir);
+            }
+
+            // 统计变化后清空计划缓存，防止旧计划使用陈旧统计
+            plan_cache_.invalidate_all();
+            session->prepared_stmts.clear();
+
+            ProcessedQuery q;
+            q.message = "ANALYZE";
             return q;
         }
 

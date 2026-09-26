@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "corodb/common/types.h"
+#include "corodb/storage/statistics.h"
 
 
 namespace corodb {
@@ -214,6 +215,24 @@ namespace corodb {
                                                                  const std::optional<Value>& high, bool high_inclusive,
                                                                  double early_exit_fraction) const;
 
+        /** @brief 获取列统计信息；无统计返回 nullptr。 */
+        [[nodiscard]] const ColumnStats* column_stats(const std::string& col) const;
+
+        /** @brief 是否已加载有效统计信息。 */
+        [[nodiscard]] bool has_stats() const noexcept { return stats_loaded_ && stats_.valid(); }
+
+        /** @brief 加载持久化统计（从 {data_dir}/{name}.stats）；文件不存在则静默跳过。 */
+        void load_stats(const std::string& data_dir);
+
+        /** @brief 持久化统计到 {data_dir}/{name}.stats。 */
+        void save_stats(const std::string& data_dir) const;
+
+        /** @brief 删除持久化统计文件 {data_dir}/{name}.stats 并清空内存缓存（DROP TABLE 调用）。 */
+        void remove_stats(const std::string& data_dir);
+
+        /** @brief 更新统计（ANALYZE 调用），同时标记为已加载。 */
+        void update_stats(TableStats new_stats);
+
         [[nodiscard]] bool loaded_from_storage() const noexcept {
             return loaded_from_storage_;
         }
@@ -258,6 +277,9 @@ namespace corodb {
         std::unordered_map<std::string, std::string> index_name_registry_; ///< 索引名 → 列名（复合为 \x1f 连接）
         /// 复合索引：索引名 → 有序列列表；条目存于 indexes_[索引名]（键为复合编码字符串）。
         std::unordered_map<std::string, std::vector<std::string>> composite_indexes_;
+
+        TableStats stats_;           ///< 列级统计缓存（ANALYZE 采集）
+        bool stats_loaded_{ false }; ///< 统计是否已加载（含加载失败标记）
 
         void index_row(const Row& row);
 

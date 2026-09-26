@@ -7,6 +7,7 @@
 
 #include <stdexcept>
 
+#include "corodb/common/config.h"
 #include "corodb/storage/storage_engine.h"
 
 namespace corodb {
@@ -83,6 +84,7 @@ namespace corodb {
                 return;
             throw std::runtime_error("[Process] Table not found: " + plan.table);
         }
+        table->remove_stats(Config::instance().data_dir());
         catalog_.unregister_table(plan.table);
         storage_.drop_table(plan.table);
     }

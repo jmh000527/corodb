@@ -740,13 +740,18 @@ namespace corodb {
         int isolation_level{ 1 };
     };
 
+    /** @struct AnalyzeStmt @brief ANALYZE 语句，采集表统计信息。 */
+    struct AnalyzeStmt {
+        std::string table_name; ///< 目标表名；空 = 所有表
+    };
+
     /** @brief SQL 语句（所有支持语句类型的 variant）。 */
     using Statement = std::variant<SelectStmt, InsertStmt, UpdateStmt, DeleteStmt, CreateStmt, CreateIndexStmt,
                                    DropTableStmt, DropIndexStmt, BeginStmt, CommitStmt, RollbackStmt,
                                    SavepointStmt, ReleaseSavepointStmt,
                                    CheckpointStmt, ShowStatusStmt,
                                    PrepareStmt, ExecuteStmt, DeallocateStmt, AuthStmt, CreateUserStmt,
-                                   SetTransactionStmt, std::shared_ptr<ExplainStmt>>;
+                                   SetTransactionStmt, AnalyzeStmt, std::shared_ptr<ExplainStmt>>;
 
     /** @brief EXPLAIN 语句 AST 节点。 */
     struct ExplainStmt {

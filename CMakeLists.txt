@@ -53,6 +53,8 @@ add_library(corodb
     src/storage/table.cpp
     src/storage/buffer_pool.cpp
     src/storage/lsm_storage_engine.cpp
+    src/storage/statistics.cpp
+    src/storage/statistics_collector.cpp
 
     # 事务
     src/txn/transaction_manager.cpp

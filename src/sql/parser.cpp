@@ -112,6 +112,8 @@ namespace corodb {
             return parse_auth(); // 解析 AUTH
         if (head == "SET")
             return parse_set(); // 解析 SET TRANSACTION ...
+        if (head == "ANALYZE")
+            return parse_analyze(); // 解析 ANALYZE
         throw std::runtime_error("[Parser] Unsupported statement type: " + head);
     }
 
@@ -1616,6 +1618,18 @@ namespace corodb {
             throw std::runtime_error("[Parser] Unknown isolation level: " + first);
         }
         return out;
+    }
+
+    AnalyzeStmt Parser::parse_analyze() {
+        consume(); // consume ANALYZE
+        AnalyzeStmt stmt;
+        // 可选 TABLE 关键字
+        match_keyword("TABLE");
+        // 可选表名；无表名 = 分析所有表
+        if (peek_is_identifier()) {
+            stmt.table_name = consume_identifier();
+        }
+        return stmt;
     }
 
 } // namespace corodb

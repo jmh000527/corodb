@@ -5,9 +5,12 @@
 
 #include "corodb/storage/table.h"
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <stdexcept>
 
+#include "corodb/common/config.h"
 #include "corodb/storage/storage_engine.h"
 #include "corodb/storage/storage_engine_common.h"
 
@@ -159,6 +162,9 @@ namespace corodb {
             for (const auto& [ckey, pk]: entries)
                 idx.emplace(ckey, pk);
         }
+
+        // 加载持久化统计信息（文件不存在则静默跳过）
+        load_stats(Config::instance().data_dir());
     }
 
     /**
@@ -604,6 +610,10 @@ namespace corodb {
     }
 
     std::optional<std::pair<Value, Value>> Table::index_min_max(const std::string& column) const {
+        // 优先读持久化统计（直方图首尾边界 = min/max）
+        if (auto* s = column_stats(column); s && s->histogram_bounds.size() >= 2)
+            return std::make_pair(s->histogram_bounds.front(), s->histogram_bounds.back());
+        // 回退：有序索引首尾键（O(1)）
         auto it = indexes_.find(column);
         if (it == indexes_.end() || it->second.empty())
             return std::nullopt;
@@ -611,6 +621,10 @@ namespace corodb {
     }
 
     std::size_t Table::index_distinct_count(const std::string& column, std::size_t cap) const {
+        // 优先读持久化统计（NDV）
+        if (auto* s = column_stats(column); s && s->ndistinct > 0)
+            return std::min(s->ndistinct, cap);
+        // 回退：从索引结构现算（upper_bound 跳跃计数，达 cap 终止）
         auto it = indexes_.find(column);
         if (it == indexes_.end())
             return 0;
@@ -637,6 +651,52 @@ namespace corodb {
         for (auto iter = begin; iter != end && count <= cap; ++iter)
             ++count;
         return static_cast<double>(count) / total;
+    }
+
+    // ---------------------------------------------------------------------------
+    // 统计信息持久化
+    // ---------------------------------------------------------------------------
+
+    const ColumnStats* Table::column_stats(const std::string& col) const {
+        return stats_.column(col);
+    }
+
+    void Table::load_stats(const std::string& data_dir) {
+        stats_loaded_ = true; // 标记已尝试加载（含失败）
+        std::filesystem::path stats_path = std::filesystem::path(data_dir) / (name_ + ".stats");
+        if (!std::filesystem::exists(stats_path))
+            return;
+        std::ifstream ifs(stats_path, std::ios::binary);
+        if (!ifs)
+            return;
+        std::string data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        auto loaded = TableStats::deserialize(data);
+        if (loaded) {
+            stats_ = std::move(*loaded);
+        }
+    }
+
+    void Table::save_stats(const std::string& data_dir) const {
+        std::filesystem::path stats_path = std::filesystem::path(data_dir) / (name_ + ".stats");
+        // 确保目录存在
+        std::filesystem::create_directories(data_dir);
+        std::ofstream ofs(stats_path, std::ios::binary | std::ios::trunc);
+        if (!ofs)
+            return;
+        std::string data = stats_.serialize();
+        ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+
+    void Table::update_stats(TableStats new_stats) {
+        stats_ = std::move(new_stats);
+        stats_loaded_ = true;
+    }
+
+    void Table::remove_stats(const std::string& data_dir) {
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::path(data_dir) / (name_ + ".stats"), ec);
+        stats_ = TableStats{};
+        stats_loaded_ = false;
     }
 
     // ---------------------------------------------------------------------------
