@@ -139,8 +139,15 @@ namespace corodb {
             return std::string(static_cast<std::size_t>(depth * 2 + 4), ' ');
         }
 
-        /** @brief 算子标题行的估计注解：(rows=N)（estimated_rows>0 时输出）。 */
+        /** @brief 算子标题行的估计注解（PostgreSQL 风格）：
+         *  cost>0 → " (cost=0.00..123.45 rows=42)"；否则仅 " (rows=N)"（行数>0 时）。 */
         static std::string rows_annotation(const PlanNode& n) {
+            if (n.total_cost > 0.0) {
+                std::ostringstream buf;
+                buf << " (cost=" << std::fixed << std::setprecision(2) << n.startup_cost << ".." << n.total_cost
+                    << " rows=" << n.estimated_rows << ")";
+                return buf.str();
+            }
             if (n.estimated_rows == 0)
                 return {};
             return " (rows=" + std::to_string(n.estimated_rows) + ")";

@@ -132,8 +132,8 @@ Value 编码：tag(1) + data
 **文件落盘路径**：`{data_dir}/{table_name}.stats`（与 SSTable 文件同目录，CHECKPOINT 时一并刷盘）。
 
 ### 验收标准
-- [ ] `ColumnStats` 可序列化/反序列化 round-trip 无损
-- [ ] 空统计 `deserialize` 返回 `nullopt` 不崩溃
+- [x] `ColumnStats` 可序列化/反序列化 round-trip 无损
+- [x] 空统计 `deserialize` 返回 `nullopt` 不崩溃
 - [x] 编译通过（加入 CMakeLists `add_library(corodb ...)`）
 
 ---
@@ -231,9 +231,9 @@ namespace corodb {
 - `correction_factor` 默认 1.0（保守），后续可换 Charikar 估计
 
 ### 验收标准
-- [ ] 10 万行均匀分布整数列：NDV 估算误差 < 15%
-- [ ] 倾斜列（90% 值=1，10% 随机）：MCV 捕获值=1，freq ≈ 0.9
-- [ ] NULL 比例准确
+- [x] 10 万行均匀分布整数列：NDV 估算误差 < 15%
+- [x] 倾斜列（90% 值=1，10% 随机）：MCV 捕获值=1，freq ≈ 0.9
+- [x] NULL 比例准确
 - [x] 采集过程不 OOM（流式采样，不物化全表）
 
 ---
@@ -491,10 +491,10 @@ namespace corodb::opt {
 2. 注意去重（相同值只算一次）
 
 ### 验收标准
-- [ ] 均匀分布 1000 值列，等值选择率 ≈ 0.001
-- [ ] MCV 中值的选择率精确返回高频
-- [ ] 范围 `> p50` 的选择率 ≈ 0.5（直方图分桶准确）
-- [ ] 无统计时不崩溃，返回合理默认值
+- [x] 均匀分布 1000 值列，等值选择率 ≈ 0.001
+- [x] MCV 中值的选择率精确返回高频
+- [x] 范围 `> p50` 的选择率 ≈ 0.5（直方图分桶准确）
+- [x] 无统计时不崩溃，返回合理默认值
 
 ---
 
@@ -564,9 +564,9 @@ auto_analyze_threshold = 0.1
 ```
 
 ### 验收标准
-- [ ] 配置文件中 `[statistics]` 段可被正确加载
-- [ ] 未配置时使用默认值
-- [ ] `genconfig` 生成的配置文件包含 `[statistics]` 段
+- [x] 配置文件中 `[statistics]` 段可被正确加载
+- [x] 未配置时使用默认值
+- [x] `genconfig` 生成的配置文件包含 `[statistics]` 段
 
 ---
 
@@ -615,9 +615,9 @@ Seq Scan on employees (rows=5000)
 **注意**：Phase 1 仅做行数估算填充，不做代价比较（Phase 2 的任务）。此处填充为 Phase 2 铺路。
 
 ### 验收标准
-- [ ] `EXPLAIN SELECT * FROM employees WHERE dept='Eng'` 输出含 `(rows=N)`
-- [ ] ANALYZE 后估算行数更准确
-- [ ] 无统计时 `(rows=N)` 仍输出（回退粗估）
+- [x] `EXPLAIN SELECT * FROM employees WHERE dept='Eng'` 输出含 `(rows=N)`
+- [x] ANALYZE 后估算行数更准确
+- [x] 无统计时 `(rows=N)` 仍输出（回退粗估）
 
 ---
 
@@ -663,9 +663,9 @@ if (table->rows_since_analyze() > 0) {
 若表无统计（`!has_stats()`）且行数 > 0，首次查询该表时触发一次 ANALYZE。
 
 ### 验收标准
-- [ ] 插入 10% 行数后下次查询自动 ANALYZE
-- [ ] 首次查询无统计表触发 ANALYZE
-- [ ] 自动 ANALYZE 不阻塞写入（同步实现时 ANALYZE 在 DML 之后）
+- [x] 插入 10% 行数后下次查询自动 ANALYZE
+- [x] 首次查询无统计表触发 ANALYZE
+- [x] 自动 ANALYZE 不阻塞写入（同步实现时 ANALYZE 在 DML 之后）
 
 ---
 
@@ -735,10 +735,10 @@ add_module_test(statistics)
 并在 `corodb_tests` 源文件列表中追加 `tests/test_statistics.cpp`。
 
 ### 验收标准
-- [ ] 全部测试通过
-- [ ] 均匀分布 NDV 估算误差 < 15%
-- [ ] 倾斜列 MCV 正确捕获
-- [ ] 序列化 round-trip 无损
+- [x] 全部测试通过
+- [x] 均匀分布 NDV 估算误差 < 15%
+- [x] 倾斜列 MCV 正确捕获
+- [x] 序列化 round-trip 无损
 
 ---
 

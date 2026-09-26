@@ -3,6 +3,11 @@
 > 目标：将 CoroDB 优化器从「启发式两段式重写器」推进到「商业级代价驱动优化器」。
 > 评估基准：PostgreSQL / 金仓（KingbaseES）/ Oracle 的优化器能力栈。
 > 编写日期：2026-08-13
+>
+> **实施进度（2026-09-27）**：
+> - ✅ Phase 1 统计基础设施完成：ANALYZE 命令、.stats 持久化、MCV/等高直方图/NDV/null_frac 采集（NDV 采样升级为 MLE 估计）、[statistics] 配置节、选择性估计库（eq/range/in/is_null + AND/OR）、EXPLAIN (cost=..rows=) 注解、auto-ANALYZE（首次查询 + 10% 陈旧触发 + stats_ts 计划缓存指纹）。tests/test_statistics.cpp 26 用例。
+> - ✅ Phase 2 统一代价模型完成：Cost{startup,total}（PG 对齐参数、[optimizer] 配置节）、全算子代价函数（SeqScan/IndexScan 含 correlation 修正/Filter/Sort/Top-N/Hash 与 Sort 聚合/Hash 与 Merge 与 NL 连接）、访问路径与连接算法代价比较（小表短路 + 无统计回退旧阈值 + cost_model 开关）。correlation 字段首次被消费。
+> - ⬜ Phase 3+（DP 连接枚举、去关联、Hybrid Hash、并行）待实施。
 
 ---
 

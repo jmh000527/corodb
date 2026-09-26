@@ -84,7 +84,7 @@ namespace corodb {
                 return;
             throw std::runtime_error("[Process] Table not found: " + plan.table);
         }
-        table->remove_stats(Config::instance().data_dir());
+        table->remove_stats();
         catalog_.unregister_table(plan.table);
         storage_.drop_table(plan.table);
     }

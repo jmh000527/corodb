@@ -27,6 +27,11 @@ namespace corodb {
         /** @brief 创建 LSM 存储引擎实例。 */
         explicit LSMTreeEngine(std::string base_dir, std::size_t buffer_pages = 256);
 
+        /** @brief 存储基础目录（表附属文件如 .stats 的落盘位置）。 */
+        [[nodiscard]] std::string base_dir() const override {
+            return base_dir_;
+        }
+
         /** @brief 注入压缩时可见性 GC 的安全水位回调。 */
         void set_gc_horizon(std::function<uint64_t()> fn) {
             gc_horizon_fn_ = std::move(fn);

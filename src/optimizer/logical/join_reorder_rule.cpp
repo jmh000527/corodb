@@ -6,13 +6,31 @@
 #include <algorithm>
 
 #include "corodb/optimizer/logical/join_reorder_rule.h"
+#include "corodb/optimizer/stats/selectivity.h"
 #include "corodb/storage/table.h"
 
 namespace corodb::opt {
 
     namespace detail {
 
-        // 估算子树基数：Scan 用真实行数；Filter 1/3；Aggregate 1/10；
+        /** @brief 逻辑子树的单表来源（下钻 Filter/Project 到 Scan）；多表返回 nullptr。 */
+        const Table* driving_table_of(const LogicalPlan& p) {
+            return std::visit(
+                    [&](const auto& n) -> const Table* {
+                        using T = std::decay_t<decltype(n)>;
+                        if constexpr (std::is_same_v<T, LogicalScan>) {
+                            return n.table.get();
+                        } else if constexpr (requires { n.child; }) {
+                            return n.child ? driving_table_of(*n.child) : nullptr;
+                        } else {
+                            return nullptr;
+                        }
+                    },
+                    p.node);
+        }
+
+        // 估算子树基数：Scan 用真实行数；Filter 按统计选择性（无统计 1/3）；
+        // Aggregate 按组键 NDV 乘积（无统计 1/10）；
         // **Join 乘积模型**：内联输出基数 = L×R / max(NDV_join_key_left, NDV_join_key_right)。
         // 若无等值 ON 或无 NDV（无索引），回退到保守估算 max(L,R)。
         std::size_t estimate_subtree_size(const LogicalPlan& p) {
@@ -59,10 +77,42 @@ namespace corodb::opt {
                             return std::max<std::size_t>(std::max(l, r), 1);
                         } else if constexpr (std::is_same_v<T, LogicalAggregate>) {
                             std::size_t c = n.child ? estimate_subtree_size(*n.child) : 0;
+                            if (n.group_by.empty())
+                                return 1;
+                            // 组数 ≈ min(输入行数, 组键 NDV 乘积)；不可解析回退 1/10。
+                            const Table* t = n.child ? driving_table_of(*n.child) : nullptr;
+                            double g = 1.0;
+                            if (t) {
+                                for (const auto& e: n.group_by) {
+                                    if (auto* col = std::get_if<ColumnRef>(&e)) {
+                                        const double ndv =
+                                                static_cast<double>(t->index_distinct_count(col->name, 10000));
+                                        if (ndv <= 0) {
+                                            g = 0.0;
+                                            break;
+                                        }
+                                        g *= ndv;
+                                        if (g > 1e15)
+                                            break;
+                                    } else {
+                                        g = 0.0;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                g = 0.0;
+                            }
+                            if (g > 0.0)
+                                return std::max<std::size_t>(
+                                        1, static_cast<std::size_t>(std::min<double>(g, static_cast<double>(c))));
                             return std::max<std::size_t>(c / 10, 1);
                         } else if constexpr (std::is_same_v<T, LogicalFilter>) {
                             std::size_t c = n.child ? estimate_subtree_size(*n.child) : 0;
-                            return std::max<std::size_t>(c / 3, 1);
+                            // 统计驱动的选择性（无统计回退 1/3）。
+                            const Table* t = n.child ? driving_table_of(*n.child) : nullptr;
+                            const double sel = t ? SelectivityEstimator::estimate_filter_selectivity(*t, n.predicate)
+                                                 : 1.0 / 3.0;
+                            return std::max<std::size_t>(static_cast<std::size_t>(static_cast<double>(c) * sel), 1);
                         } else if constexpr (requires { n.child; }) {
                             return n.child ? estimate_subtree_size(*n.child) : 0;
                         } else if constexpr (std::is_same_v<T, LogicalDML>) {

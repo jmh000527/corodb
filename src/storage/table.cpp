@@ -168,7 +168,7 @@ namespace corodb {
         }
 
         // 加载持久化统计信息（文件不存在则静默跳过）
-        load_stats(Config::instance().data_dir());
+        load_stats();
     }
 
     /**
@@ -669,9 +669,9 @@ namespace corodb {
         return stats_.column(col);
     }
 
-    void Table::load_stats(const std::string& data_dir) {
+    void Table::load_stats() {
         stats_loaded_ = true; // 标记已尝试加载（含失败）
-        std::filesystem::path stats_path = std::filesystem::path(data_dir) / (name_ + ".stats");
+        std::filesystem::path stats_path = std::filesystem::path(stats_dir()) / (name_ + ".stats");
         if (!std::filesystem::exists(stats_path))
             return;
         std::ifstream ifs(stats_path, std::ios::binary);
@@ -684,10 +684,11 @@ namespace corodb {
         }
     }
 
-    void Table::save_stats(const std::string& data_dir) const {
-        std::filesystem::path stats_path = std::filesystem::path(data_dir) / (name_ + ".stats");
+    void Table::save_stats() const {
+        const std::string dir = stats_dir();
+        std::filesystem::path stats_path = std::filesystem::path(dir) / (name_ + ".stats");
         // 确保目录存在
-        std::filesystem::create_directories(data_dir);
+        std::filesystem::create_directories(dir);
         std::ofstream ofs(stats_path, std::ios::binary | std::ios::trunc);
         if (!ofs)
             return;
@@ -701,12 +702,22 @@ namespace corodb {
         rows_since_analyze_ = 0;
     }
 
-    void Table::remove_stats(const std::string& data_dir) {
+    void Table::remove_stats() {
         std::error_code ec;
-        std::filesystem::remove(std::filesystem::path(data_dir) / (name_ + ".stats"), ec);
+        std::filesystem::remove(std::filesystem::path(stats_dir()) / (name_ + ".stats"), ec);
         stats_ = TableStats{};
         stats_loaded_ = false;
         rows_since_analyze_ = 0;
+    }
+
+    std::string Table::stats_dir() const {
+        // 统计跟随表自己的数据库目录，避免不同库（或测试）间同名表互相污染。
+        if (storage_) {
+            const std::string dir = storage_->base_dir();
+            if (!dir.empty())
+                return dir;
+        }
+        return Config::instance().data_dir();
     }
 
     // ---------------------------------------------------------------------------

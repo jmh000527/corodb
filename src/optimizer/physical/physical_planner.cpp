@@ -6,10 +6,13 @@
 #include "corodb/optimizer/physical/physical_planner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
+#include "corodb/common/config.h"
+#include "corodb/optimizer/cost/cost_model.h"
 #include "corodb/optimizer/stats/selectivity.h"
 #include "corodb/storage/storage_engine_base.h"
 #include "corodb/storage/table.h"
@@ -135,7 +138,7 @@ namespace corodb::opt {
         }
 
         // ------------------------------------------------------------------
-        // 基数估计标注（T1.7）：自底向上填 PlanNode::estimated_rows
+        // 基数 + 代价标注（T1.7 + Phase 2）：自底向上填 estimated_rows 与 cost
         // ------------------------------------------------------------------
 
         /** @brief 子树的单表来源（Filter/Project 下钻到扫描）；多表或未知返回 nullptr。 */
@@ -153,29 +156,24 @@ namespace corodb::opt {
             return nullptr;
         }
 
-        /** @brief IndexScan 输出估计：表行数 × 索引条件选择率（等值/范围/IN/复合）。 */
-        std::size_t estimate_index_scan_rows(const IndexScanPlan& idx) {
+        /** @brief IndexScan 索引条件选择率（等值/范围/IN/复合）。 */
+        double index_scan_selectivity(const IndexScanPlan& idx) {
             const Table& t = *idx.table;
-            const std::size_t base = t.estimated_row_count();
-            if (base == 0)
-                return 0;
             const ColumnStats* cs = t.column_stats(idx.column);
-            double sel;
             if (idx.is_composite) {
-                sel = 1.0;
+                double sel = 1.0;
                 for (std::size_t i = 0; i < idx.composite_columns.size() && i < idx.composite_key.size(); ++i) {
                     sel *= opt::SelectivityEstimator::selectivity_eq(t.column_stats(idx.composite_columns[i]),
                                                                     idx.composite_key[i]);
                 }
-            } else if (idx.is_in) {
-                sel = opt::SelectivityEstimator::selectivity_in_list(cs, idx.in_keys);
-            } else if (idx.is_range) {
-                sel = opt::SelectivityEstimator::selectivity_range(cs, idx.low, idx.low_inclusive, idx.high,
-                                                                   idx.high_inclusive);
-            } else {
-                sel = opt::SelectivityEstimator::selectivity_eq(cs, idx.key);
+                return sel;
             }
-            return std::max<std::size_t>(1, static_cast<std::size_t>(static_cast<double>(base) * sel));
+            if (idx.is_in)
+                return opt::SelectivityEstimator::selectivity_in_list(cs, idx.in_keys);
+            if (idx.is_range)
+                return opt::SelectivityEstimator::selectivity_range(cs, idx.low, idx.low_inclusive, idx.high,
+                                                                   idx.high_inclusive);
+            return opt::SelectivityEstimator::selectivity_eq(cs, idx.key);
         }
 
         /** @brief 连接输出估计：|L|×|R|/max(NDV_left, NDV_right)，NDV 不可解析回退 max(L,R)。 */
@@ -191,108 +189,188 @@ namespace corodb::opt {
             return std::max<std::size_t>(std::max(l, r), 1);
         }
 
-        /** @brief 递归标注：先子后父。 */
-        void annotate_rows(PlanNode* node) {
+        /** @brief 分组数估计：min(输入行数, 组键 NDV 乘积)；NDV 不可解析回退 child/10；全局聚合为 1。 */
+        std::size_t estimate_group_count(const PlanNode* child, const std::vector<ColumnRef>& group_by) {
+            const std::size_t child_rows = child ? child->estimated_rows : 0;
+            if (group_by.empty())
+                return 1;
+            double g = 1.0;
+            if (const Table* t = driving_table(child)) {
+                for (const auto& grp: group_by) {
+                    const double ndv = static_cast<double>(t->index_distinct_count(grp.name, 10000));
+                    if (ndv <= 0) {
+                        g = 0.0;
+                        break;
+                    }
+                    g *= ndv;
+                    if (g > 1e15)
+                        break;
+                }
+            } else {
+                g = 0.0;
+            }
+            return g > 0.0
+                       ? std::max<std::size_t>(1, static_cast<std::size_t>(
+                                                          std::min<double>(g, static_cast<double>(child_rows))))
+                       : std::max<std::size_t>(child_rows / 10, 1);
+        }
+
+        /** @brief 递归标注：先子后父，填 estimated_rows 与 startup/total_cost。 */
+        void annotate(PlanNode* node) {
             if (!node)
                 return;
+            const opt::CostModel cm{ opt::CostModel::Params::from_config() };
+            const auto rows_of = [](const PlanNode* n) {
+                return n ? static_cast<double>(n->estimated_rows) : 0.0;
+            };
+            const auto total_of = [](const PlanNode* n) {
+                return n ? n->total_cost : 0.0;
+            };
+            const auto startup_of = [](const PlanNode* n) {
+                return n ? n->startup_cost : 0.0;
+            };
+
             if (auto* seq = dynamic_cast<SeqScanPlan*>(node)) {
                 seq->estimated_rows = seq->table ? seq->table->estimated_row_count() : 0;
+                const Cost c = cm.seq_scan(static_cast<double>(seq->estimated_rows));
+                seq->startup_cost = c.startup;
+                seq->total_cost = c.total;
                 return;
             }
             if (auto* idx = dynamic_cast<IndexScanPlan*>(node)) {
-                idx->estimated_rows = idx->table ? estimate_index_scan_rows(*idx) : 0;
+                const std::size_t base = idx->table ? idx->table->estimated_row_count() : 0;
+                const double sel = idx->table ? index_scan_selectivity(*idx) : 0.0;
+                const double out = static_cast<double>(base) * sel;
+                idx->estimated_rows = base == 0 ? 0 : std::max<std::size_t>(1, static_cast<std::size_t>(out));
+                const double corr = idx->table ? [&] {
+                    if (const ColumnStats* cs = idx->table->column_stats(idx->column))
+                        return cs->correlation;
+                    return 0.0;
+                }()
+                                               : 0.0;
+                const Cost c = cm.index_scan(out, static_cast<double>(base), corr);
+                idx->startup_cost = c.startup;
+                idx->total_cost = c.total;
                 return;
             }
             if (auto* fil = dynamic_cast<FilterPlan*>(node)) {
-                annotate_rows(fil->child.get());
-                const PlanNode* c = fil->child.get();
+                annotate(fil->child.get());
                 double sel = 1.0 / 3.0; // 无统计回退（与 R5 旧模型一致）
-                if (const Table* t = driving_table(c))
+                if (const Table* t = driving_table(fil->child.get()))
                     sel = opt::SelectivityEstimator::estimate_filter_selectivity(*t, fil->predicate);
-                fil->estimated_rows =
-                        c ? std::max<std::size_t>(1, static_cast<std::size_t>(static_cast<double>(c->estimated_rows) * sel))
-                          : 0;
+                const double child_rows = rows_of(fil->child.get());
+                fil->estimated_rows = fil->child
+                                              ? std::max<std::size_t>(
+                                                        1, static_cast<std::size_t>(child_rows * sel))
+                                              : 0;
+                const Cost c = cm.filter(total_of(fil->child.get()), child_rows);
+                fil->startup_cost = c.startup;
+                fil->total_cost = c.total;
                 return;
             }
             if (auto* proj = dynamic_cast<ProjectPlan*>(node)) {
-                annotate_rows(proj->child.get());
+                annotate(proj->child.get());
                 proj->estimated_rows = proj->child ? proj->child->estimated_rows : 0;
+                proj->startup_cost = startup_of(proj->child.get());
+                proj->total_cost = total_of(proj->child.get());
                 return;
             }
             if (auto* un = dynamic_cast<UnionPlan*>(node)) {
-                std::size_t total = 0;
+                double total = 0.0;
+                std::size_t rows = 0;
                 for (auto& c: un->children) {
-                    annotate_rows(c.get());
-                    total += c ? c->estimated_rows : 0;
+                    annotate(c.get());
+                    total += total_of(c.get());
+                    rows += c ? c->estimated_rows : 0;
                 }
-                un->estimated_rows = total;
+                un->estimated_rows = rows;
+                const Cost c = cm.union_(total);
+                un->startup_cost = c.startup;
+                un->total_cost = c.total;
                 return;
             }
             if (auto* hash = dynamic_cast<HashJoinPlan*>(node)) {
-                annotate_rows(hash->left.get());
-                annotate_rows(hash->right.get());
+                annotate(hash->left.get());
+                annotate(hash->right.get());
                 hash->estimated_rows =
                         estimate_join_rows(hash->left ? hash->left->estimated_rows : 1,
                                            hash->right ? hash->right->estimated_rows : 1,
                                            driving_table(hash->left.get()), driving_table(hash->right.get()),
                                            hash->left_key, hash->right_key);
+                const Cost c = cm.hash_join(total_of(hash->left.get()), total_of(hash->right.get()),
+                                            rows_of(hash->left.get()), rows_of(hash->right.get()),
+                                            static_cast<double>(hash->estimated_rows));
+                hash->startup_cost = c.startup;
+                hash->total_cost = c.total;
                 return;
             }
             if (auto* merge = dynamic_cast<MergeJoinPlan*>(node)) {
-                annotate_rows(merge->left.get());
-                annotate_rows(merge->right.get());
+                annotate(merge->left.get());
+                annotate(merge->right.get());
                 merge->estimated_rows =
                         estimate_join_rows(merge->left ? merge->left->estimated_rows : 1,
                                            merge->right ? merge->right->estimated_rows : 1,
                                            driving_table(merge->left.get()), driving_table(merge->right.get()),
                                            merge->left_key, merge->right_key);
+                const bool l_sorted = merge->left_sorted;
+                const bool r_sorted = merge->right_sorted;
+                const Cost c =
+                        cm.merge_join(total_of(merge->left.get()), total_of(merge->right.get()),
+                                      rows_of(merge->left.get()), rows_of(merge->right.get()),
+                                      static_cast<double>(merge->estimated_rows), !l_sorted, !r_sorted);
+                merge->startup_cost = c.startup;
+                merge->total_cost = c.total;
                 return;
             }
             if (auto* nl = dynamic_cast<NestedLoopJoinPlan*>(node)) {
-                annotate_rows(nl->left.get());
-                annotate_rows(nl->right.get());
+                annotate(nl->left.get());
+                annotate(nl->right.get());
                 // 非等值连接无 NDV 模型：保守取 max(L,R)。
                 nl->estimated_rows = std::max<std::size_t>(
                         std::max(nl->left ? nl->left->estimated_rows : 0,
                                  nl->right ? nl->right->estimated_rows : 0),
                         1);
+                const Cost c = cm.nested_loop(total_of(nl->left.get()), total_of(nl->right.get()),
+                                              rows_of(nl->left.get()),
+                                              static_cast<double>(nl->estimated_rows));
+                nl->startup_cost = c.startup;
+                nl->total_cost = c.total;
                 return;
             }
             if (auto* agg = dynamic_cast<AggregatePlan*>(node)) {
-                annotate_rows(agg->child.get());
+                annotate(agg->child.get());
                 const std::size_t child_rows = agg->child ? agg->child->estimated_rows : 0;
-                if (agg->group_by.empty()) {
-                    agg->estimated_rows = 1;
-                    return;
-                }
-                // 分组数 ≈ min(输入行数, 组键 NDV 乘积)；不可解析回退 child/10。
-                double groups = 1.0;
-                if (const Table* t = driving_table(agg->child.get())) {
-                    for (const auto& g: agg->group_by) {
-                        double ndv = static_cast<double>(t->index_distinct_count(g.name, 10000));
-                        if (ndv <= 0) {
-                            groups = 0.0;
-                            break;
-                        }
-                        groups *= ndv;
-                        if (groups > 1e15)
-                            break;
-                    }
-                }
-                if (groups > 0.0)
-                    agg->estimated_rows = std::max<std::size_t>(
-                            1, static_cast<std::size_t>(std::min<double>(groups, static_cast<double>(child_rows))));
-                else
-                    agg->estimated_rows = std::max<std::size_t>(child_rows / 10, 1);
+                agg->estimated_rows = estimate_group_count(agg->child.get(), agg->group_by);
+                const double crows = static_cast<double>(child_rows);
+                const Cost c =
+                        agg->strategy == AggregatePlan::Strategy::Sort
+                                ? cm.sort_aggregate(total_of(agg->child.get()), crows)
+                                : cm.hash_aggregate(total_of(agg->child.get()), crows,
+                                                    static_cast<double>(agg->estimated_rows));
+                agg->startup_cost = c.startup;
+                agg->total_cost = c.total;
                 return;
             }
             if (auto* ord = dynamic_cast<OrderByPlan*>(node)) {
-                annotate_rows(ord->child.get());
+                annotate(ord->child.get());
                 ord->estimated_rows = ord->child ? ord->child->estimated_rows : 0;
+                const double crows = rows_of(ord->child.get());
+                if (ord->limit.has_value()) {
+                    // Top-N：K 元堆只保前 K 小。
+                    const double k = static_cast<double>(*ord->limit) +
+                                     static_cast<double>(ord->offset.value_or(0));
+                    const Cost c = cm.top_n_sort(total_of(ord->child.get()), crows, k);
+                    ord->startup_cost = c.startup;
+                    ord->total_cost = c.total;
+                } else {
+                    const Cost c = cm.sort(total_of(ord->child.get()), crows, crows);
+                    ord->startup_cost = c.startup;
+                    ord->total_cost = c.total;
+                }
                 return;
             }
             if (auto* lim = dynamic_cast<LimitPlan*>(node)) {
-                annotate_rows(lim->child.get());
+                annotate(lim->child.get());
                 const std::size_t child_rows = lim->child ? lim->child->estimated_rows : 0;
                 std::size_t rows = child_rows;
                 if (lim->offset.has_value())
@@ -302,9 +380,12 @@ namespace corodb::opt {
                 if (lim->limit.has_value())
                     rows = std::min<std::size_t>(rows, static_cast<std::size_t>(*lim->limit));
                 lim->estimated_rows = rows;
+                const Cost c = cm.limit(total_of(lim->child.get()));
+                lim->startup_cost = c.startup;
+                lim->total_cost = c.total;
                 return;
             }
-            // DML 计划：行数估计无意义，保持 0。
+            // DML/DDL 计划：估计无意义，保持 0。
         }
     } // namespace
 
@@ -314,17 +395,15 @@ namespace corodb::opt {
      * @return 物理计划根节点。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::plan(const LogicalPlan& lp) {
-        auto plan = visit(lp);
-        // T1.7：自底向上标注估计行数（EXPLAIN rows=N；Phase 2 代价模型在同字段上扩展 cost）。
-        annotate_rows(plan.get());
-        return plan;
+        // visit() 逐节点标注估计行数与代价（自底向上），build_* 决策可直接读取子树代价。
+        return visit(lp);
     }
 
     /**
-     * @brief 按节点类型分发到对应的 build_* 方法。
+     * @brief 按节点类型分发到对应的 build_* 方法；构建后立即标注估计。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::visit(const LogicalPlan& lp) {
-        return std::visit(
+        std::unique_ptr<PlanNode> node = std::visit(
                 [&](const auto& n) -> std::unique_ptr<PlanNode> {
                     using T = std::decay_t<decltype(n)>;
                     if constexpr (std::is_same_v<T, LogicalScan>)
@@ -350,6 +429,9 @@ namespace corodb::opt {
                     }
                 },
                 lp.node);
+        // T1.7 + Phase 2：自底向上填 estimated_rows 与 cost（EXPLAIN 展示 + 上层代价决策输入）。
+        annotate(node.get());
+        return node;
     }
 
     /**
@@ -424,8 +506,34 @@ namespace corodb::opt {
 
     /**
      * @brief 将 LogicalFilter 翻译为物理计划节点；若满足索引条件则生成 IndexScanPlan，否则生成 FilterPlan。
+     *
+     * 访问路径决策（Phase 2，G1）：IndexScan 与 SeqScan+Filter 双候选按总代价比较；
+     * 小表（<128 行）短路走索引；代价模型关闭（[optimizer].cost_model=false）或表无统计时
+     * 回退旧阈值启发式（OPT-2/3/6），保证估计缺失时的行为不变。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_filter(const LogicalFilter& f) {
+        // 代价比较：IndexScan 与 SeqScan+Filter 双候选（需子扫描已标注代价）。
+        // 返回 nullopt = 应回退旧阈值启发式。
+        auto index_beats_seq_scan = [&](const Table& t, double sel, double corr) -> std::optional<bool> {
+            constexpr std::size_t kSmallTable = 128;
+            if (t.estimated_row_count() < kSmallTable)
+                return true;
+            if (!Config::instance().cost_model_enabled() || !t.has_stats())
+                return std::nullopt;
+            auto seq_node = visit(*f.child); // 已标注的 SeqScan 候选
+            const opt::CostModel cm{ opt::CostModel::Params::from_config() };
+            const double base = static_cast<double>(seq_node->estimated_rows);
+            const Cost idx = cm.index_scan(base * sel, base, corr);
+            const Cost seq = cm.filter(seq_node->total_cost, base);
+            return idx < seq;
+        };
+        // 列统计的物理相关性（无统计为 0 → 全随机读计价）。
+        auto col_correlation = [](const Table& t, const std::string& col) -> double {
+            if (const ColumnStats* cs = t.column_stats(col))
+                return cs->correlation;
+            return 0.0;
+        };
+
         // IndexScan 选择：当 child 为 Scan 且 predicate 为单一比较（列 OP 字面量）且该列已建索引，
         // 则升级为 IndexScan（等值或范围）取代 SeqScan + Filter。
         if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::Comparison &&
@@ -446,8 +554,14 @@ namespace corodb::opt {
             }
             if (col && lit && scan.table && scan.table->indexed_columns().count(col->name) > 0) {
                 if (op == CompareOp::Eq) {
+                    const double sel = opt::SelectivityEstimator::selectivity_eq(
+                            scan.table->column_stats(col->name), lit->value);
+                    auto decision =
+                            index_beats_seq_scan(*scan.table, sel, col_correlation(*scan.table, col->name));
                     // 代价决策：低基数列的等值非选择性，落回 SeqScan + Filter。
-                    if (equality_worth_index(*scan.table, col->name)) {
+                    const bool use_index =
+                            decision.has_value() ? *decision : equality_worth_index(*scan.table, col->name);
+                    if (use_index) {
                         return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, lit->value);
                     }
                 } else {
@@ -472,8 +586,16 @@ namespace corodb::opt {
                             break; // Ne/Like/IsNull 等不走索引
                     }
                     if (low.has_value() || high.has_value()) {
+                        const double sel = opt::SelectivityEstimator::selectivity_range(
+                                scan.table->column_stats(col->name), low, low_inc, high, high_inc);
+                        auto decision =
+                                index_beats_seq_scan(*scan.table, sel, col_correlation(*scan.table, col->name));
                         // 代价决策：非选择性范围落回 SeqScan + Filter（顺序流式扫描更优）。
-                        if (range_worth_index(*scan.table, col->name, low, low_inc, high, high_inc)) {
+                        const bool use_index = decision.has_value()
+                                                   ? *decision
+                                                   : range_worth_index(*scan.table, col->name, low, low_inc, high,
+                                                                       high_inc);
+                        if (use_index) {
                             return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(low),
                                                                    low_inc, std::move(high), high_inc);
                         }
@@ -490,16 +612,25 @@ namespace corodb::opt {
             const auto* col = std::get_if<ColumnRef>(&be.expr);
             const auto* lo = std::get_if<Literal>(&be.low);
             const auto* hi = std::get_if<Literal>(&be.high);
-            if (col && lo && hi && scan.table && scan.table->indexed_columns().count(col->name) > 0 &&
-                range_worth_index(*scan.table, col->name, std::optional<Value>(lo->value), true,
-                                  std::optional<Value>(hi->value), true)) {
-                return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name,
-                                                       std::optional<Value>(lo->value), true,
-                                                       std::optional<Value>(hi->value), true);
+            if (col && lo && hi && scan.table && scan.table->indexed_columns().count(col->name) > 0) {
+                const double sel = opt::SelectivityEstimator::selectivity_between(
+                        scan.table->column_stats(col->name), lo->value, hi->value);
+                auto decision = index_beats_seq_scan(*scan.table, sel, col_correlation(*scan.table, col->name));
+                const bool use_index = decision.has_value()
+                                           ? *decision
+                                           : range_worth_index(*scan.table, col->name,
+                                                               std::optional<Value>(lo->value), true,
+                                                               std::optional<Value>(hi->value), true);
+                if (use_index) {
+                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name,
+                                                           std::optional<Value>(lo->value), true,
+                                                           std::optional<Value>(hi->value), true);
+                }
             }
         }
 
         // col IN (v1, v2, ...) → 多个等值点查的并集 IndexScan（列已建索引且值均为字面量）。
+        // 旧行为无代价检查（恒走索引）；有统计时代价比较，无统计回退恒走索引。
         if (f.child && f.child->kind == LogicalKind::Scan && f.predicate.kind == BoolExpr::Kind::In &&
             f.predicate.in_expr.has_value() && !f.predicate.in_expr->negated) {
             const auto& scan = std::get<LogicalScan>(f.child->node);
@@ -518,7 +649,13 @@ namespace corodb::opt {
                     }
                 }
                 if (all_lit) {
-                    return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(keys));
+                    const double sel = opt::SelectivityEstimator::selectivity_in_list(
+                            scan.table->column_stats(col->name), keys);
+                    auto decision =
+                            index_beats_seq_scan(*scan.table, sel, col_correlation(*scan.table, col->name));
+                    if (!decision.has_value() || *decision) {
+                        return std::make_unique<IndexScanPlan>(scan.table, scan.alias, col->name, std::move(keys));
+                    }
                 }
             }
         }
@@ -640,13 +777,17 @@ namespace corodb::opt {
     }
 
     /**
-     * @brief 将 LogicalJoin 翻译为 HashJoinPlan / MergeJoinPlan / NestedLoopJoinPlan，
-     *        按 ON 条件和子树排序状态选择最优物理实现。
+     * @brief 将 LogicalJoin 翻译为 HashJoinPlan / MergeJoinPlan / NestedLoopJoinPlan。
+     *
+     * 算法选择（Phase 2，G1）：等值连接时对 Hash / NL（输入已有序时还有 Merge）
+     * 按总代价比较；代价模型关闭时等值默认 Hash（旧行为），非等值恒 NL。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::build_join(const LogicalJoin& j) {
-        // P2: 等值 + 双侧表名清晰 → HashJoin（Inner/Left/Right/Full 均支持，执行器带 matched 标记 +
-        //     收尾补 NULL）；否则 NestedLoop。
-        // P3: 若等值且双侧 child 为 LogicalSort，且 sort key 顶层恰好分别等于左/右等值键 → MergeJoin。
+        auto build_children = [&](std::unique_ptr<PlanNode>& left, std::unique_ptr<PlanNode>& right) {
+            left = j.left ? visit(*j.left) : nullptr;
+            right = j.right ? visit(*j.right) : nullptr;
+        };
+
         if ((j.join_type == JoinType::Inner || j.join_type == JoinType::Left || j.join_type == JoinType::Right ||
              j.join_type == JoinType::Full) &&
             j.on.has_value()) {
@@ -657,7 +798,7 @@ namespace corodb::opt {
                 collect_plan_tables(*j.right, rtabs);
             ColumnRef lk, rk;
             if (try_extract_equi_keys(*j.on, ltabs, rtabs, lk, rk)) {
-                // P3 检测：左右都是 Sort 且首个排序键匹配等值键
+                // P3 检测：左右都是 Sort 且首个排序键匹配等值键（输入已按连接键有序）。
                 bool merge_ok = false;
                 if (j.left && j.left->kind == LogicalKind::Sort && j.right && j.right->kind == LogicalKind::Sort) {
                     const auto& ls = std::get<LogicalSort>(j.left->node);
@@ -674,8 +815,51 @@ namespace corodb::opt {
                     }
                 }
 
-                auto left = j.left ? visit(*j.left) : nullptr;
-                auto right = j.right ? visit(*j.right) : nullptr;
+                std::unique_ptr<PlanNode> left, right;
+                build_children(left, right);
+
+                const std::size_t lrows = left ? left->estimated_rows : 1;
+                const std::size_t rrows = right ? right->estimated_rows : 1;
+                const std::size_t out_rows = estimate_join_rows(
+                        lrows, rrows, driving_table(left.get()), driving_table(right.get()), lk, rk);
+                const opt::CostModel cm{ opt::CostModel::Params::from_config() };
+                const double lt = left ? left->total_cost : 0.0;
+                const double rt = right ? right->total_cost : 0.0;
+
+                if (Config::instance().cost_model_enabled()) {
+                    // MergeJoin 候选：仅当输入已按连接键有序（免排序）。
+                    // 只比 total：同总代价时归并免建哈希表，优先归并。
+                    if (merge_ok) {
+                        const Cost merge =
+                                cm.merge_join(lt, rt, static_cast<double>(lrows), static_cast<double>(rrows),
+                                              static_cast<double>(out_rows), false, false);
+                        const Cost hash = cm.hash_join(lt, rt, static_cast<double>(lrows),
+                                                       static_cast<double>(rrows),
+                                                       static_cast<double>(out_rows));
+                        if (merge.total <= hash.total) {
+                            auto mj = std::make_unique<MergeJoinPlan>(std::move(left), std::move(right),
+                                                                      std::move(lk), std::move(rk), std::nullopt,
+                                                                      j.join_type);
+                            mj->left_sorted = true;
+                            mj->right_sorted = true;
+                            return mj;
+                        }
+                        merge_ok = false; // Hash 严格更优：落回 Hash/NL 比较
+                    }
+                    const Cost hash = cm.hash_join(lt, rt, static_cast<double>(lrows), static_cast<double>(rrows),
+                                                   static_cast<double>(out_rows));
+                    const Cost nl = cm.nested_loop(lt, rt, static_cast<double>(lrows),
+                                                   static_cast<double>(out_rows));
+                    // 平局归 Hash：等值连接哈希为线性伸缩的默认选择。
+                    if (nl < hash) {
+                        return std::make_unique<NestedLoopJoinPlan>(std::move(left), std::move(right), *j.on,
+                                                                    j.join_type);
+                    }
+                    return std::make_unique<HashJoinPlan>(std::move(left), std::move(right), std::move(lk),
+                                                          std::move(rk), std::nullopt, j.join_type);
+                }
+
+                // 代价模型关闭：旧启发式（等值 → Merge 若有序否则 Hash）。
                 if (merge_ok) {
                     auto mj = std::make_unique<MergeJoinPlan>(std::move(left), std::move(right), std::move(lk),
                                                               std::move(rk), std::nullopt, j.join_type);
@@ -683,16 +867,16 @@ namespace corodb::opt {
                     mj->right_sorted = true;
                     return mj;
                 }
-                return std::make_unique<HashJoinPlan>(std::move(left), std::move(right), std::move(lk), std::move(rk),
-                                                      std::nullopt, j.join_type);
+                return std::make_unique<HashJoinPlan>(std::move(left), std::move(right), std::move(lk),
+                                                      std::move(rk), std::nullopt, j.join_type);
             }
         }
 
         if (!j.on.has_value()) {
             throw std::runtime_error("[PhysicalPlanner] Join without ON not supported");
         }
-        auto left = j.left ? visit(*j.left) : nullptr;
-        auto right = j.right ? visit(*j.right) : nullptr;
+        std::unique_ptr<PlanNode> left, right;
+        build_children(left, right);
         return std::make_unique<NestedLoopJoinPlan>(std::move(left), std::move(right), *j.on, j.join_type);
     }
 
@@ -770,6 +954,19 @@ namespace corodb::opt {
                 group.push_back(*c);
             else
                 throw std::runtime_error("[PhysicalPlanner] GROUP BY expression must be a column");
+        }
+
+        // 代价决策（Phase 2，G1）：输入已按组键有序时，Sort（流式）与 Hash 按代价比较；
+        // 平局保持 Sort（不换将），代价模型关闭时维持旧行为（有序候选 → Sort）。
+        if (use_sort && Config::instance().cost_model_enabled()) {
+            const opt::CostModel cm{ opt::CostModel::Params::from_config() };
+            const double crows = static_cast<double>(child ? child->estimated_rows : 0);
+            const double ctotal = child ? child->total_cost : 0.0;
+            const double groups = static_cast<double>(estimate_group_count(child.get(), group));
+            const Cost sort_c = cm.sort_aggregate(ctotal, crows);
+            const Cost hash_c = cm.hash_aggregate(ctotal, crows, groups);
+            if (hash_c < sort_c)
+                use_sort = false;
         }
 
         std::vector<AggregateExpr> aggs;

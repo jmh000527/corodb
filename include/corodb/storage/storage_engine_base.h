@@ -32,6 +32,11 @@ namespace corodb {
         StorageEngine(StorageEngine&&) = delete;
         StorageEngine& operator=(StorageEngine&&) = delete;
 
+        /** @brief 存储基础目录（表附属文件如 .stats 的落盘位置）；纯内存实现返回空串。 */
+        [[nodiscard]] virtual std::string base_dir() const {
+            return {};
+        }
+
         /**
          * @name 表管理操作
          * @{

@@ -477,7 +477,7 @@ namespace corodb {
             Config::instance().statistics_max_mcv(),
             Config::instance().statistics_histogram_buckets() } };
         table->update_stats(collector.collect(*table, snapshot_ts));
-        table->save_stats(Config::instance().data_dir());
+        table->save_stats();
     }
 
     /**

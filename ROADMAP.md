@@ -87,7 +87,7 @@
 - [ ] 范围条件走索引、多列索引。
 - [x] **CBO 第一步：行数统计驱动 JOIN 重排**：存储引擎 `estimate_row_count`（LSM：memtable 条目数 +
   SSTable 字节粗估，不解码）；R5 小表左置改用真实行数（Filter 1/3、Aggregate 1/10 选择率传播）。
-- [ ] CBO 后续：列级统计/直方图、代价模型驱动算子选择（IndexScan vs SeqScan、Join 算法）。
+- [x] CBO 后续：列级统计/直方图（ANALYZE + MCV/等高直方图 + 选择性估计库 + auto-ANALYZE）、代价模型驱动的算子选择（Cost{startup,total}，IndexScan/SeqScan 与 Hash/Merge/NL 按代价比较）。
 - [x] **BOOLEAN / DATE / TIMESTAMP 类型 v1（存储映射）**：BOOL/BOOLEAN→Int64 存 0/1（TRUE/FALSE
   字面量解析为 1/0，表达式与 VALUES 均支持）；DATE/TIMESTAMP/DATETIME→Text ISO-8601 字符串
   （字典序即时间序，范围/BETWEEN/索引自然生效）；独立 TypeKind + 域校验（拒绝非 0/1、非合法日期）待后续。

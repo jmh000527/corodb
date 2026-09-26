@@ -13,9 +13,12 @@
 #include "corodb/optimizer/logical/logical_planner.h"
 #include "corodb/optimizer/physical/physical_planner.h"
 #include "corodb/optimizer/logical/rule.h"
+#include "corodb/optimizer/cost/cost_model.h"
 #include "corodb/plan/logical_plan.h"
 #include "corodb/plan/physical_plan.h"
+#include "corodb/process/explain_printer.h"
 #include "corodb/sql/parser.h"
+#include "corodb/storage/statistics_collector.h"
 #include "corodb/storage/table.h"
 
 using namespace corodb;
@@ -776,4 +779,119 @@ TEST(PhysicalPlannerAggregate, ChoosesSortWhenChildSortedByGroupKey) {
     ASSERT_TRUE(ap) << "should produce AggregatePlan";
     EXPECT_EQ(ap->strategy, AggregatePlan::Strategy::Sort)
             << "should pick SortAggregate when child sorted by group key";
+}
+
+// =====================================================================
+// Phase 2: 统一代价模型（G1）
+// =====================================================================
+
+TEST(CostModel, MonotonicInRows) {
+    const CostModel cm;
+    EXPECT_LT(cm.seq_scan(10).total, cm.seq_scan(100).total);
+    EXPECT_LT(cm.index_scan(1, 100, 0).total, cm.index_scan(10, 100, 0).total);
+    // random_page_cost 越大 → IndexScan 代价越高。
+    CostModel::Params p;
+    p.random_page_cost = 8.0;
+    const CostModel expensive{ p };
+    EXPECT_LT(cm.index_scan(10, 100, 0).total, expensive.index_scan(10, 100, 0).total);
+}
+
+TEST(CostModel, CorrelationReducesIndexCost) {
+    const CostModel cm;
+    EXPECT_LT(cm.index_scan(50, 100, 1.0).total, cm.index_scan(50, 100, 0.0).total);
+    // 完全相关时随机读退化为顺序读。
+    EXPECT_NEAR(cm.index_scan(50, 100, 1.0).total, cm.index_scan(50, 100, -1.0).total, 1e-9);
+}
+
+namespace {
+    // 带统计的内存表：n 行 val ∈ [1..n]（NDV=n），可选建索引并采集统计。
+    std::shared_ptr<Table> make_stats_table(Catalog& cat, const std::string& name, std::size_t n,
+                                            bool with_index) {
+        std::vector<Column> cols = { Column{ name, "id", TypeKind::Int64 },
+                                     Column{ name, "val", TypeKind::Int64 } };
+        auto t = std::make_shared<Table>(name, cols);
+        for (std::size_t i = 1; i <= n; ++i)
+            t->insert(Row{ std::vector<Value>{ static_cast<int64_t>(i), static_cast<int64_t>(i) } });
+        if (with_index)
+            t->create_index("val");
+        StatisticsCollector collector;
+        t->update_stats(collector.collect(*t, 1));
+        cat.register_table(t);
+        return t;
+    }
+
+    std::string plan_text(Catalog& cat, const std::string& sql) {
+        auto lp = plan_sql(cat, sql);
+        auto applied = make_default_rules().apply(std::move(lp));
+        PhysicalPlanner pp;
+        auto pn = pp.plan(*applied);
+        // 复用 EXPLAIN 打印器获取文本。
+        std::string text = ExplainPrinter::format(pn.get());
+        return text;
+    }
+} // namespace
+
+TEST(PhysicalPlannerCost, SelectiveEqualityChoosesIndexScanWithStats) {
+    Catalog cat;
+    make_stats_table(cat, "t", 500, /*with_index=*/true);
+    // val = 490：选择性 1/500，IndexScan（4 行代价）远低于 SeqScan（500 行）。
+    const std::string plan = plan_text(cat, "SELECT id FROM t WHERE val = 490");
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+}
+
+TEST(PhysicalPlannerCost, LowCardinalityEqualityWithStatsFallsBackToSeqScan) {
+    Catalog cat;
+    // flag ∈ {0,1}：等值命中半表 → SeqScan 更优。
+    std::vector<Column> cols = { Column{ "s", "id", TypeKind::Int64 },
+                                 Column{ "s", "flag", TypeKind::Int64 } };
+    auto t = std::make_shared<Table>("s", cols);
+    for (int i = 0; i < 500; ++i)
+        t->insert(Row{ std::vector<Value>{ static_cast<int64_t>(i), static_cast<int64_t>(i % 2) } });
+    t->create_index("flag");
+    StatisticsCollector collector;
+    t->update_stats(collector.collect(*t, 1));
+    cat.register_table(t);
+    const std::string plan = plan_text(cat, "SELECT id FROM s WHERE flag = 1");
+    EXPECT_EQ(plan.find("Index Scan"), std::string::npos) << plan;
+    EXPECT_NE(plan.find("Seq Scan"), std::string::npos) << plan;
+}
+
+TEST(PhysicalPlannerCost, SelectiveRangeChoosesIndexScanWithStats) {
+    Catalog cat;
+    make_stats_table(cat, "t", 500, /*with_index=*/true);
+    // val > 490：约 2% 选择性 → IndexScan。
+    const std::string plan = plan_text(cat, "SELECT id FROM t WHERE val > 490");
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
+}
+
+TEST(PhysicalPlannerCost, NonSelectiveRangeWithStatsFallsBackToSeqScan) {
+    Catalog cat;
+    make_stats_table(cat, "t", 500, /*with_index=*/true);
+    // val > 10：约 98% 选择性 → SeqScan。
+    const std::string plan = plan_text(cat, "SELECT id FROM t WHERE val > 10");
+    EXPECT_EQ(plan.find("Index Scan"), std::string::npos) << plan;
+    EXPECT_NE(plan.find("Seq Scan"), std::string::npos) << plan;
+}
+
+TEST(PhysicalPlannerCost, HashJoinBeatsNestedLoopOnEqualTables) {
+    Catalog cat;
+    make_stats_table(cat, "l", 100, /*with_index=*/false);
+    make_stats_table(cat, "r", 100, /*with_index=*/false);
+    auto lp = plan_sql(cat, "SELECT l.id FROM l JOIN r ON l.id = r.id");
+    auto applied = make_default_rules().apply(std::move(lp));
+    PhysicalPlanner pp;
+    auto pn = pp.plan(*applied);
+    auto* proj = dynamic_cast<ProjectPlan*>(pn.get());
+    ASSERT_NE(proj, nullptr);
+    EXPECT_NE(dynamic_cast<HashJoinPlan*>(proj->child.get()), nullptr) << "等值连接应选 HashJoin";
+}
+
+TEST(PhysicalPlannerCost, CostDisabledFallsBackToHeuristics) {
+    Catalog cat;
+    make_stats_table(cat, "t", 500, /*with_index=*/true);
+    // 关闭代价模型 → 旧阈值启发式：等值（高基数）仍走索引。
+    Config::instance().set_cost_model_enabled(false);
+    const std::string plan = plan_text(cat, "SELECT id FROM t WHERE val = 490");
+    Config::instance().set_cost_model_enabled(true);
+    EXPECT_NE(plan.find("Index Scan"), std::string::npos) << plan;
 }

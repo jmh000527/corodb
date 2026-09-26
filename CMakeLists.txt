@@ -47,6 +47,7 @@ add_library(corodb
     src/optimizer/logical/join_reorder_rule.cpp
     src/optimizer/physical/physical_planner.cpp
     src/optimizer/stats/selectivity.cpp
+    src/optimizer/cost/cost_model.cpp
 
     # 存储引擎
     src/storage/storage_engine_base.cpp

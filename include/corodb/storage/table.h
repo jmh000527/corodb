@@ -230,14 +230,17 @@ namespace corodb {
         /** @brief 记录写入行数（写路径调用，供 auto-ANALYZE 判断统计是否陈旧）。 */
         void note_rows_written(std::size_t n) noexcept { rows_since_analyze_ += n; }
 
-        /** @brief 加载持久化统计（从 {data_dir}/{name}.stats）；文件不存在则静默跳过。 */
-        void load_stats(const std::string& data_dir);
+        /** @brief 加载持久化统计（从 {存储目录}/{name}.stats）；文件不存在则静默跳过。 */
+        void load_stats();
 
-        /** @brief 持久化统计到 {data_dir}/{name}.stats。 */
-        void save_stats(const std::string& data_dir) const;
+        /** @brief 持久化统计到 {存储目录}/{name}.stats。 */
+        void save_stats() const;
 
-        /** @brief 删除持久化统计文件 {data_dir}/{name}.stats 并清空内存缓存（DROP TABLE 调用）。 */
-        void remove_stats(const std::string& data_dir);
+        /** @brief 删除持久化统计文件并清空内存缓存（DROP TABLE 调用）。 */
+        void remove_stats();
+
+        /** @brief 统计文件所在目录：跟随表自己的存储引擎目录（无引擎时回退全局 data_dir）。 */
+        [[nodiscard]] std::string stats_dir() const;
 
         /** @brief 更新统计（ANALYZE 调用），同时标记为已加载。 */
         void update_stats(TableStats new_stats);
