@@ -25,6 +25,8 @@ namespace corodb {
             return 0x9e3779b9; // 空值的哈希值
         if (std::holds_alternative<int64_t>(v))
             return std::hash<int64_t>{}(std::get<int64_t>(v)) ^ 0x9e3779b9;     // 整数的哈希值
+        if (std::holds_alternative<double>(v))
+            return std::hash<double>{}(std::get<double>(v)) ^ 0x85ebca6b;       // 浮点（DECIMAL/Float64）的哈希值
         return std::hash<std::string>{}(std::get<std::string>(v)) ^ 0x85ebca6b; // 字符串的哈希值
     }
 
@@ -40,7 +42,9 @@ namespace corodb {
         if (std::holds_alternative<NullValue>(a))
             return true; // 两个都是空值，相等
         if (std::holds_alternative<int64_t>(a))
-            return std::get<int64_t>(a) == std::get<int64_t>(b);     // 比较整数值
+            return std::get<int64_t>(a) == std::get<int64_t>(b); // 比较整数值
+        if (std::holds_alternative<double>(a))
+            return std::get<double>(a) == std::get<double>(b); // 比较浮点值
         return std::get<std::string>(a) == std::get<std::string>(b); // 比较字符串值
     }
 
@@ -185,6 +189,7 @@ namespace corodb {
             update_indexes_for_row(new_rid);          // 增量更新索引
         }
         bump_write_counter();
+        note_rows_written(1);
     }
 
     /**
@@ -223,6 +228,7 @@ namespace corodb {
             }
         }
         bump_write_counter();
+        note_rows_written(rows.size());
     }
 
     /**
@@ -251,6 +257,7 @@ namespace corodb {
         storage_->append_row(name_, columns_, row, commit_ts);
         index_row(row); // 增量维护二级索引（value→pk 超集）
         bump_write_counter();
+        note_rows_written(1);
     }
 
     void Table::persist_row_delete(const Value& key, uint64_t commit_ts) {
@@ -258,6 +265,7 @@ namespace corodb {
             return;
         storage_->delete_row_by_key(name_, columns_, key, commit_ts);
         bump_write_counter();
+        note_rows_written(1);
     }
 
     std::vector<Row> Table::scan_visible(uint64_t snapshot_ts) const {
@@ -690,6 +698,7 @@ namespace corodb {
     void Table::update_stats(TableStats new_stats) {
         stats_ = std::move(new_stats);
         stats_loaded_ = true;
+        rows_since_analyze_ = 0;
     }
 
     void Table::remove_stats(const std::string& data_dir) {
@@ -697,6 +706,7 @@ namespace corodb {
         std::filesystem::remove(std::filesystem::path(data_dir) / (name_ + ".stats"), ec);
         stats_ = TableStats{};
         stats_loaded_ = false;
+        rows_since_analyze_ = 0;
     }
 
     // ---------------------------------------------------------------------------

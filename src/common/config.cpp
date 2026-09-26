@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -54,6 +55,19 @@ namespace corodb {
                 if (pos != v.size())
                     return std::nullopt;
                 return n;
+            } catch (...) {
+                return std::nullopt;
+            }
+        }
+
+        // 将字符串解析为非负浮点数，解析失败返回 nullopt
+        std::optional<double> parse_double(const std::string& v) {
+            try {
+                std::size_t pos = 0;
+                double d = std::stod(v, &pos);
+                if (pos != v.size() || d < 0.0 || !std::isfinite(d))
+                    return std::nullopt;
+                return d;
             } catch (...) {
                 return std::nullopt;
             }
@@ -199,6 +213,39 @@ namespace corodb {
 
         // auth.*
         if (try_set_str("auth.password_salt", &Config::auth_salt_)) return;
+
+        // statistics.*
+        if (try_set_size("statistics.sample_target", &Config::statistics_sample_target_)) return;
+        if (try_set_size("statistics.max_mcv", &Config::statistics_max_mcv_)) return;
+        if (try_set_size("statistics.histogram_buckets", &Config::statistics_histogram_buckets_)) return;
+        if (k == "statistics.auto_analyze_threshold") {
+            if (auto d = parse_double(value); d && *d <= 1.0)
+                statistics_auto_analyze_threshold_ = *d;
+            return;
+        }
+
+        // optimizer.*
+        if (k == "optimizer.cost_model") { cost_model_enabled_ = (value == "true" || value == "1"); return; }
+        if (k == "optimizer.seq_page_cost") {
+            if (auto d = parse_double(value); d && *d > 0.0) seq_page_cost_ = *d;
+            return;
+        }
+        if (k == "optimizer.random_page_cost") {
+            if (auto d = parse_double(value); d && *d > 0.0) random_page_cost_ = *d;
+            return;
+        }
+        if (k == "optimizer.cpu_tuple_cost") {
+            if (auto d = parse_double(value); d && *d > 0.0) cpu_tuple_cost_ = *d;
+            return;
+        }
+        if (k == "optimizer.cpu_index_tuple_cost") {
+            if (auto d = parse_double(value); d && *d > 0.0) cpu_index_tuple_cost_ = *d;
+            return;
+        }
+        if (k == "optimizer.cpu_operator_cost") {
+            if (auto d = parse_double(value); d && *d > 0.0) cpu_operator_cost_ = *d;
+            return;
+        }
     }
 
     /**
@@ -361,6 +408,48 @@ namespace corodb {
         ofs << "[auth]\n";
         ofs << "# 密码哈希盐值，修改后所有已有密码失效（需重新 CREATE USER）。\n";
         ofs << "password_salt = " << tmp.auth_salt_ << "\n";
+        ofs << "\n\n";
+
+        // ---- [statistics] ----
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "#  统计信息采集参数（ANALYZE / 自动统计，Phase 1）\n";
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "[statistics]\n";
+        ofs << "# 采样目标行数：大表按此目标做 Bernoulli 采样，小表（≤3倍）全量扫描。\n";
+        ofs << "sample_target = " << tmp.statistics_sample_target_ << "\n";
+        ofs << "\n";
+        ofs << "# 最常用值（MCV）最大保留个数。\n";
+        ofs << "max_mcv = " << tmp.statistics_max_mcv_ << "\n";
+        ofs << "\n";
+        ofs << "# 等高直方图桶数。\n";
+        ofs << "histogram_buckets = " << tmp.statistics_histogram_buckets_ << "\n";
+        ofs << "\n";
+        ofs << "# 自动 ANALYZE 阈值：行数变化比例超过该值时于下次查询前重采集统计（0–1）。\n";
+        ofs << "auto_analyze_threshold = " << tmp.statistics_auto_analyze_threshold_ << "\n";
+        ofs << "\n\n";
+
+        // ---- [optimizer] ----
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "#  优化器代价模型参数（Phase 2；默认值对齐 PostgreSQL）\n";
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "[optimizer]\n";
+        ofs << "# 是否启用代价模型（false 时回退启发式阈值决策）。\n";
+        ofs << "cost_model = " << (tmp.cost_model_enabled_ ? "true" : "false") << "\n";
+        ofs << "\n";
+        ofs << "# 顺序读一页的代价（基准单位）。\n";
+        ofs << "seq_page_cost = " << tmp.seq_page_cost_ << "\n";
+        ofs << "\n";
+        ofs << "# 随机读一页的代价（IndexScan 逐 pk 点查按此计价）。\n";
+        ofs << "random_page_cost = " << tmp.random_page_cost_ << "\n";
+        ofs << "\n";
+        ofs << "# 处理一行（元组）的 CPU 代价。\n";
+        ofs << "cpu_tuple_cost = " << tmp.cpu_tuple_cost_ << "\n";
+        ofs << "\n";
+        ofs << "# 索引项处理一行的 CPU 代价。\n";
+        ofs << "cpu_index_tuple_cost = " << tmp.cpu_index_tuple_cost_ << "\n";
+        ofs << "\n";
+        ofs << "# 求值一次操作符/谓词的 CPU 代价。\n";
+        ofs << "cpu_operator_cost = " << tmp.cpu_operator_cost_ << "\n";
 
         return true;
     }

@@ -221,6 +221,15 @@ namespace corodb {
         /** @brief 是否已加载有效统计信息。 */
         [[nodiscard]] bool has_stats() const noexcept { return stats_loaded_ && stats_.valid(); }
 
+        /** @brief 访问表级统计集合（只读；无统计时 total_rows==0）。 */
+        [[nodiscard]] const TableStats& table_stats() const noexcept { return stats_; }
+
+        /** @brief 自上次统计采集以来的写入行数（INSERT/UPDATE/DELETE 累计）。 */
+        [[nodiscard]] std::size_t rows_since_analyze() const noexcept { return rows_since_analyze_; }
+
+        /** @brief 记录写入行数（写路径调用，供 auto-ANALYZE 判断统计是否陈旧）。 */
+        void note_rows_written(std::size_t n) noexcept { rows_since_analyze_ += n; }
+
         /** @brief 加载持久化统计（从 {data_dir}/{name}.stats）；文件不存在则静默跳过。 */
         void load_stats(const std::string& data_dir);
 
@@ -280,6 +289,7 @@ namespace corodb {
 
         TableStats stats_;           ///< 列级统计缓存（ANALYZE 采集）
         bool stats_loaded_{ false }; ///< 统计是否已加载（含加载失败标记）
+        std::size_t rows_since_analyze_{ 0 }; ///< 自上次统计以来的写入行数（auto-ANALYZE）
 
         void index_row(const Row& row);
 

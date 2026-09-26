@@ -290,26 +290,42 @@ namespace corodb {
 
         if (sample_size == 0)
             return 0;
+        if (sample_distinct == 0)
+            return 0;
 
         // 全量扫描（sample_size ≈ total_rows）：直接返回精确值
         if (sample_size >= total_rows) {
             return sample_distinct;
         }
 
-        // 采样外推：未见到的值中仍有去重值
-        // 估计：ndistinct ≈ sample_distinct + (total - sample) × (未见值比例)
-        // 未见值比例 = 1 - sample_distinct / sample_size（样本中每个值平均出现 sample_size/distinct 次）
-        const double unseen_ratio =
-            1.0 - static_cast<double>(sample_distinct) / static_cast<double>(sample_size);
-        const std::size_t remaining_rows = total_rows > sample_size
-                                               ? total_rows - sample_size
-                                               : 0;
-        const std::size_t estimated =
-            sample_distinct +
-            static_cast<std::size_t>(static_cast<double>(remaining_rows) * unseen_ratio);
+        // MLE 估计：Bernoulli 采样率 q 下，观测到 d 个去重值的期望为
+        //   E[d | N] = N · (1 - (1-q)^(rows/N))
+        // 该函数关于 N 单调递增，二分解 E[d|N] = d 即最大似然 NDV。
+        // 相比线性外推，MLE 对均匀高基数列不会系统性高估
+        // （10000 行 1000 去重值采样 300 行：外推 ≈1600，MLE ≈1000）。
+        const double q = static_cast<double>(sample_size) / static_cast<double>(total_rows);
+        const double rows = static_cast<double>(total_rows);
+        const double d = static_cast<double>(sample_distinct);
 
-        // 上限：不超过总行数
-        return std::min(estimated, total_rows);
+        auto expected_distinct = [&](double n) {
+            return n * (1.0 - std::pow(1.0 - q, rows / n));
+        };
+
+        // 边界保护：若全表都采样也达不到 d（采样方差），退回观测值。
+        if (expected_distinct(rows) < d)
+            return sample_distinct;
+
+        double lo = d, hi = rows;
+        while (hi - lo > 0.5) {
+            const double mid = (lo + hi) / 2.0;
+            if (expected_distinct(mid) < d)
+                lo = mid;
+            else
+                hi = mid;
+        }
+
+        auto n = static_cast<std::size_t>(std::llround(hi));
+        return std::min(n, total_rows);
     }
 
 } // namespace corodb

@@ -92,6 +92,11 @@ namespace corodb {
         /// 虚析构函数，确保子类能正确析构
         virtual ~PlanNode() = default;
 
+        // ---- 规划期估计（EXPLAIN 展示；Phase 2 代价模型自底向上填充） ----
+        double startup_cost{ 0.0 };      ///< 启动代价（产出首行前；0 = 未估计）
+        double total_cost{ 0.0 };        ///< 总代价
+        std::size_t estimated_rows{ 0 }; ///< 估计输出行数（基于统计/回退粗估）
+
         // 禁用复制（计划节点通常通过unique_ptr管理）
         PlanNode(const PlanNode&) = delete;
         PlanNode& operator=(const PlanNode&) = delete;

@@ -5,10 +5,12 @@
 
 #include "corodb/optimizer/physical/physical_planner.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
+#include "corodb/optimizer/stats/selectivity.h"
 #include "corodb/storage/storage_engine_base.h"
 #include "corodb/storage/table.h"
 
@@ -131,6 +133,179 @@ namespace corodb::opt {
             }
             return false;
         }
+
+        // ------------------------------------------------------------------
+        // 基数估计标注（T1.7）：自底向上填 PlanNode::estimated_rows
+        // ------------------------------------------------------------------
+
+        /** @brief 子树的单表来源（Filter/Project 下钻到扫描）；多表或未知返回 nullptr。 */
+        const Table* driving_table(const PlanNode* n) {
+            if (!n)
+                return nullptr;
+            if (const auto* s = dynamic_cast<const SeqScanPlan*>(n))
+                return s->table.get();
+            if (const auto* s = dynamic_cast<const IndexScanPlan*>(n))
+                return s->table.get();
+            if (const auto* f = dynamic_cast<const FilterPlan*>(n))
+                return driving_table(f->child.get());
+            if (const auto* p = dynamic_cast<const ProjectPlan*>(n))
+                return driving_table(p->child.get());
+            return nullptr;
+        }
+
+        /** @brief IndexScan 输出估计：表行数 × 索引条件选择率（等值/范围/IN/复合）。 */
+        std::size_t estimate_index_scan_rows(const IndexScanPlan& idx) {
+            const Table& t = *idx.table;
+            const std::size_t base = t.estimated_row_count();
+            if (base == 0)
+                return 0;
+            const ColumnStats* cs = t.column_stats(idx.column);
+            double sel;
+            if (idx.is_composite) {
+                sel = 1.0;
+                for (std::size_t i = 0; i < idx.composite_columns.size() && i < idx.composite_key.size(); ++i) {
+                    sel *= opt::SelectivityEstimator::selectivity_eq(t.column_stats(idx.composite_columns[i]),
+                                                                    idx.composite_key[i]);
+                }
+            } else if (idx.is_in) {
+                sel = opt::SelectivityEstimator::selectivity_in_list(cs, idx.in_keys);
+            } else if (idx.is_range) {
+                sel = opt::SelectivityEstimator::selectivity_range(cs, idx.low, idx.low_inclusive, idx.high,
+                                                                   idx.high_inclusive);
+            } else {
+                sel = opt::SelectivityEstimator::selectivity_eq(cs, idx.key);
+            }
+            return std::max<std::size_t>(1, static_cast<std::size_t>(static_cast<double>(base) * sel));
+        }
+
+        /** @brief 连接输出估计：|L|×|R|/max(NDV_left, NDV_right)，NDV 不可解析回退 max(L,R)。 */
+        std::size_t estimate_join_rows(std::size_t l, std::size_t r, const Table* lt, const Table* rt,
+                                       const ColumnRef& lkey, const ColumnRef& rkey) {
+            std::size_t ndv = 0;
+            if (lt && !lkey.name.empty())
+                ndv = std::max(ndv, lt->index_distinct_count(lkey.name, 10000));
+            if (rt && !rkey.name.empty())
+                ndv = std::max(ndv, rt->index_distinct_count(rkey.name, 10000));
+            if (ndv > 0)
+                return std::max<std::size_t>((l * r) / ndv, 1);
+            return std::max<std::size_t>(std::max(l, r), 1);
+        }
+
+        /** @brief 递归标注：先子后父。 */
+        void annotate_rows(PlanNode* node) {
+            if (!node)
+                return;
+            if (auto* seq = dynamic_cast<SeqScanPlan*>(node)) {
+                seq->estimated_rows = seq->table ? seq->table->estimated_row_count() : 0;
+                return;
+            }
+            if (auto* idx = dynamic_cast<IndexScanPlan*>(node)) {
+                idx->estimated_rows = idx->table ? estimate_index_scan_rows(*idx) : 0;
+                return;
+            }
+            if (auto* fil = dynamic_cast<FilterPlan*>(node)) {
+                annotate_rows(fil->child.get());
+                const PlanNode* c = fil->child.get();
+                double sel = 1.0 / 3.0; // 无统计回退（与 R5 旧模型一致）
+                if (const Table* t = driving_table(c))
+                    sel = opt::SelectivityEstimator::estimate_filter_selectivity(*t, fil->predicate);
+                fil->estimated_rows =
+                        c ? std::max<std::size_t>(1, static_cast<std::size_t>(static_cast<double>(c->estimated_rows) * sel))
+                          : 0;
+                return;
+            }
+            if (auto* proj = dynamic_cast<ProjectPlan*>(node)) {
+                annotate_rows(proj->child.get());
+                proj->estimated_rows = proj->child ? proj->child->estimated_rows : 0;
+                return;
+            }
+            if (auto* un = dynamic_cast<UnionPlan*>(node)) {
+                std::size_t total = 0;
+                for (auto& c: un->children) {
+                    annotate_rows(c.get());
+                    total += c ? c->estimated_rows : 0;
+                }
+                un->estimated_rows = total;
+                return;
+            }
+            if (auto* hash = dynamic_cast<HashJoinPlan*>(node)) {
+                annotate_rows(hash->left.get());
+                annotate_rows(hash->right.get());
+                hash->estimated_rows =
+                        estimate_join_rows(hash->left ? hash->left->estimated_rows : 1,
+                                           hash->right ? hash->right->estimated_rows : 1,
+                                           driving_table(hash->left.get()), driving_table(hash->right.get()),
+                                           hash->left_key, hash->right_key);
+                return;
+            }
+            if (auto* merge = dynamic_cast<MergeJoinPlan*>(node)) {
+                annotate_rows(merge->left.get());
+                annotate_rows(merge->right.get());
+                merge->estimated_rows =
+                        estimate_join_rows(merge->left ? merge->left->estimated_rows : 1,
+                                           merge->right ? merge->right->estimated_rows : 1,
+                                           driving_table(merge->left.get()), driving_table(merge->right.get()),
+                                           merge->left_key, merge->right_key);
+                return;
+            }
+            if (auto* nl = dynamic_cast<NestedLoopJoinPlan*>(node)) {
+                annotate_rows(nl->left.get());
+                annotate_rows(nl->right.get());
+                // 非等值连接无 NDV 模型：保守取 max(L,R)。
+                nl->estimated_rows = std::max<std::size_t>(
+                        std::max(nl->left ? nl->left->estimated_rows : 0,
+                                 nl->right ? nl->right->estimated_rows : 0),
+                        1);
+                return;
+            }
+            if (auto* agg = dynamic_cast<AggregatePlan*>(node)) {
+                annotate_rows(agg->child.get());
+                const std::size_t child_rows = agg->child ? agg->child->estimated_rows : 0;
+                if (agg->group_by.empty()) {
+                    agg->estimated_rows = 1;
+                    return;
+                }
+                // 分组数 ≈ min(输入行数, 组键 NDV 乘积)；不可解析回退 child/10。
+                double groups = 1.0;
+                if (const Table* t = driving_table(agg->child.get())) {
+                    for (const auto& g: agg->group_by) {
+                        double ndv = static_cast<double>(t->index_distinct_count(g.name, 10000));
+                        if (ndv <= 0) {
+                            groups = 0.0;
+                            break;
+                        }
+                        groups *= ndv;
+                        if (groups > 1e15)
+                            break;
+                    }
+                }
+                if (groups > 0.0)
+                    agg->estimated_rows = std::max<std::size_t>(
+                            1, static_cast<std::size_t>(std::min<double>(groups, static_cast<double>(child_rows))));
+                else
+                    agg->estimated_rows = std::max<std::size_t>(child_rows / 10, 1);
+                return;
+            }
+            if (auto* ord = dynamic_cast<OrderByPlan*>(node)) {
+                annotate_rows(ord->child.get());
+                ord->estimated_rows = ord->child ? ord->child->estimated_rows : 0;
+                return;
+            }
+            if (auto* lim = dynamic_cast<LimitPlan*>(node)) {
+                annotate_rows(lim->child.get());
+                const std::size_t child_rows = lim->child ? lim->child->estimated_rows : 0;
+                std::size_t rows = child_rows;
+                if (lim->offset.has_value())
+                    rows = rows > static_cast<std::size_t>(*lim->offset)
+                               ? rows - static_cast<std::size_t>(*lim->offset)
+                               : 0;
+                if (lim->limit.has_value())
+                    rows = std::min<std::size_t>(rows, static_cast<std::size_t>(*lim->limit));
+                lim->estimated_rows = rows;
+                return;
+            }
+            // DML 计划：行数估计无意义，保持 0。
+        }
     } // namespace
 
     /**
@@ -139,7 +314,10 @@ namespace corodb::opt {
      * @return 物理计划根节点。
      */
     std::unique_ptr<PlanNode> PhysicalPlanner::plan(const LogicalPlan& lp) {
-        return visit(lp);
+        auto plan = visit(lp);
+        // T1.7：自底向上标注估计行数（EXPLAIN rows=N；Phase 2 代价模型在同字段上扩展 cost）。
+        annotate_rows(plan.get());
+        return plan;
     }
 
     /**

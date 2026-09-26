@@ -459,8 +459,64 @@ namespace corodb {
             for (char c: name)
                 fp = (fp ^ static_cast<uint64_t>(c)) * 1099511628211ull;
             fp = (fp ^ bucket) * 1099511628211ull;
+            // 混入 stats_ts：ANALYZE 重采集后即使行数量级不变也使指纹变化，
+            // 烘入计划的统计相关决策随之失效（事务内 ANALYZE 的 stats_ts 非零）。
+            fp = (fp ^ tbl->table_stats().stats_ts) * 1099511628211ull;
         }
         return fp;
+    }
+
+    /**
+     * @brief 对单表按 [statistics] 配置采集统计并持久化（手动 ANALYZE 与 auto-ANALYZE 共用）。
+     */
+    void QueryProcessor::analyze_table(const std::shared_ptr<Table>& table, uint64_t snapshot_ts) {
+        if (!table)
+            return;
+        StatisticsCollector collector{ StatisticsCollector::Config{
+            Config::instance().statistics_sample_target(),
+            Config::instance().statistics_max_mcv(),
+            Config::instance().statistics_histogram_buckets() } };
+        table->update_stats(collector.collect(*table, snapshot_ts));
+        table->save_stats(Config::instance().data_dir());
+    }
+
+    /**
+     * @brief auto-ANALYZE（T1.8）：SELECT 规划前刷新陈旧统计。
+     *
+     * 触发条件（满足其一）：
+     *   - 表非空但从未采集统计（首次查询触发）；
+     *   - 行数较上次采集变化比例 > auto_analyze_threshold（is_stale）；
+     *   - 自上次采集的累计写入行数 > threshold × 上次采集行数（UPDATE 不改行数也能触发）。
+     * 刷新后全量失效计划缓存（含 sunk prepared 计划），与手动 ANALYZE 语义一致。
+     */
+    void QueryProcessor::maybe_auto_analyze(const std::vector<std::string>& table_names, Session& session) {
+        const double threshold = Config::instance().statistics_auto_analyze_threshold();
+        if (threshold >= 1.0)
+            return; // 阈值设为 1 = 禁用 auto-ANALYZE
+        const uint64_t snap_ts =
+                session.in_transaction() ? session.snapshot_ts : txn_manager_.allocate_ts();
+        bool refreshed = false;
+        for (const auto& name: table_names) {
+            auto t = catalog_.lookup(name);
+            if (!t)
+                continue;
+            const std::size_t rows = t->estimated_row_count();
+            if (rows == 0)
+                continue; // 空表无统计价值
+            const TableStats& s = t->table_stats();
+            const bool no_stats = s.total_rows == 0;
+            const bool stale_rows = !no_stats && s.is_stale(rows, threshold);
+            const bool stale_writes =
+                    !no_stats && static_cast<double>(t->rows_since_analyze()) > threshold * static_cast<double>(s.total_rows);
+            if (no_stats || stale_rows || stale_writes) {
+                analyze_table(t, snap_ts);
+                refreshed = true;
+            }
+        }
+        if (refreshed) {
+            plan_cache_.invalidate_all();
+            session.prepared_stmts.clear();
+        }
     }
 
     std::string QueryProcessor::normalize_sql(const std::string& sql) {
@@ -608,29 +664,20 @@ namespace corodb {
 
         // 1e) ANALYZE — 采集统计信息并持久化
         if (auto* ana = std::get_if<AnalyzeStmt>(&stmt)) {
-            const std::string& data_dir = Config::instance().data_dir();
-            // 快照时间戳：事务内用会话快照，自动提交用 0（最新已提交）
-            const uint64_t snap_ts = session->in_transaction() ? session->snapshot_ts : 0;
-
-            StatisticsCollector collector;
+            // 快照时间戳：事务内用会话快照；自动提交分配新 ts（0 会看不到任何已提交行）。
+            const uint64_t snap_ts =
+                    session->in_transaction() ? session->snapshot_ts : txn_manager_.allocate_ts();
 
             if (ana->table_name.empty()) {
                 // 分析所有表
                 for (const auto& name : catalog_.table_names()) {
-                    auto t = catalog_.lookup(name);
-                    if (t) {
-                        auto stats = collector.collect(*t, snap_ts);
-                        t->update_stats(std::move(stats));
-                        t->save_stats(data_dir);
-                    }
+                    analyze_table(catalog_.lookup(name), snap_ts);
                 }
             } else {
                 auto t = catalog_.lookup(ana->table_name);
                 if (!t)
                     throw std::runtime_error("[ANALYZE] Unknown table: " + ana->table_name);
-                auto stats = collector.collect(*t, snap_ts);
-                t->update_stats(std::move(stats));
-                t->save_stats(data_dir);
+                analyze_table(t, snap_ts);
             }
 
             // 统计变化后清空计划缓存，防止旧计划使用陈旧统计
@@ -803,6 +850,12 @@ namespace corodb {
             auto table_names = extract_table_names(stmt);
             const bool ddl_op = is_ddl(stmt);
             const bool is_select = std::holds_alternative<SelectStmt>(stmt);
+
+            // 自动 ANALYZE（T1.8）：SELECT 规划前刷新缺失/陈旧统计（含首次查询触发），
+            // 刷新即失效计划缓存；DML/DDL 路径不触发，避免与写锁交互。
+            if (is_select && !ddl_op) {
+                maybe_auto_analyze(table_names, *session);
+            }
 
             // 非相关 IN (SELECT ...)：先执行子查询并代换为字面量 IN 列表（数据相关，跳过计划缓存）。
             const bool had_subquery = stmt_has_subquery(stmt);

@@ -46,6 +46,7 @@ add_library(corodb
     src/optimizer/logical/projection_merge_rule.cpp
     src/optimizer/logical/join_reorder_rule.cpp
     src/optimizer/physical/physical_planner.cpp
+    src/optimizer/stats/selectivity.cpp
 
     # 存储引擎
     src/storage/storage_engine_base.cpp
@@ -183,6 +184,7 @@ add_executable(corodb_tests
     tests/test_transaction.cpp
     tests/test_optimizer.cpp
     tests/test_config.cpp
+    tests/test_statistics.cpp
 )
 target_link_libraries(corodb_tests
     PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock

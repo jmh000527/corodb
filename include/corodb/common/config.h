@@ -30,6 +30,17 @@ namespace corodb {
         static constexpr std::size_t kDefaultPlanCacheEntries = 128;
         static constexpr uint64_t  kDefaultStatementTimeoutMs = 0; // disabled
         static constexpr std::size_t kDefaultThreadPoolMaxQueue = 0; // unlimited
+        // [statistics]（ANALYZE 采集，Phase 1）
+        static constexpr std::size_t kDefaultStatisticsSampleTarget = 300;
+        static constexpr std::size_t kDefaultStatisticsMaxMcv = 20;
+        static constexpr std::size_t kDefaultStatisticsHistogramBuckets = 32;
+        static constexpr double kDefaultAutoAnalyzeThreshold = 0.1;
+        // [optimizer]（代价模型，Phase 2；默认值对齐 PostgreSQL）
+        static constexpr double kDefaultSeqPageCost = 1.0;
+        static constexpr double kDefaultRandomPageCost = 4.0;
+        static constexpr double kDefaultCpuTupleCost = 0.01;
+        static constexpr double kDefaultCpuIndexTupleCost = 0.005;
+        static constexpr double kDefaultCpuOperatorCost = 0.0025;
 
         static Config& instance() {
             static Config config;
@@ -132,6 +143,42 @@ namespace corodb {
         [[nodiscard]] const std::string& auth_salt() const noexcept { return auth_salt_; }
         void set_auth_salt(std::string v) noexcept { auth_salt_ = std::move(v); }
 
+        // =========================================================================
+        // [statistics]
+        // =========================================================================
+        [[nodiscard]] std::size_t statistics_sample_target() const noexcept { return statistics_sample_target_; }
+        [[nodiscard]] std::size_t statistics_max_mcv() const noexcept { return statistics_max_mcv_; }
+        [[nodiscard]] std::size_t statistics_histogram_buckets() const noexcept {
+            return statistics_histogram_buckets_;
+        }
+        [[nodiscard]] double statistics_auto_analyze_threshold() const noexcept {
+            return statistics_auto_analyze_threshold_;
+        }
+        void set_statistics_sample_target(std::size_t v) noexcept { statistics_sample_target_ = v; }
+        void set_statistics_max_mcv(std::size_t v) noexcept { statistics_max_mcv_ = v; }
+        void set_statistics_histogram_buckets(std::size_t v) noexcept {
+            statistics_histogram_buckets_ = v;
+        }
+        void set_statistics_auto_analyze_threshold(double v) noexcept {
+            statistics_auto_analyze_threshold_ = v;
+        }
+
+        // =========================================================================
+        // [optimizer]
+        // =========================================================================
+        [[nodiscard]] bool cost_model_enabled() const noexcept { return cost_model_enabled_; }
+        [[nodiscard]] double seq_page_cost() const noexcept { return seq_page_cost_; }
+        [[nodiscard]] double random_page_cost() const noexcept { return random_page_cost_; }
+        [[nodiscard]] double cpu_tuple_cost() const noexcept { return cpu_tuple_cost_; }
+        [[nodiscard]] double cpu_index_tuple_cost() const noexcept { return cpu_index_tuple_cost_; }
+        [[nodiscard]] double cpu_operator_cost() const noexcept { return cpu_operator_cost_; }
+        void set_cost_model_enabled(bool v) noexcept { cost_model_enabled_ = v; }
+        void set_seq_page_cost(double v) noexcept { seq_page_cost_ = v; }
+        void set_random_page_cost(double v) noexcept { random_page_cost_ = v; }
+        void set_cpu_tuple_cost(double v) noexcept { cpu_tuple_cost_ = v; }
+        void set_cpu_index_tuple_cost(double v) noexcept { cpu_index_tuple_cost_ = v; }
+        void set_cpu_operator_cost(double v) noexcept { cpu_operator_cost_ = v; }
+
     private:
         Config() = default;
         Config(const Config&) = delete;
@@ -186,6 +233,20 @@ namespace corodb {
 
         // [auth]
         std::string auth_salt_ = "corodb_salt_v1";
+
+        // [statistics]
+        std::size_t statistics_sample_target_ = kDefaultStatisticsSampleTarget;
+        std::size_t statistics_max_mcv_ = kDefaultStatisticsMaxMcv;
+        std::size_t statistics_histogram_buckets_ = kDefaultStatisticsHistogramBuckets;
+        double statistics_auto_analyze_threshold_ = kDefaultAutoAnalyzeThreshold;
+
+        // [optimizer]
+        bool cost_model_enabled_ = true;
+        double seq_page_cost_ = kDefaultSeqPageCost;
+        double random_page_cost_ = kDefaultRandomPageCost;
+        double cpu_tuple_cost_ = kDefaultCpuTupleCost;
+        double cpu_index_tuple_cost_ = kDefaultCpuIndexTupleCost;
+        double cpu_operator_cost_ = kDefaultCpuOperatorCost;
     };
 
 } // namespace corodb

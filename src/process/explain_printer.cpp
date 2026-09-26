@@ -131,11 +131,19 @@ namespace corodb {
 
         // ── PostgreSQL-style indentation ─────────────────────────────────
         static std::string indent(int depth) {
-            if (depth == 0) return "";
+            if (depth == 0)
+                return "";
             return std::string(static_cast<std::size_t>(depth * 2), ' ') + "->  ";
         }
         static std::string attr_indent(int depth) {
             return std::string(static_cast<std::size_t>(depth * 2 + 4), ' ');
+        }
+
+        /** @brief 算子标题行的估计注解：(rows=N)（estimated_rows>0 时输出）。 */
+        static std::string rows_annotation(const PlanNode& n) {
+            if (n.estimated_rows == 0)
+                return {};
+            return " (rows=" + std::to_string(n.estimated_rows) + ")";
         }
 
         void emit_plan(const PlanNode* plan, std::ostringstream& oss, int depth) {
@@ -143,17 +151,17 @@ namespace corodb {
             const std::string ai = attr_indent(depth);
 
             if (const auto* seq = dynamic_cast<const SeqScanPlan*>(plan)) {
-                oss << in << "Seq Scan on " << seq->table->name() << "\n";
+                oss << in << "Seq Scan on " << seq->table->name() << rows_annotation(*seq) << "\n";
                 return;
             }
             if (const auto* un = dynamic_cast<const UnionPlan*>(plan)) {
-                oss << in << (un->all ? "Union All" : "Union") << "\n";
+                oss << in << (un->all ? "Union All" : "Union") << rows_annotation(*un) << "\n";
                 for (const auto& c: un->children)
                     emit_plan(c.get(), oss, depth + 1);
                 return;
             }
             if (const auto* idx = dynamic_cast<const IndexScanPlan*>(plan)) {
-                oss << in << "Index Scan on " << idx->table->name() << "\n";
+                oss << in << "Index Scan on " << idx->table->name() << rows_annotation(*idx) << "\n";
                 if (idx->is_composite) {
                     oss << ai << "Index Cond: (";
                     for (std::size_t i = 0; i < idx->composite_columns.size(); ++i) {
@@ -189,19 +197,19 @@ namespace corodb {
                 return;
             }
             if (const auto* fil = dynamic_cast<const FilterPlan*>(plan)) {
-                oss << in << "Filter: (" << to_string(fil->predicate) << ")\n";
+                oss << in << "Filter: (" << to_string(fil->predicate) << ")" << rows_annotation(*fil) << "\n";
                 emit_plan(fil->child.get(), oss, depth + 1);
                 return;
             }
             if (const auto* proj = dynamic_cast<const ProjectPlan*>(plan)) {
                 std::vector<std::string> cols;
                 for (const auto& c: proj->columns) cols.push_back(describe_project_item(c));
-                oss << in << "Project [" << join_vec(cols) << "]\n";
+                oss << in << "Project [" << join_vec(cols) << "]" << rows_annotation(*proj) << "\n";
                 emit_plan(proj->child.get(), oss, depth + 1);
                 return;
             }
             if (const auto* hash = dynamic_cast<const HashJoinPlan*>(plan)) {
-                oss << in << "Hash Join (" << join_type_string(hash->type) << ")\n";
+                oss << in << "Hash Join (" << join_type_string(hash->type) << ")" << rows_annotation(*hash) << "\n";
                 oss << ai << "Hash Cond: (" << to_string(hash->left_key) << " = "
                     << to_string(hash->right_key) << ")\n";
                 if (hash->residual.has_value())
@@ -211,7 +219,7 @@ namespace corodb {
                 return;
             }
             if (const auto* merge = dynamic_cast<const MergeJoinPlan*>(plan)) {
-                oss << in << "Merge Join (" << join_type_string(merge->type) << ")\n";
+                oss << in << "Merge Join (" << join_type_string(merge->type) << ")" << rows_annotation(*merge) << "\n";
                 oss << ai << "Merge Cond: (" << to_string(merge->left_key) << " = "
                     << to_string(merge->right_key) << ")\n";
                 if (merge->residual.has_value())
@@ -221,7 +229,7 @@ namespace corodb {
                 return;
             }
             if (const auto* loop = dynamic_cast<const NestedLoopJoinPlan*>(plan)) {
-                oss << in << "Nested Loop (" << join_type_string(loop->type) << ")\n";
+                oss << in << "Nested Loop (" << join_type_string(loop->type) << ")" << rows_annotation(*loop) << "\n";
                 oss << ai << "Join Filter: (" << to_string(loop->on) << ")\n";
                 emit_plan(loop->left.get(), oss, depth + 1);
                 emit_plan(loop->right.get(), oss, depth + 1);
@@ -229,7 +237,8 @@ namespace corodb {
             }
             if (const auto* agg = dynamic_cast<const AggregatePlan*>(plan)) {
                 oss << in << (agg->strategy == AggregatePlan::Strategy::Sort ? "Aggregate (sort)"
-                                                                             : "Hash Aggregate") << "\n";
+                                                                             : "Hash Aggregate")
+                    << rows_annotation(*agg) << "\n";
                 if (!agg->group_by.empty()) {
                     std::vector<std::string> groups;
                     for (const auto& g: agg->group_by) groups.push_back(to_string(g));
@@ -248,7 +257,7 @@ namespace corodb {
                                       : to_string(std::get<AggregateExpr>(it.key));
                     items.push_back(key + (it.asc ? " ASC" : " DESC"));
                 }
-                oss << in << "Sort\n";
+                oss << in << "Sort" << rows_annotation(*ord) << "\n";
                 oss << ai << "Sort Key: " << join_vec(items) << "\n";
                 emit_plan(ord->child.get(), oss, depth + 1);
                 return;

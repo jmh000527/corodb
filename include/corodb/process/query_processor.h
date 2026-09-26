@@ -113,6 +113,13 @@ namespace corodb {
         /** @brief 语句涉及表的统计指纹（各表行数 log2 桶混合）；行数量级变化即指纹变化。 */
         [[nodiscard]] uint64_t stats_fingerprint(const Statement& stmt) const;
 
+        /** @brief 对单表采集统计并持久化（ANALYZE 与 auto-ANALYZE 共用路径）。 */
+        void analyze_table(const std::shared_ptr<Table>& table, uint64_t snapshot_ts);
+
+        /** @brief 自动 ANALYZE（T1.8）：SELECT 规划前，对统计缺失或陈旧（行数变化/写入量
+         *  超过 [statistics].auto_analyze_threshold）的表同步重采集统计并使缓存计划失效。 */
+        void maybe_auto_analyze(const std::vector<std::string>& table_names, Session& session);
+
         /** @brief 构建 SHOW STATUS 的状态指标行生成器。 */
         [[nodiscard]] std::generator<Record> build_status_rows();
 
