@@ -178,14 +178,36 @@ namespace corodb::storage_internal {
         std::vector<uint8_t> bits_;
     };
 
-    /** @brief SSTable 页脚（存储在数据页之后）。仅保留 Bloom（主键泛化后不再用 int64 min/max 裁剪）。 */
+    /** @brief SSTable 页脚（存储在数据页之后）。
+     *
+     * v2（当前）：body = [magic][bloom][页 CRC 表]，body 之后跟 8 字节 trailer
+     * （body_len u32 + body 的 CRC32C u32），页脚定位不再依赖 magic 尾部扫描。
+     * v1（历史）：body 仅 [magic][bloom]，且 body 即文件结尾——向后兼容读取。 */
     struct SstFooter {
         BloomFilter bloom;
+        /// 数据页 CRC32C 表（按数据区页序，0 起）。空 = v1 页脚（无页校验）。
+        std::vector<uint32_t> page_crcs;
 
         [[nodiscard]] bool valid() const noexcept { return bloom.valid(); }
         [[nodiscard]] std::string serialize() const;
         bool deserialize(const std::string& data);
     };
+
+    /** @brief CRC32C（Castagnoli 多项式 0x82F63B78，反射，init/final xor 全 1）。
+     *  "123456789" 的标准测试向量 = 0xE3069283。 */
+    [[nodiscard]] uint32_t crc32c(const void* data, std::size_t n) noexcept;
+
+    /** @brief 序列化页脚为 body + 8 字节 trailer（body_len + body CRC32C）。 */
+    [[nodiscard]] std::string serialize_sst_footer(const SstFooter& footer);
+
+    /** @brief 从 SSTable 文件定位并解析页脚。
+     *  先按 v2 trailer 定位（body CRC 校验通过即采纳）；失败回退 v1 magic 尾部扫描。
+     *  @return 是否成功解析出页脚。 */
+    bool load_sst_footer(const std::filesystem::path& path, SstFooter& out);
+
+    /** @brief 读取 SSTable 的 v2 页脚 trailer CRC（内容指纹）；v1/无页脚返回 0。
+     *  只读文件尾部 8 字节，供 MANIFEST 对账使用。 */
+    [[nodiscard]] uint32_t sst_footer_trailer_crc(const std::filesystem::path& path);
 
     /** @brief 对齐到指定边界。 */
     [[nodiscard]] constexpr std::size_t align_up(std::size_t n, std::size_t align) noexcept {

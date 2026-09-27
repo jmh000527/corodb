@@ -16,8 +16,8 @@
   字节误判为页校验和，导致刷盘后（>1MB 或 CHECKPOINT）已提交数据不可读——已移除该误判校验。
 - [x] 提交日志 GC：checkpoint 覆盖所有磁盘表后安全截断（`CheckpointTruncatesCommitLogKeepsCommittedData`）。
 - [x] 写入路径强制约束：NOT NULL / 类型校验 / 主键唯一性（`TxnTest.*`；约束标志持久化且向后兼容）。
-- [ ] SSTable/Compaction 引入 MANIFEST，避免压缩中途崩溃留下不一致文件集。
-- [ ] 真正的页级校验和：为 SSTable 数据页预留页头并 stamp/verify（检测磁盘静默损坏）。
+- [x] **SSTable/Compaction 引入 MANIFEST**：{data_dir}/MANIFEST（CRC 校验 + tmp/fsync/rename 原子替换）在 create/drop/flush/每级压缩步/全表重写后记录文件集（层级、尺寸、页脚指纹）；启动对账：清理 .tmp 残留、**修补层级缺口**（修复旧代码级联压缩 remove(L_k) 后崩溃导致 max_level 前缀扫描静默丢数据的真实故障）、完成被中断的压缩步（补清空/移除源层）并以现状重写基线。
+- [x] **SSTable 页级校验和**：写路径逐数据页计算 CRC32C（Castagnoli）记入 v2 页脚 CRC 表（页脚带 trailer 定位 + 自校验，不再依赖 magic 尾部扫描）；读路径（全量解码与流式扫描）逐页验证，静默损坏大声抛错；v1 页脚向后兼容（降级不校验）。
 
 ## P1 — 打破内存天花板（最大工程量）
 
@@ -83,15 +83,15 @@
   body 限制 `SELECT * FROM 单表 [WHERE ...]`；内联时 CTE 名改写为基表+别名，
   body WHERE 合取并入引用处（FROM→主 WHERE， JOIN ON→并入 ON）；
   RIGHT/FULL JOIN 侧体带 WHERE 射绝（不等价）；支持多 CTE + 显式别名 + UNION 臂。
-- [ ] 优化器后续：直方图、join 基数估算。
-- [ ] 范围条件走索引、多列索引。
+- [x] 优化器后续：直方图（ANALYZE MCV/等高直方图 + index_range_fraction 精确探针 OPT-8）、join 基数估算（L·R/NDV 乘积模型 OPT-9 + 统计库）。
+- [x] 范围条件走索引（BETWEEN/IN/范围 IndexScan）、多列复合等值索引。
 - [x] **CBO 第一步：行数统计驱动 JOIN 重排**：存储引擎 `estimate_row_count`（LSM：memtable 条目数 +
   SSTable 字节粗估，不解码）；R5 小表左置改用真实行数（Filter 1/3、Aggregate 1/10 选择率传播）。
 - [x] CBO 后续：列级统计/直方图（ANALYZE + MCV/等高直方图 + 选择性估计库 + auto-ANALYZE）、代价模型驱动的算子选择（Cost{startup,total}，IndexScan/SeqScan 与 Hash/Merge/NL 按代价比较）。
 - [x] **BOOLEAN / DATE / TIMESTAMP 类型 v1（存储映射）**：BOOL/BOOLEAN→Int64 存 0/1（TRUE/FALSE
   字面量解析为 1/0，表达式与 VALUES 均支持）；DATE/TIMESTAMP/DATETIME→Text ISO-8601 字符串
   （字典序即时间序，范围/BETWEEN/索引自然生效）；独立 TypeKind + 域校验（拒绝非 0/1、非合法日期）待后续。
-- [ ] DECIMAL；参数化查询。
+- [x] DECIMAL 类型；参数化查询（PREPARE/EXECUTE ? 占位）。
 - [x] **直方图级范围选择率 OPT-8**：有序索引即精确分布（等高直方图每桶 1 条的极限形态），
   `index_range_fraction` 定界后计数、超阈即短路；替换线性 min/max 插值（倾斜分布下后者系统性
   错判，测试实锤两个方向的误判场景）；任意可比较类型含字符串；无探针时回退线性模型。

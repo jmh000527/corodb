@@ -261,6 +261,41 @@ namespace corodb {
         mutable std::shared_mutex sst_footer_cache_mutex_;
         mutable std::unordered_map<std::string, std::pair<int64_t, storage_internal::SstFooter>> sst_footer_cache_;
 
+        /// 获取（并缓存）SSTable 页脚；未命中按 mtime 从磁盘加载。
+        [[nodiscard]] storage_internal::SstFooter get_footer_cached(const std::string& abs_path,
+                                                                    int64_t mtime) const;
+
+        /// 校验单个数据页的 CRC（v2 页脚；v1 无页 CRC 表则跳过）。损坏抛 std::runtime_error。
+        void verify_page_crc(const std::string& abs_path, const storage_internal::SstFooter& footer,
+                             uint32_t offset_pages, uint32_t page_no, const char* data) const;
+
+        // ---- MANIFEST（SSTable/Compaction 清单，崩溃一致性） ----
+        struct ManifestLevel {
+            int level{ 0 };
+            uint64_t size_bytes{ 0 };
+            uint32_t footer_crc{ 0 }; ///< v2 页脚 trailer CRC（内容指纹；v1 为 0）
+        };
+        struct ManifestState {
+            uint64_t version{ 0 };
+            std::map<std::string, std::vector<ManifestLevel>> tables;
+        };
+
+        [[nodiscard]] std::string manifest_path() const;
+        /// 从磁盘加载 MANIFEST（不存在/损坏则保持空基线）。
+        void load_manifest() const;
+        /// 从当前磁盘文件集重建清单并原子落盘（tmp + fsync + rename，version 自增）。
+        void write_manifest() const;
+        /// 启动对账（构造期调用）：清理 .tmp 残留、修补层级缺口、完成被中断的压缩步。
+        void reconcile_with_manifest();
+        /// ManifestState 序列化（含末尾 CRC32C）。
+        [[nodiscard]] static std::string serialize_manifest(const ManifestState& m);
+        /// ManifestState 反序列化（校验 magic/长度/CRC）。
+        [[nodiscard]] static bool deserialize_manifest(const std::string& data, ManifestState& m);
+
+        mutable std::mutex manifest_mutex_;
+        mutable ManifestState manifest_;
+        mutable bool manifest_loaded_{ false };
+
         // ---- 全局提交日志（跨表原子提交） ----
         /// 单一的全局提交日志文件，记录已提交的 commit_ts（跨所有表）。
         [[nodiscard]] std::string commit_log_path() const;

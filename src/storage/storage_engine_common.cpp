@@ -916,6 +916,101 @@ namespace corodb::storage_internal {
 
     // ---- SstFooter ----
 
+    uint32_t crc32c(const void* data, std::size_t n) noexcept {
+        // CRC-32C（Castagnoli）：反射多项式 0x82F63B78，表驱动。
+        struct Table {
+            std::array<uint32_t, 256> t;
+            Table() {
+                for (uint32_t i = 0; i < 256; ++i) {
+                    uint32_t c = i;
+                    for (int k = 0; k < 8; ++k)
+                        c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+                    t[i] = c;
+                }
+            }
+        };
+        static const Table table;
+        uint32_t crc = 0xFFFFFFFFu;
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < n; ++i)
+            crc = table.t[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+    std::string serialize_sst_footer(const SstFooter& footer) {
+        std::string body = footer.serialize();
+        // trailer：body_len + body CRC32C —— 页脚定位不再依赖 magic 尾部扫描。
+        uint32_t body_len = static_cast<uint32_t>(body.size());
+        uint32_t body_crc = crc32c(body.data(), body.size());
+        std::string out = std::move(body);
+        out.append(reinterpret_cast<const char*>(&body_len), sizeof(body_len));
+        out.append(reinterpret_cast<const char*>(&body_crc), sizeof(body_crc));
+        return out;
+    }
+
+    bool load_sst_footer(const std::filesystem::path& path, SstFooter& out) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs)
+            return false;
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff end = ifs.tellg();
+        if (end < 8)
+            return false;
+        const auto file_len = static_cast<std::size_t>(end);
+
+        // v2：尾部 8 字节 trailer（body_len + body CRC32C）。
+        if (file_len >= 16) {
+            char tr[8] = {};
+            ifs.seekg(static_cast<std::streamoff>(file_len - 8));
+            ifs.read(tr, sizeof(tr));
+            uint32_t body_len = 0, body_crc = 0;
+            std::memcpy(&body_len, tr, sizeof(body_len));
+            std::memcpy(&body_crc, tr + 4, sizeof(body_crc));
+            if (body_len >= 8 && static_cast<std::size_t>(body_len) + 8 <= file_len) {
+                std::string body(body_len, '\0');
+                ifs.seekg(static_cast<std::streamoff>(file_len - 8 - body_len));
+                ifs.read(body.data(), static_cast<std::streamsize>(body.size()));
+                if (crc32c(body.data(), body.size()) == body_crc && out.deserialize(body))
+                    return true;
+            }
+            // trailer 不匹配 → 继续 v1 回退（可能是旧格式文件）。
+        }
+
+        // v1 回退：页脚 body 结尾即文件结尾，扫尾部窗口找 magic。
+        out = SstFooter{};
+        constexpr std::size_t kScanWindow = 256 * 1024;
+        const std::size_t seek_offset = (file_len > kScanWindow) ? (file_len - kScanWindow) : 0;
+        ifs.seekg(static_cast<std::streamoff>(seek_offset));
+        std::size_t tail_len = file_len - seek_offset;
+        std::string tail(tail_len, '\0');
+        ifs.read(tail.data(), static_cast<std::streamsize>(tail.size()));
+        const uint32_t fmagic = kFooterMagic;
+        const auto magic_bytes = std::string(reinterpret_cast<const char*>(&fmagic), sizeof(fmagic));
+        const auto footer_pos = tail.rfind(magic_bytes);
+        if (footer_pos == std::string::npos)
+            return false;
+        return out.deserialize(tail.substr(footer_pos));
+    }
+
+    uint32_t sst_footer_trailer_crc(const std::filesystem::path& path) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs)
+            return 0;
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff end = ifs.tellg();
+        if (end < 16)
+            return 0;
+        char tr[8] = {};
+        ifs.seekg(end - 8);
+        ifs.read(tr, sizeof(tr));
+        uint32_t body_len = 0, body_crc = 0;
+        std::memcpy(&body_len, tr, sizeof(body_len));
+        std::memcpy(&body_crc, tr + 4, sizeof(body_crc));
+        if (body_len < 8 || static_cast<std::streamoff>(body_len) + 8 > end)
+            return 0; // v1 或损坏
+        return body_crc;
+    }
+
     std::string SstFooter::serialize() const {
         std::string bloom_data = bloom.serialize();
         std::string out;
@@ -924,6 +1019,12 @@ namespace corodb::storage_internal {
         uint32_t bloom_len = static_cast<uint32_t>(bloom_data.size());
         out.append(reinterpret_cast<const char*>(&bloom_len), sizeof(bloom_len));
         out.append(bloom_data);
+        // v2：数据页 CRC 表（页数 × u32）。
+        uint32_t n = static_cast<uint32_t>(page_crcs.size());
+        out.append(reinterpret_cast<const char*>(&n), sizeof(n));
+        if (!page_crcs.empty())
+            out.append(reinterpret_cast<const char*>(page_crcs.data()),
+                       static_cast<std::streamsize>(page_crcs.size() * sizeof(uint32_t)));
         return out;
     }
 
@@ -939,9 +1040,27 @@ namespace corodb::storage_internal {
         uint32_t bloom_len = 0;
         std::memcpy(&bloom_len, p, sizeof(bloom_len));
         p += sizeof(bloom_len);
-        if (bloom_len == 0)
-            return true; // No bloom filter (empty SSTable).
-        return bloom.deserialize(std::string(p, bloom_len));
+        if (bloom_len != 0) {
+            if (!bloom.deserialize(std::string(p, bloom_len)))
+                return false;
+        }
+        p += bloom_len;
+        // v2：可选的页 CRC 表。v1 body 到此为止（无剩余字节）。
+        page_crcs.clear();
+        const std::size_t remaining =
+                static_cast<std::size_t>(data.size() - static_cast<std::size_t>(p - data.data()));
+        if (remaining >= sizeof(uint32_t)) {
+            uint32_t n = 0;
+            std::memcpy(&n, p, sizeof(n));
+            p += sizeof(n);
+            if (remaining == sizeof(uint32_t) + static_cast<std::size_t>(n) * sizeof(uint32_t)) {
+                page_crcs.resize(n);
+                if (n > 0)
+                    std::memcpy(page_crcs.data(), p, static_cast<std::size_t>(n) * sizeof(uint32_t));
+            }
+            // 长度不符：非 v2 布局（旧文件残留字节），按 v1 处理（page_crcs 保持为空）。
+        }
+        return true;
     }
 
 } // namespace corodb::storage_internal

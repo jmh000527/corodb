@@ -33,6 +33,8 @@ namespace corodb {
         // so all old MVCC versions are safe to discard.  Database::Database()
         // overrides this with a real min_active_read_ts() callback.
         gc_horizon_fn_ = []() { return UINT64_MAX; };
+        // 启动对账：清理 .tmp 残留、修补压缩中断留下的层级缺口/重复内容，建立基线 MANIFEST。
+        reconcile_with_manifest();
     }
 
     /**
@@ -235,6 +237,7 @@ namespace corodb {
         }
         if (storage_internal::get_wal_sync_mode() == storage_internal::WalSyncMode::Durable)
             fsync_path(wal_path(name));
+        write_manifest(); // 新表登记进清单
     }
 
     /**
@@ -305,13 +308,16 @@ namespace corodb {
                         ? 0
                         : static_cast<uint32_t>((data_bytes + Config::kDefaultPageSize - 1) / Config::kDefaultPageSize);
 
+        // 页脚先行：v2 页脚携带数据页 CRC 表，读页时逐页校验（v1 页脚无 CRC 表则跳过）。
+        const SstFooter footer = get_footer_cached(abs_path, mtime);
+
         std::string buffer;
         buffer.reserve(data_bytes);
         for (uint32_t i = 0; i < page_count; ++i) {
             PageId pid{ abs_path, offset_pages + i };
             auto frame = bufpool_.pin(pid);
-            // SSTable 数据页为原始 payload（无 PageHeader/校验和），不做页级校验，
-            // 避免把 payload 字节误判为校验和（页级校验和待引入真正页头后重做，见 ROADMAP）。
+            // P0 页级校验和：CRC32C 与页脚表比对，磁盘静默损坏在此暴露。
+            verify_page_crc(abs_path, footer, offset_pages, offset_pages + i, frame->data.data());
             std::size_t copied = std::min<std::size_t>(
                     Config::kDefaultPageSize, data_bytes - static_cast<std::size_t>(i) * Config::kDefaultPageSize);
             buffer.append(frame->data.data(), copied);
@@ -358,43 +364,62 @@ namespace corodb {
             sst_cache_lru_.push_back(abs_path);
         }
 
-        // Load footer for bloom filter (best-effort: ignore failures).
+        // 页脚已在前置的 get_footer_cached 中加载并缓存。
+        return result;
+    }
+
+    /**
+     * @brief 获取（并缓存）SSTable 页脚。
+     *
+     * 命中按 (路径, mtime) 判定；未命中经 load_sst_footer（v2 trailer 定位，v1 回退）从磁盘
+     * 加载。读取失败返回空页脚（无 bloom、无页 CRC）——降级可用，不阻断读路径。
+     */
+    storage_internal::SstFooter LSMTreeEngine::get_footer_cached(const std::string& abs_path,
+                                                                 int64_t mtime) const {
         {
             std::shared_lock lf(sst_footer_cache_mutex_);
             auto fit = sst_footer_cache_.find(abs_path);
-            if (fit != sst_footer_cache_.end() && fit->second.first == mtime) {
-                // Footer already cached.
-            } else {
-                lf.unlock();
-                SstFooter footer;
-                std::ifstream ifs_footer(path, std::ios::binary);
-                if (ifs_footer) {
-                    ifs_footer.seekg(0, std::ios::end);
-                    std::streamoff fsize = ifs_footer.tellg();
-                    std::size_t file_len = static_cast<std::size_t>(fsize);
-                    if (file_len > sizeof(uint32_t)) {
-                        // Read last ~256 bytes (should contain the footer).
-                        std::size_t seek_offset = (file_len > 256U) ? (file_len - 256U) : 0U;
-                        ifs_footer.seekg(static_cast<std::streamoff>(seek_offset));
-                        std::size_t tail_len = file_len - seek_offset;
-                        std::string tail(tail_len, '\0');
-                        ifs_footer.read(tail.data(), static_cast<std::streamsize>(tail.size()));
-                        uint32_t fmagic = kFooterMagic;
-                        auto magic_bytes = std::string(reinterpret_cast<const char*>(&fmagic), sizeof(fmagic));
-                        auto footer_pos = tail.rfind(magic_bytes);
-                        if (footer_pos != std::string::npos) {
-                            footer.deserialize(tail.substr(footer_pos));
-                        }
-                    }
-                }
-                if (!ec) {
-                    std::unique_lock lf2(sst_footer_cache_mutex_);
-                    sst_footer_cache_[abs_path] = std::make_pair(mtime, std::move(footer));
-                }
-            }
+            if (fit != sst_footer_cache_.end() && fit->second.first == mtime)
+                return fit->second.second;
         }
+        SstFooter footer;
+        storage_internal::load_sst_footer(abs_path, footer);
+        std::unique_lock lf(sst_footer_cache_mutex_);
+        sst_footer_cache_[abs_path] = std::make_pair(mtime, footer);
+        return footer;
+    }
 
-        return result;
+    /**
+     * @brief 校验单个数据页的 CRC32C（P0 页级校验和）。
+     *
+     * 仅当页脚携带页 CRC 表且页号落在表覆盖范围内时验证；损坏抛 std::runtime_error
+     * （磁盘静默损坏必须大声失败，而不是把垃圾行交给上层）。
+     */
+    void LSMTreeEngine::verify_page_crc(const std::string& abs_path, const storage_internal::SstFooter& footer,
+                                        uint32_t offset_pages, uint32_t page_no, const char* data) const {
+        if (footer.page_crcs.empty())
+            return; // v1 页脚：无页校验信息
+        if (page_no < offset_pages)
+            return;
+        const std::size_t idx = page_no - offset_pages;
+        if (idx >= footer.page_crcs.size())
+            return; // 页脚区/越界页不校验
+        const uint32_t actual = crc32c(data, Config::kDefaultPageSize);
+        if (actual != footer.page_crcs[idx]) {
+            throw std::runtime_error("[LSM] SSTable page checksum mismatch (disk corruption?): file=" + abs_path +
+                                     " page=" + std::to_string(page_no) + " expected=0x" +
+                                     [] (uint32_t v) {
+                                         char buf[9];
+                                         snprintf(buf, sizeof buf, "%08X", v);
+                                         return std::string(buf);
+                                     }(footer.page_crcs[idx]) +
+                                     " actual=0x" +
+                                     [] (uint32_t v) {
+                                         char buf[9];
+                                         snprintf(buf, sizeof buf, "%08X", v);
+                                         return std::string(buf);
+                                     }(actual));
+        }
     }
 
     /**
@@ -451,12 +476,16 @@ namespace corodb {
                 data_bytes == 0
                         ? 0
                         : static_cast<uint32_t>((data_bytes + Config::kDefaultPageSize - 1) / Config::kDefaultPageSize);
+        // P0 页级校验和：逐页 CRC32C，写入 v2 页脚的 CRC 表；读路径逐页验证。
+        std::vector<uint32_t> page_crcs;
+        page_crcs.reserve(page_count);
         const auto abs_tmp = std::filesystem::absolute(tmp_path).string();
         for (uint32_t i = 0; i < page_count; ++i) {
             std::vector<char> page(Config::kDefaultPageSize, 0);
             std::size_t start = static_cast<std::size_t>(i) * Config::kDefaultPageSize;
             std::size_t copy = std::min<std::size_t>(Config::kDefaultPageSize, data_bytes - start);
             std::memcpy(page.data(), payload.data() + start, copy);
+            page_crcs.push_back(crc32c(page.data(), page.size()));
             PageId pid{ abs_tmp, offset_pages + i };
             auto frame = bufpool_.allocate(pid);
             frame->data = std::move(page);
@@ -465,7 +494,7 @@ namespace corodb {
         }
         bufpool_.flush_all();
 
-        // Write footer with bloom filter for point-query optimization.
+        // Write footer with bloom filter + page CRC table for point-query optimization.
         {
             SstFooter footer;
             if (!entries.empty()) {
@@ -479,7 +508,8 @@ namespace corodb {
                 }
                 footer.bloom.build(pks);
             }
-            std::string footer_data = footer.serialize();
+            footer.page_crcs = std::move(page_crcs);
+            std::string footer_data = serialize_sst_footer(footer);
             std::ofstream ofs_footer(tmp_path, std::ios::binary | std::ios::app);
             ofs_footer.write(footer_data.data(), static_cast<std::streamsize>(footer_data.size()));
         }
@@ -655,6 +685,7 @@ namespace corodb {
         // MVCC: 保留所有版本（含 tombstone），由后续 compaction GC
 
         write_sstable(base_path(name), columns, merged);
+        write_manifest(); // L0 已原子替换 → 清单记录新文件集（崩溃后对账可见 flush 已完成）
 
         if (pool_) {
             pool_->submit([this, name, columns]() { compact_levels(name, columns); });
@@ -1107,6 +1138,7 @@ namespace corodb {
             uint32_t offset_pages;  ///< 数据区起始页号
             std::size_t data_bytes; ///< 数据区字节数（含填充+footer）
             std::size_t pos;        ///< 数据区内当前字节偏移
+            SstFooter footer;       ///< 页脚（v2 携带页 CRC 表，读页时逐页校验）
         };
         std::vector<SstSrc> ssts;
         {
@@ -1132,8 +1164,14 @@ namespace corodb {
                 std::size_t fsz = std::filesystem::file_size(abs_p);
                 if (fsz < aligned)
                     continue;
-                ssts.push_back(
-                        SstSrc{ abs_p, static_cast<uint32_t>(aligned / Config::kDefaultPageSize), fsz - aligned, 0 });
+                std::error_code mtime_ec;
+                const auto mtime = std::filesystem::last_write_time(abs_p, mtime_ec).time_since_epoch().count();
+                SstSrc src{ abs_p,
+                            static_cast<uint32_t>(aligned / Config::kDefaultPageSize),
+                            fsz - aligned,
+                            0,
+                            get_footer_cached(abs_p, mtime_ec ? 0 : mtime) };
+                ssts.push_back(std::move(src));
             }
         }
 
@@ -1149,6 +1187,7 @@ namespace corodb {
                 std::size_t take = std::min(Config::kDefaultPageSize - in_page, n - got);
                 PageId pid{ s.path, page };
                 auto frame = bufpool_.pin(pid);
+                verify_page_crc(s.path, s.footer, s.offset_pages, page, frame->data.data());
                 out.append(frame->data.data() + in_page, take);
                 bufpool_.unpin(frame);
                 got += take;
@@ -1265,6 +1304,7 @@ namespace corodb {
 
         // Truncate WAL so it only contains the header; fsync via WalWriter.
         WalManager::instance().truncate(wal_path(name));
+        write_manifest(); // 全表重写后记录新文件集
     }
 
     /**
@@ -1337,6 +1377,7 @@ namespace corodb {
             states_.erase(name);
         }
 
+        write_manifest(); // 表文件已删 → 清单移除该表（崩溃后对账不再将其视为待恢复）
         return true;
     }
 
@@ -1604,6 +1645,9 @@ namespace corodb {
             } else {
                 std::filesystem::remove(curr_path);
             }
+            // 本级压缩步完成（写入 next + 清空/移除 curr）→ 立即记录清单。
+            // 级联中途崩溃时，清单最后记录的是最后一个完整步，启动对账据此完成残余步骤。
+            write_manifest();
 
             // 级联：仅当下一层超过相应阈值才继续（阈值随层级倍增）。
             if (level + 1 >= max_level)
@@ -1687,6 +1731,372 @@ namespace corodb {
             std::lock_guard lk(commit_log_mutex_);
             committed_ts_.clear();
         }
+    }
+
+    // =========================================================================
+    // MANIFEST —— SSTable/Compaction 清单（P0 崩溃一致性）
+    //
+    // 文件 {base_dir}/MANIFEST：[magic "MNF1"][u64 version][u32 table_count]
+    //   每表：[u16 name_len][name][u32 level_count] 每级 [u8 level][u64 size][u32 footer_crc]
+    // 末尾 [u32 crc32c(前缀)]。
+    //
+    // 写时机：create/drop/flush/每级压缩步/全表重写之后，tmp+fsync+rename 原子替换。
+    // 启动对账（reconcile_with_manifest）：
+    //   1) 删除 .tmp 残留；
+    //   2) 层级缺口修补（L_k 缺失而更深层存在 → 逐级下移补位。旧代码压缩级联中途崩溃
+    //      会在 remove(L_k) 与下一步之间留下缺口，max_level 前缀扫描从此读不到更深层
+    //      数据——这是本清单修复的最严重故障）；
+    //   3) 完成被中断的压缩步：清单中 L_{k-1} 尺寸吻合而 L_k 吻合失败 ⟺ 压缩 (k-1)→k
+    //      已写入合并结果但未清空源——补一步「清空/移除 L_{k-1}」即可收尾（合并结果已含
+    //      源内容，无需重算）；L0 尺寸不符视为 flush 已完成，直接采纳；
+    //   4) 以对账后的现状重写基线清单。
+    // =========================================================================
+
+    namespace {
+
+        constexpr uint32_t kManifestMagic = 0x314E464D; // "MNF1"
+
+        std::string level_file_name(const std::string& name, int level) {
+            return name + ".lsm.L" + std::to_string(level);
+        }
+
+        /// 从文件名解析 (表名, 层级)；匹配 "{name}.lsm.L{k}" 返回 true。
+        bool parse_level_file_name(const std::string& fname, std::string& name, int& level) {
+            const std::string marker = ".lsm.L";
+            const std::size_t pos = fname.rfind(marker);
+            if (pos == std::string::npos || pos == 0)
+                return false;
+            const std::string suffix = fname.substr(pos + marker.size());
+            if (suffix.empty())
+                return false;
+            int lvl = 0;
+            for (char c: suffix) {
+                if (c < '0' || c > '9')
+                    return false;
+                lvl = lvl * 10 + (c - '0');
+                if (lvl > 1000)
+                    return false;
+            }
+            name = fname.substr(0, pos);
+            level = lvl;
+            return true;
+        }
+
+        /// 从 SSTable 文件头读取 schema（只读 header，不触发状态加载/WAL 回放）。
+        bool read_sstable_header_schema(const std::filesystem::path& p, const std::string& table_name,
+                                        std::vector<Column>& cols) {
+            std::ifstream ifs(p, std::ios::binary);
+            if (!ifs)
+                return false;
+            uint32_t magic = 0, schema_bytes = 0;
+            ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            ifs.read(reinterpret_cast<char*>(&schema_bytes), sizeof(schema_bytes));
+            if (!ifs || magic != kLsmMagic || schema_bytes == 0 || schema_bytes > (1u << 20))
+                return false;
+            std::vector<char> buf(schema_bytes);
+            ifs.read(buf.data(), static_cast<std::streamsize>(schema_bytes));
+            if (!ifs)
+                return false;
+            std::string schema_str(buf.begin(), buf.end());
+            std::istringstream iss(schema_str);
+            cols = deserialize_schema(iss, table_name);
+            return !cols.empty();
+        }
+
+    } // anonymous namespace
+
+    std::string LSMTreeEngine::serialize_manifest(const ManifestState& m) {
+        std::string out;
+        uint32_t magic = kManifestMagic;
+        out.append(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        uint64_t version = m.version;
+        out.append(reinterpret_cast<const char*>(&version), sizeof(version));
+        uint32_t table_count = static_cast<uint32_t>(m.tables.size());
+        out.append(reinterpret_cast<const char*>(&table_count), sizeof(table_count));
+        for (const auto& [name, levels]: m.tables) {
+            uint16_t name_len = static_cast<uint16_t>(name.size());
+            out.append(reinterpret_cast<const char*>(&name_len), sizeof(name_len));
+            out.append(name);
+            uint32_t level_count = static_cast<uint32_t>(levels.size());
+            out.append(reinterpret_cast<const char*>(&level_count), sizeof(level_count));
+            for (const auto& lv: levels) {
+                uint8_t level = static_cast<uint8_t>(lv.level);
+                uint64_t size_bytes = lv.size_bytes;
+                uint32_t footer_crc = lv.footer_crc;
+                out.append(reinterpret_cast<const char*>(&level), sizeof(level));
+                out.append(reinterpret_cast<const char*>(&size_bytes), sizeof(size_bytes));
+                out.append(reinterpret_cast<const char*>(&footer_crc), sizeof(footer_crc));
+            }
+        }
+        uint32_t crc = crc32c(out.data(), out.size());
+        out.append(reinterpret_cast<const char*>(&crc), sizeof(crc));
+        return out;
+    }
+
+    bool LSMTreeEngine::deserialize_manifest(const std::string& data, ManifestState& m) {
+        if (data.size() < 4 + 8 + 4 + 4)
+            return false;
+        const char* p = data.data();
+        const char* const end = data.data() + data.size();
+        uint32_t magic = 0;
+        std::memcpy(&magic, p, sizeof(magic));
+        if (magic != kManifestMagic)
+            return false;
+        p += sizeof(magic);
+        std::memcpy(&m.version, p, sizeof(m.version));
+        p += sizeof(m.version);
+        uint32_t table_count = 0;
+        std::memcpy(&table_count, p, sizeof(table_count));
+        p += sizeof(table_count);
+        m.tables.clear();
+        for (uint32_t i = 0; i < table_count; ++i) {
+            if (p + sizeof(uint16_t) > end)
+                return false;
+            uint16_t name_len = 0;
+            std::memcpy(&name_len, p, sizeof(name_len));
+            p += sizeof(name_len);
+            if (p + name_len + sizeof(uint32_t) > end)
+                return false;
+            std::string name(p, name_len);
+            p += name_len;
+            uint32_t level_count = 0;
+            std::memcpy(&level_count, p, sizeof(level_count));
+            p += sizeof(level_count);
+            std::vector<ManifestLevel> levels;
+            for (uint32_t j = 0; j < level_count; ++j) {
+                if (p + 1 + 8 + 4 > end)
+                    return false;
+                ManifestLevel lv;
+                uint8_t level = 0;
+                std::memcpy(&level, p, sizeof(level));
+                p += sizeof(level);
+                std::memcpy(&lv.size_bytes, p, sizeof(lv.size_bytes));
+                p += sizeof(lv.size_bytes);
+                std::memcpy(&lv.footer_crc, p, sizeof(lv.footer_crc));
+                p += sizeof(lv.footer_crc);
+                lv.level = level;
+                levels.push_back(lv);
+            }
+            m.tables.emplace(std::move(name), std::move(levels));
+        }
+        if (p + sizeof(uint32_t) != end)
+            return false;
+        uint32_t crc = 0;
+        std::memcpy(&crc, p, sizeof(crc));
+        return crc == crc32c(data.data(), static_cast<std::size_t>(p - data.data()));
+    }
+
+    std::string LSMTreeEngine::manifest_path() const {
+        std::filesystem::path p(base_dir_);
+        p /= "MANIFEST";
+        return p.string();
+    }
+
+    void LSMTreeEngine::load_manifest() const {
+        std::lock_guard lk(manifest_mutex_);
+        if (manifest_loaded_)
+            return;
+        manifest_loaded_ = true;
+        std::ifstream ifs(manifest_path(), std::ios::binary);
+        if (!ifs)
+            return; // 无清单（首次启动/旧库）→ 空基线，随后 write_manifest 建立
+        std::string data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        ManifestState loaded;
+        if (deserialize_manifest(data, loaded))
+            manifest_ = std::move(loaded);
+        // 解析失败：保持空基线（对账按现状自愈，不因清单损坏拒绝启动）。
+    }
+
+    void LSMTreeEngine::write_manifest() const {
+        load_manifest(); // 确保已加载（version 延续）
+        // 从当前磁盘文件集重建：levels 文件是唯一事实来源，清单是其快照。
+        ManifestState next;
+        {
+            std::lock_guard lk(manifest_mutex_);
+            next.version = manifest_.version;
+        }
+        std::error_code ec;
+        std::unordered_map<std::string, std::map<int, std::filesystem::path>> found;
+        if (std::filesystem::exists(base_dir_, ec)) {
+            for (const auto& entry: std::filesystem::directory_iterator(base_dir_, ec)) {
+                if (ec)
+                    break;
+                if (!entry.is_regular_file())
+                    continue;
+                const std::string fname = entry.path().filename().string();
+                std::string name;
+                int level = 0;
+                if (!parse_level_file_name(fname, name, level))
+                    continue;
+                found[std::move(name)][level] = entry.path();
+            }
+        }
+        for (auto& [name, levels]: found) {
+            std::vector<ManifestLevel> recs;
+            recs.reserve(levels.size());
+            for (auto& [level, path]: levels) {
+                ManifestLevel lv;
+                lv.level = level;
+                std::error_code ec2;
+                lv.size_bytes = std::filesystem::file_size(path, ec2);
+                if (ec2)
+                    lv.size_bytes = 0;
+                lv.footer_crc = storage_internal::sst_footer_trailer_crc(path);
+                recs.push_back(lv);
+            }
+            next.tables.emplace(name, std::move(recs));
+        }
+        ++next.version;
+
+        const std::string data = serialize_manifest(next);
+        const std::string tmp = manifest_path() + ".tmp";
+        {
+            std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+            if (!ofs)
+                return;
+            ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+            ofs.close();
+        }
+        fsync_path(tmp);
+        std::error_code rec;
+        std::filesystem::rename(tmp, manifest_path(), rec);
+        if (rec)
+            std::filesystem::remove(tmp, rec); // 重命名失败不阻断业务，下次写清单重试
+
+        std::unique_lock lk(manifest_mutex_);
+        manifest_ = std::move(next);
+    }
+
+    void LSMTreeEngine::reconcile_with_manifest() {
+        load_manifest();
+
+        // 1) 清理 .tmp 残留（write_sstable/manifest 崩溃窗口的孤儿文件）。
+        std::error_code ec;
+        if (std::filesystem::exists(base_dir_, ec)) {
+            for (const auto& entry: std::filesystem::directory_iterator(base_dir_, ec)) {
+                if (ec)
+                    break;
+                if (!entry.is_regular_file())
+                    continue;
+                const std::string fname = entry.path().filename().string();
+                if (fname.size() > 4 && fname.compare(fname.size() - 4, 4, ".tmp") == 0) {
+                    std::error_code rm_ec;
+                    std::filesystem::remove(entry.path(), rm_ec);
+                }
+            }
+        }
+
+        // 2) 枚举现有层级文件。
+        std::unordered_map<std::string, std::map<int, std::filesystem::path>> actual;
+        if (std::filesystem::exists(base_dir_, ec)) {
+            for (const auto& entry: std::filesystem::directory_iterator(base_dir_, ec)) {
+                if (ec)
+                    break;
+                if (!entry.is_regular_file())
+                    continue;
+                const std::string fname = entry.path().filename().string();
+                std::string name;
+                int level = 0;
+                if (!parse_level_file_name(fname, name, level))
+                    continue;
+                actual[std::move(name)][level] = entry.path();
+            }
+        }
+
+        ManifestState snapshot;
+        {
+            std::lock_guard lk(manifest_mutex_);
+            snapshot = manifest_;
+        }
+
+        for (auto& [name, levels]: actual) {
+            // 3) 层级缺口修补：L_k 缺失而更深层存在 → 把缺口之上连续的层级整体下移补位
+            //    （恢复前缀性质，否则 max_level 前缀扫描读不到更深层文件 = 静默丢数据）。
+            for (int k = 0;; ++k) {
+                const bool k_exists = levels.count(k) > 0;
+                if (k_exists)
+                    continue;
+                if (levels.empty() || levels.rbegin()->first <= k)
+                    break; // 无更深层
+                // 缺口之上第一个存在的层级 m（崩溃留下的深层文件是连续的）。
+                const int max_lvl = levels.rbegin()->first;
+                int m = k + 1;
+                while (m <= max_lvl && levels.count(m) == 0)
+                    ++m;
+                if (m > max_lvl)
+                    break;
+                const int shift = m - k;
+                for (int j = m; j <= max_lvl; ++j) {
+                    auto it = levels.find(j);
+                    std::error_code mv_ec;
+                    std::filesystem::rename(level_path(name, j), level_path(name, j - shift), mv_ec);
+                    levels[j - shift] = std::move(it->second);
+                    levels.erase(it);
+                }
+                break;
+            }
+
+            // 4) 完成被中断的压缩步：清单中 L_{k-1} 吻合而 L_k 不吻合
+            //    ⟺ 合并结果已写入 L_k 但源 L_{k-1} 未清空 → 补清空/移除即收尾。
+            auto mit = snapshot.tables.find(name);
+            if (mit != snapshot.tables.end()) {
+                for (std::size_t idx = 1; idx < levels.size(); ++idx) {
+                    // levels 按 level 升序（std::map）；idx 为其在既有层级序列中的位置。
+                    const int k = std::next(levels.begin(), static_cast<long>(idx))->first;
+                    const int k_prev = std::next(levels.begin(), static_cast<long>(idx - 1))->first;
+                    if (k_prev != k - 1)
+                        continue; // 已有缺口被修补过的情形，逐对推进
+                    const ManifestLevel* m_prev = nullptr;
+                    const ManifestLevel* m_cur = nullptr;
+                    for (const auto& lv: mit->second) {
+                        if (lv.level == k_prev)
+                            m_prev = &lv;
+                        if (lv.level == k)
+                            m_cur = &lv;
+                    }
+                    std::error_code ec2;
+                    const uint64_t actual_size = std::filesystem::file_size(levels[k], ec2);
+                    const uint32_t actual_crc = storage_internal::sst_footer_trailer_crc(levels[k]);
+                    // 清单中无该层记录，或尺寸/页脚指纹不符 → 视为中断步的目标层
+                    // （L≥1 文件只由压缩步写入且每步后立即更新清单）。
+                    const bool cur_matches =
+                            m_cur && !ec2 && actual_size == m_cur->size_bytes &&
+                            (m_cur->footer_crc == 0 || actual_crc == m_cur->footer_crc);
+                    if (cur_matches)
+                        continue;
+                    // k 不吻合：若 k-1 吻合且清单中存在 → 被中断的压缩步（k-1)→k，补清空源。
+                    if (m_prev) {
+                        std::error_code ec3;
+                        const uint64_t prev_size = std::filesystem::file_size(levels[k_prev], ec3);
+                        const uint32_t prev_crc = storage_internal::sst_footer_trailer_crc(levels[k_prev]);
+                        const bool prev_matches =
+                                !ec3 && prev_size == m_prev->size_bytes &&
+                                (m_prev->footer_crc == 0 || prev_crc == m_prev->footer_crc);
+                        if (prev_matches) {
+                            if (k_prev == 0) {
+                                // L0 需保留（table_exists 依赖）：用现有 L0 文件头的 schema 重写空表。
+                                std::vector<Column> cols;
+                                if (read_sstable_header_schema(levels[k_prev], name, cols)) {
+                                    write_sstable(base_path(name), cols, std::vector<MemEntry>{});
+                                } else {
+                                    std::error_code rm_ec;
+                                    std::filesystem::remove(levels[k_prev], rm_ec);
+                                }
+                            } else {
+                                std::error_code rm_ec;
+                                std::filesystem::remove(levels[k_prev], rm_ec);
+                            }
+                            levels.erase(k_prev);
+                            break; // 一次崩溃至多一个在途步
+                        }
+                    }
+                    // 源不吻合/清单不完整：采纳现状（数据经 MVCC 归并对读端自洽）。
+                }
+            }
+        }
+
+        // 5) 以对账后现状重写基线清单。
+        write_manifest();
     }
 
 } // namespace corodb

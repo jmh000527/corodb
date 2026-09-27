@@ -673,3 +673,160 @@ TEST_F(IndexTest, CreateIndex) {
     EXPECT_EQ(indexes.size(), 1u);
 }
 
+
+// =====================================================================
+// P0：SSTable 页级校验和 + MANIFEST 清单（崩溃一致性）
+// =====================================================================
+
+TEST(Crc32C, KnownVectors) {
+    // CRC-32C 标准测试向量。
+    EXPECT_EQ(storage_internal::crc32c("123456789", 9), 0xE3069283u);
+    EXPECT_EQ(storage_internal::crc32c("", 0), 0x00000000u);
+    EXPECT_EQ(storage_internal::crc32c("hello world", 11), 0xC99465AAu);
+}
+
+namespace {
+    // 构造含 N 行数据且已刷盘（L0 有数据页）的表。
+    void build_flushed_table(StorageEngine& eng, const std::string& name, int n) {
+        std::vector<Column> cols = { Column{ name, "id", TypeKind::Int64 },
+                                     Column{ name, "val", TypeKind::Int64 } };
+        eng.create_table(name, cols);
+        for (int i = 0; i < n; ++i) {
+            Row r;
+            r.values = { static_cast<int64_t>(i), static_cast<int64_t>(i * 7) };
+            eng.append_row(name, cols, r, 0);
+        }
+        eng.checkpoint(); // memtable → L0 SSTable（有数据页 + v2 页脚）
+    }
+
+    std::vector<Row> scan_all(StorageEngine& eng, const std::string& name,
+                              const std::vector<Column>& cols) {
+        return eng.scan_visible(name, cols, std::numeric_limits<uint64_t>::max());
+    }
+} // namespace
+
+TEST_F(LSMEngineTest, SstablePageChecksumDetectsCorruption) {
+    build_flushed_table(*engine, "corrupt_t", 50);
+    const std::vector<Column> cols = { Column{ "corrupt_t", "id", TypeKind::Int64 },
+                                       Column{ "corrupt_t", "val", TypeKind::Int64 } };
+    EXPECT_EQ(scan_all(*engine, "corrupt_t", cols).size(), 50u);
+    engine.reset();
+
+    // 磁盘静默损坏：翻转第一个数据页的首字节。
+    const std::string path = (std::filesystem::path(temp_dir->path()) / "corrupt_t.lsm.L0").string();
+    const std::size_t page_size = Config::kDefaultPageSize;
+    {
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(f.good());
+        // 数据区起始 = align_up(8 + schema_bytes, page_size)：读 schema_bytes 定位。
+        f.seekg(4);
+        uint32_t schema_bytes = 0;
+        f.read(reinterpret_cast<char*>(&schema_bytes), sizeof(schema_bytes));
+        const std::size_t aligned =
+                ((4 + 4 + schema_bytes) + page_size - 1) / page_size * page_size;
+        char original = 0;
+        f.seekg(static_cast<std::streamoff>(aligned));
+        f.read(&original, 1);
+        f.seekg(static_cast<std::streamoff>(aligned));
+        f.put(original ^ 0xFF);
+        f.flush();
+        ASSERT_TRUE(f.good());
+    }
+
+    // 重开引擎 → 读路径逐页校验 → 大声失败（而非把垃圾行交给上层）。
+    storage_internal::WalManager::instance().clear_all();
+    auto eng2 = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    const std::vector<Column> cols2 = { Column{ "corrupt_t", "id", TypeKind::Int64 },
+                                        Column{ "corrupt_t", "val", TypeKind::Int64 } };
+    EXPECT_THROW((void)scan_all(*eng2, "corrupt_t", cols2), std::runtime_error);
+}
+
+TEST_F(LSMEngineTest, ManifestTracksFileSetAndSurvivesRestart) {
+    build_flushed_table(*engine, "mf_t", 30);
+    const std::vector<Column> cols = { Column{ "mf_t", "id", TypeKind::Int64 },
+                                       Column{ "mf_t", "val", TypeKind::Int64 } };
+    // checkpoint/flush 后清单应存在且非空。
+    const std::string manifest = (std::filesystem::path(temp_dir->path()) / "MANIFEST").string();
+    ASSERT_TRUE(std::filesystem::exists(manifest));
+    EXPECT_GT(std::filesystem::file_size(manifest), 0u);
+    engine.reset();
+
+    // 重开引擎：对账为 no-op，数据完好。
+    storage_internal::WalManager::instance().clear_all();
+    auto eng2 = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    const std::vector<Column> cols2 = { Column{ "mf_t", "id", TypeKind::Int64 },
+                                        Column{ "mf_t", "val", TypeKind::Int64 } };
+    EXPECT_EQ(scan_all(*eng2, "mf_t", cols2).size(), 30u);
+}
+
+TEST_F(LSMEngineTest, ManifestHealsCompactionLevelGap) {
+    // 崩溃窗口复现：级联压缩 remove(L1) 后崩溃、L2 已写入 → 层级缺口。
+    // 旧代码 max_level 前缀扫描会静默丢掉 L2 数据；对账应下移补位。
+    build_flushed_table(*engine, "gap_t", 25);
+    engine.reset();
+
+    const std::filesystem::path dir = temp_dir->path();
+    const auto l0 = dir / "gap_t.lsm.L0";
+    // 构造缺口：L0 数据复制为 L2，删除 L0 与（不存在的）L1 —— 形成 L0 缺失 + L2 存在。
+    std::filesystem::copy_file(l0, dir / "gap_t.lsm.L2",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::remove(l0);
+
+    storage_internal::WalManager::instance().clear_all();
+    auto eng2 = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    const std::vector<Column> cols = { Column{ "gap_t", "id", TypeKind::Int64 },
+                                       Column{ "gap_t", "val", TypeKind::Int64 } };
+    // L2 下移补位为 L0 → 数据可读（缺口修复前这里会返回 0 行）。
+    EXPECT_EQ(scan_all(*eng2, "gap_t", cols).size(), 25u);
+}
+
+TEST_F(LSMEngineTest, ManifestCompletesInterruptedCompaction) {
+    // 中断的压缩步：合并结果已写入 L1，L0 未清空，清单未更新 → 对账补清空 L0。
+    build_flushed_table(*engine, "ic_t", 25);
+    const auto l0 = std::filesystem::path(temp_dir->path()) / "ic_t.lsm.L0";
+    const auto l0_size_before = std::filesystem::file_size(l0);
+    engine.reset();
+
+    // L1 ← L0 副本：模拟「L1 = merged(L0, L1_old)，L0 待清空」的中间态。
+    std::filesystem::copy_file(l0, std::filesystem::path(temp_dir->path()) / "ic_t.lsm.L1",
+                               std::filesystem::copy_options::overwrite_existing);
+
+    storage_internal::WalManager::instance().clear_all();
+    auto eng2 = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    // L0 被对账清空（尺寸缩为头部页），数据仍可从 L1 读全。
+    EXPECT_LT(std::filesystem::file_size(l0), l0_size_before);
+    const std::vector<Column> cols = { Column{ "ic_t", "id", TypeKind::Int64 },
+                                       Column{ "ic_t", "val", TypeKind::Int64 } };
+    EXPECT_EQ(scan_all(*eng2, "ic_t", cols).size(), 25u);
+}
+
+TEST_F(LSMEngineTest, ManifestRemovesTmpStraysOnStartup) {
+    // write_sstable / manifest 崩溃窗口遗留的 .tmp 孤儿文件应在启动对账时清理。
+    const auto stray = std::filesystem::path(temp_dir->path()) / "stray.lsm.L0.tmp";
+    { std::ofstream ofs(stray, std::ios::binary); ofs << "junk"; }
+    ASSERT_TRUE(std::filesystem::exists(stray));
+
+    storage_internal::WalManager::instance().clear_all();
+    auto eng2 = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    EXPECT_FALSE(std::filesystem::exists(stray));
+}
+
+TEST_F(LSMEngineTest, SstableFooterV1CompatTruncatedTrailer) {
+    // 旧格式兼容：去掉 v2 trailer（模拟 v1 文件以 body 结尾）后仍可读（无页校验降级）。
+    build_flushed_table(*engine, "v1_t", 20);
+    engine.reset();
+
+    const auto path = std::filesystem::path(temp_dir->path()) / "v1_t.lsm.L0";
+    {
+        // 截掉最后 8 字节（v2 trailer）→ 页脚以 body 结尾 = v1 布局。
+        const auto size_before = std::filesystem::file_size(path);
+        ASSERT_GE(size_before, 8u);
+        std::filesystem::resize_file(path, size_before - 8);
+    }
+
+    storage_internal::WalManager::instance().clear_all();
+    auto eng2 = std::make_unique<LSMTreeEngine>(temp_dir->path());
+    const std::vector<Column> cols = { Column{ "v1_t", "id", TypeKind::Int64 },
+                                       Column{ "v1_t", "val", TypeKind::Int64 } };
+    EXPECT_EQ(scan_all(*eng2, "v1_t", cols).size(), 20u);
+}
