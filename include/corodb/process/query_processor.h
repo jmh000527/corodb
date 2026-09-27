@@ -89,7 +89,7 @@ namespace corodb {
                        LockManager& lock_manager, RowLockManager& row_locks, std::mutex& commit_apply_mutex,
                        UserManager& user_manager);
 
-        /** @brief 完整流水线处理一条 SQL。 */
+        /** @brief 完整流水线处理一条 SQL（含审计记录）。 */
         ProcessedQuery run(const std::string& sql, std::shared_ptr<Session> session);
 
         /** @brief 只读模式（P4 从端副本）：拒绝一切数据变更语句。 */
@@ -98,6 +98,9 @@ namespace corodb {
         }
 
     private:
+        /// run() 的实际执行体（审计包装之下）。
+        ProcessedQuery run_impl(const std::string& sql, std::shared_ptr<Session> session);
+
         std::unique_ptr<PlanNode> build_physical_plan(const Statement& stmt);
 
         /** @brief 相关子查询运行器（执行期逐外层行代换引用 + 递归规划/执行，nested apply）。 */
@@ -134,6 +137,9 @@ namespace corodb {
         LockManager& lock_manager_;
         RowLockManager& row_locks_;
         UserManager& user_manager_;
+
+        /// 语句是否为数据变更语句（只读副本与 RBAC 共用的判定）。
+        [[nodiscard]] static bool is_write_statement(const Statement& stmt);
 
         TransactionController txn_ctrl_;
         UtilityProcessor utility_;

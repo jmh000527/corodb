@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "corodb/ast/ast.h"
 #include "corodb/storage/table.h"
 
 namespace corodb {
@@ -84,6 +85,7 @@ namespace corodb {
 
         bool authenticated{ false }; ///< 是否已通过认证
         std::string auth_user;       ///< 认证用户名
+        UserRole auth_role{ UserRole::ReadWrite }; ///< 认证用户的角色（P2 RBAC）
 
         /// 是否处于活跃事务中。
         bool in_transaction() const noexcept { return current_txn_id != 0; }

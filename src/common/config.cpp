@@ -500,6 +500,18 @@ namespace corodb {
         ofs << "\n";
         ofs << "# 从端连接的主端地址 host:port（replica 角色，如 127.0.0.1:4200）。\n";
         ofs << "connect = " << tmp.replication_connect_ << "\n";
+        ofs << "\n";
+
+        // ---- [audit] ----
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "#  审计日志（JSON Lines，每条语句一行）\n";
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "[audit]\n";
+        ofs << "# 是否启用审计日志。\n";
+        ofs << "enabled = " << (tmp.audit_enabled_ ? "true" : "false") << "\n";
+        ofs << "\n";
+        ofs << "# 审计文件路径（追加写入）。\n";
+        ofs << "path = " << tmp.audit_path_ << "\n";
 
         return true;
     }

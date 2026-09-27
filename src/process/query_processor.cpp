@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "corodb/common/audit.h"
 #include "corodb/common/config.h"
 #include "corodb/db/database.h"
 #include "corodb/executor/executor.h"
@@ -523,6 +524,14 @@ namespace corodb {
         }
     }
 
+    bool QueryProcessor::is_write_statement(const Statement& stmt) {
+        return std::holds_alternative<InsertStmt>(stmt) || std::holds_alternative<UpdateStmt>(stmt) ||
+               std::holds_alternative<DeleteStmt>(stmt) || std::holds_alternative<CreateStmt>(stmt) ||
+               std::holds_alternative<CreateIndexStmt>(stmt) || std::holds_alternative<DropTableStmt>(stmt) ||
+               std::holds_alternative<DropIndexStmt>(stmt) || std::holds_alternative<AnalyzeStmt>(stmt) ||
+               std::holds_alternative<BackupStmt>(stmt);
+    }
+
     std::string QueryProcessor::normalize_sql(const std::string& sql) {
         std::string out;
         out.reserve(sql.size());
@@ -612,20 +621,57 @@ namespace corodb {
      * DML（INSERT/UPDATE/DELETE）立即 drain generator 完成写操作。
      */
     ProcessedQuery QueryProcessor::run(const std::string& sql, std::shared_ptr<Session> session) {
+        // P2 审计：RAII 记录语句执行事件（成功/失败/被拒均落盘）。
+        const auto audit_start = std::chrono::steady_clock::now();
+        AuditLogger::Event event;
+        event.sql = sql;
+        if (session && session->authenticated) {
+            event.user = session->auth_user;
+            switch (session->auth_role) {
+                case UserRole::Admin: event.role = "admin"; break;
+                case UserRole::ReadWrite: event.role = "read_write"; break;
+                case UserRole::ReadOnly: event.role = "read_only"; break;
+            }
+        } else {
+            event.role = "anonymous";
+        }
+        try {
+            auto result = run_impl(sql, session);
+            event.status = "ok";
+            event.duration_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audit_start)
+                            .count();
+            AuditLogger::instance().log(event);
+            return result;
+        } catch (const std::exception& ex) {
+            event.duration_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audit_start)
+                            .count();
+            event.error = ex.what();
+            // 被权限系统拒绝的语句单独归类。
+            const std::string what = ex.what();
+            event.status = (what.find("[RBAC]") != std::string::npos || what.find("[Replica]") != std::string::npos)
+                               ? "denied"
+                               : "error";
+            AuditLogger::instance().log(event);
+            throw;
+        } catch (...) {
+            event.status = "error";
+            AuditLogger::instance().log(event);
+            throw;
+        }
+    }
+
+    ProcessedQuery QueryProcessor::run_impl(const std::string& sql, std::shared_ptr<Session> session) {
         Parser parser;
         Statement stmt = parser.parse(sql);
 
         // P4 只读副本：拒绝一切数据变更语句（含 EXPLAIN ANALYZE 包裹的 DML）。
         if (read_only_) {
-            auto is_write_stmt = [](const Statement& s) {
-                return std::holds_alternative<InsertStmt>(s) || std::holds_alternative<UpdateStmt>(s) ||
-                       std::holds_alternative<DeleteStmt>(s) || std::holds_alternative<CreateStmt>(s) ||
-                       std::holds_alternative<CreateIndexStmt>(s) || std::holds_alternative<DropTableStmt>(s) ||
-                       std::holds_alternative<DropIndexStmt>(s) || std::holds_alternative<AnalyzeStmt>(s) ||
-                       std::holds_alternative<BackupStmt>(s);
-            };
-            if (is_write_stmt(stmt) || (std::holds_alternative<std::shared_ptr<ExplainStmt>>(stmt) &&
-                                        is_write_stmt(std::get<std::shared_ptr<ExplainStmt>>(stmt)->inner))) {
+            const bool is_write = is_write_statement(stmt) ||
+                                  (std::holds_alternative<std::shared_ptr<ExplainStmt>>(stmt) &&
+                                   is_write_statement(std::get<std::shared_ptr<ExplainStmt>>(stmt)->inner));
+            if (is_write) {
                 throw std::runtime_error(
                         "[Replica] Read-only replica: data modification statements are not accepted");
             }
@@ -633,10 +679,15 @@ namespace corodb {
 
         // 0) CREATE USER: always available, even before authentication.
         if (auto* cu = std::get_if<CreateUserStmt>(&stmt)) {
-            if (session->authenticated && session->auth_user != "admin") {
-                throw std::runtime_error("[Auth] Only admin can create users");
+            // 引导例外：尚无任何用户时允许匿名创建首个用户；此后必须持 admin 角色
+            // （并修复既有漏洞：认证门此前位于本块之后，匿名开户可绕过）。
+            if (user_manager_.has_users()) {
+                if (!session->authenticated || user_manager_.role_of(session->auth_user) != UserRole::Admin) {
+                    throw std::runtime_error(
+                            "[RBAC] Only authenticated users with the 'admin' role can create users");
+                }
             }
-            user_manager_.add_user(cu->username, cu->password);
+            user_manager_.add_user(cu->username, cu->password, cu->role);
             ProcessedQuery q;
             q.message = "CREATE USER";
             return q;
@@ -649,6 +700,7 @@ namespace corodb {
             }
             session->authenticated = true;
             session->auth_user = auth->username;
+            session->auth_role = user_manager_.role_of(auth->username);
             ProcessedQuery q;
             q.message = "AUTH OK";
             return q;
@@ -657,6 +709,29 @@ namespace corodb {
         // Require authentication for all other commands (only when users exist).
         if (!session->authenticated && user_manager_.has_users()) {
             throw std::runtime_error("[Auth] Not authenticated. Use AUTH <username> '<password>'");
+        }
+
+        // P2 RBAC：按角色限制语句（仅在启用用户体系时生效）。
+        if (session->authenticated && user_manager_.has_users()) {
+            const UserRole role = session->auth_role;
+            if (role == UserRole::ReadOnly) {
+                // 只读角色：允许查询/事务控制/会话命令；拒绝一切变更。
+                bool is_read = std::holds_alternative<SelectStmt>(stmt) ||
+                               std::holds_alternative<ShowStatusStmt>(stmt) ||
+                               std::holds_alternative<BeginStmt>(stmt) || std::holds_alternative<CommitStmt>(stmt) ||
+                               std::holds_alternative<RollbackStmt>(stmt) ||
+                               std::holds_alternative<SavepointStmt>(stmt) ||
+                               std::holds_alternative<ReleaseSavepointStmt>(stmt) ||
+                               std::holds_alternative<SetTransactionStmt>(stmt) ||
+                               std::holds_alternative<AuthStmt>(stmt);
+                if (auto* ex = std::get_if<std::shared_ptr<ExplainStmt>>(&stmt))
+                    is_read = ex->get() != nullptr && !is_write_statement((*ex)->inner);
+                if (!is_read) {
+                    throw std::runtime_error("[RBAC] role 'read_only' cannot execute data-modification statements");
+                }
+            } else if (role == UserRole::ReadWrite && std::holds_alternative<CreateUserStmt>(stmt)) {
+                throw std::runtime_error("[RBAC] role 'read_write' cannot create users; 'admin' required");
+            }
         }
 
         // 1) 事务控制语句

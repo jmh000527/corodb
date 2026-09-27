@@ -39,7 +39,7 @@
 
 - [ ] 强制认证 + Argon2/bcrypt/scrypt 密码哈希。
 - [ ] TLS 传输加密。
-- [ ] 授权 / RBAC + 审计日志。
+- [x] **授权 / RBAC + 审计日志**：三档角色（admin / read_write / read_only），CREATE USER ... [ROLE ...] 指定，会话按角色强制语句权限（只读角色拒一切变更含 EXPLAIN 包裹的 DML；用户管理仅 admin）；AuditLogger 以 JSON Lines 落盘每条语句（时间戳/用户/角色/SQL 截断/status=ok|error|denied/错误/耗时），[audit] enabled/path 可配。顺带修复既有漏洞：用户已存在时匿名 CREATE USER 可绕过认证门自行开户。
 - [x] **Prometheus 指标、健康检查、慢查询日志**：进程级 Metrics 注册表（Counter/Gauge/Histogram，Prometheus 文本暴露格式）；管理端 HTTP（仅绑定本机回环，独立 [metrics].port）：GET /metrics（查询计数/延迟直方图/连接数/事务计数/写入行数/uptime）与 GET /healthz；慢查询日志（超 [metrics].slow_query_ms 记 WARN，阈值可配、0 禁用）。
 - [x] 物理一致性快照：BACKUP TO 'dir'（checkpoint 后拷贝 SSTable/MANIFEST/索引/统计，排除 WAL 瞬态文件；拷贝期间文件集变化自动重试，耗尽则拒绝给出不一致备份；目标目录清理陈旧文件防幽灵表）。增量与 PITR 待做。
 

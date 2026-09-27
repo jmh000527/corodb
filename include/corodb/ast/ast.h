@@ -715,10 +715,18 @@ namespace corodb {
         std::string password;
     };
 
-    /** @struct CreateUserStmt @brief CREATE USER 语句，创建数据库用户。 */
+    /** @brief 用户角色（P2 RBAC）。 */
+    enum class UserRole {
+        Admin,      ///< 一切权限（含用户管理）
+        ReadWrite,  ///< 数据读写 + DDL（默认）
+        ReadOnly,   ///< 仅查询
+    };
+
+    /** @struct CreateUserStmt @brief CREATE USER 语句，创建数据库用户（可指定角色）。 */
     struct CreateUserStmt {
         std::string username;
         std::string password;
+        UserRole role{ UserRole::ReadWrite };
     };
 
     /**

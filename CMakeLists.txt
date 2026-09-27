@@ -74,6 +74,7 @@ add_library(corodb
     # 公共
     src/common/types.cpp
     src/common/config.cpp
+    src/common/audit.cpp
     src/common/crypto.cpp
     src/common/logger.cpp
     src/common/metrics.cpp
@@ -192,6 +193,7 @@ add_executable(corodb_tests
     tests/test_statistics.cpp
     tests/test_metrics.cpp
     tests/test_crypto.cpp
+    tests/test_security.cpp
     tests/test_replication.cpp
 )
 target_link_libraries(corodb_tests

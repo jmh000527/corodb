@@ -1567,7 +1567,20 @@ namespace corodb {
         if (tok.text.size() < 2 || tok.text.front() != '\'' || tok.text.back() != '\'')
             throw std::runtime_error("[Parser] CREATE USER requires a password string literal");
         std::string password = tok.text.substr(1, tok.text.size() - 2);
-        return CreateUserStmt{ std::move(username), std::move(password) };
+        // 可选 ROLE 子句：admin | read_write | read_only（默认 read_write）。
+        UserRole role = UserRole::ReadWrite;
+        if (match_keyword("ROLE")) {
+            const std::string role_name = to_upper(consume_identifier());
+            if (role_name == "ADMIN")
+                role = UserRole::Admin;
+            else if (role_name == "READ_WRITE")
+                role = UserRole::ReadWrite;
+            else if (role_name == "READ_ONLY")
+                role = UserRole::ReadOnly;
+            else
+                throw std::runtime_error("[Parser] Unknown role: " + role_name);
+        }
+        return CreateUserStmt{ std::move(username), std::move(password), role };
     }
 
     /**

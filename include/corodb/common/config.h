@@ -49,6 +49,8 @@ namespace corodb {
         static constexpr uint32_t kDefaultAuthPbkdf2Iterations = 100000;
         // [replication]（P4 WAL 日志复制）
         static constexpr uint16_t kDefaultReplicationPort = 4200;
+        // [audit]（审计日志）
+        static constexpr bool kDefaultAuditEnabled = true;
 
         static Config& instance() {
             static Config config;
@@ -209,6 +211,14 @@ namespace corodb {
         void set_replication_port(uint16_t v) noexcept { replication_port_ = v; }
         void set_replication_connect(std::string v) noexcept { replication_connect_ = std::move(v); }
 
+        // =========================================================================
+        // [audit]
+        // =========================================================================
+        [[nodiscard]] bool audit_enabled() const noexcept { return audit_enabled_; }
+        [[nodiscard]] const std::string& audit_path() const noexcept { return audit_path_; }
+        void set_audit_enabled(bool v) noexcept { audit_enabled_ = v; }
+        void set_audit_path(std::string v) noexcept { audit_path_ = std::move(v); }
+
     private:
         Config() = default;
         Config(const Config&) = delete;
@@ -288,6 +298,10 @@ namespace corodb {
         std::string replication_role_ = "primary"; ///< primary | replica
         uint16_t replication_port_ = kDefaultReplicationPort;
         std::string replication_connect_; ///< 从端连接的主端地址 "host:port"（仅 replica 角色）
+
+        // [audit]
+        bool audit_enabled_ = kDefaultAuditEnabled;
+        std::string audit_path_ = "audit.log";
     };
 
 } // namespace corodb

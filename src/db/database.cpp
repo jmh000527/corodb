@@ -102,15 +102,20 @@ namespace corodb {
         return crypto::constant_time_equal(crypto::to_hex(dk), dk_hex);
     }
 
-    void UserManager::add_user(const std::string& username, const std::string& password) {
-        users_[username] = hash_password(password);
+    void UserManager::add_user(const std::string& username, const std::string& password, UserRole role) {
+        users_[username] = UserEntry{ hash_password(password), role };
+    }
+
+    UserRole UserManager::role_of(const std::string& username) const {
+        auto it = users_.find(username);
+        return it == users_.end() ? UserRole::ReadWrite : it->second.role;
     }
 
     bool UserManager::authenticate(const std::string& username, const std::string& password) const {
         auto it = users_.find(username);
         if (it == users_.end())
             return false;
-        return verify_password(it->second, password);
+        return verify_password(it->second.hash, password);
     }
 
     /**

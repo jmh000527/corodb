@@ -25,14 +25,18 @@ namespace corodb {
 
     class QueryProcessor;
 
-    /** @brief 用户凭据管理器（PBKDF2-HMAC-SHA256 加盐口令 KDF）。
+    /** @brief 用户凭据管理器（PBKDF2-HMAC-SHA256 加盐口令 KDF + RBAC 角色）。
      *
      * 存储格式：pbkdf2-sha256$<iterations>$<salt_hex>$<dk_hex>，每用户独立随机盐。
      * 旧版 FNV-1a 口令（16 位十六进制）仍可校验，登录后应重设口令完成迁移。 */
     class UserManager {
     public:
-        /** @brief 添加或更新用户。 */
-        void add_user(const std::string& username, const std::string& password);
+        /** @brief 添加或更新用户（P2 RBAC：指定角色）。 */
+        void add_user(const std::string& username, const std::string& password,
+                      UserRole role = UserRole::ReadWrite);
+
+        /** @brief 查询用户角色；未知用户返回 ReadWrite。 */
+        [[nodiscard]] UserRole role_of(const std::string& username) const;
 
         /** @brief 验证凭据，密码匹配返回 true。 */
         [[nodiscard]] bool authenticate(const std::string& username, const std::string& password) const;
@@ -50,7 +54,11 @@ namespace corodb {
         /** @brief 校验口令与存储串是否匹配（按存储格式分发）。 */
         [[nodiscard]] static bool verify_password(const std::string& stored, const std::string& password);
 
-        std::unordered_map<std::string, std::string> users_; ///< username → 存储串
+        struct UserEntry {
+            std::string hash; ///< 口令存储串
+            UserRole role{ UserRole::ReadWrite };
+        };
+        std::unordered_map<std::string, UserEntry> users_; ///< username → 凭据 + 角色
     };
 
     /** @brief 协调解析、优化、执行和存储的数据库入口。 */
