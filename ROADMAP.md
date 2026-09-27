@@ -101,6 +101,6 @@
 
 ## P4 — 高可用与复制
 
-- [ ] WAL 日志复制（主从）、只读副本。
+- [x] **WAL 日志复制（主从）+ 只读副本**：主端引擎每次变更（行写入/按主键删除/提交标记/建表/删表）在本地持久化后经 sink 产出 ReplicationRecord，ReplicationHub 按连接 FIFO 推送（行先于其 COMMIT 到达，未提交行在从端不可见，与崩溃恢复语义一致）；从端 ReplicationFollower 断线自动重连、逐帧重放（mark_committed 写本地提交日志，恢复语义正确）、DDL 记录触发 Catalog 刷新；从端只读（写语句在查询层拒绝）。异步复制（无确认等待），从端引导 = BACKUP 快照 + 目录拷贝；Raft 自动故障转移另列。[replication] role/port/connect 配置 + 4 个复制指标。
 - [ ] 基于共识（Raft）的自动故障转移。
 - [ ] 读写分离、连接池、限流增强。

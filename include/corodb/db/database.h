@@ -109,6 +109,13 @@ namespace corodb {
         /// 获取用户凭据管理器（只读）。
         [[nodiscard]] const UserManager& get_user_manager() const noexcept { return user_manager_; }
 
+        /// 只读模式（P4 从端副本）：拒绝一切数据变更语句。
+        void set_read_only(bool v) noexcept;
+        [[nodiscard]] bool read_only() const noexcept { return read_only_; }
+
+        /// 重扫数据目录，把新增的磁盘表注册进 Catalog（从端复制建表后调用）。
+        void reload_catalog();
+
     private:
         std::unique_ptr<StorageEngine> storage_;
         Catalog catalog_;
@@ -119,6 +126,7 @@ namespace corodb {
         std::shared_ptr<Session> default_session_{ std::make_shared<Session>() };
         std::unique_ptr<QueryProcessor> query_processor_;
         UserManager user_manager_;
+        bool read_only_{ false }; ///< 只读副本标志（P4）
     };
 
 } // namespace corodb

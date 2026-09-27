@@ -10,7 +10,9 @@
 #include "corodb/db/session.h"
 #include "corodb/executor/executor.h"
 #include "corodb/net/port.h"
+#include "corodb/replication/replication.h"
 #include "corodb/server/admin_server.h"
+#include "corodb/storage/lsm_storage_engine.h"
 #include "corodb/storage/storage_engine_common.h"
 #include "corodb/threading/reactor_server.h"
 
@@ -365,6 +367,54 @@ namespace corodb {
             }
         }
 
+        // ---- WAL 日志复制（P4 主从） ----
+        ReplicationHub repl_hub;          // primary：复制日志集线器
+        ReplicationFollower repl_follower; // replica：日志接收器
+        const std::string repl_role = Config::instance().replication_role();
+        if (repl_role == "replica") {
+            db.set_read_only(true);
+            // 解析 connect = "host:port"（缺省 127.0.0.1:[replication].port）。
+            const std::string connect = Config::instance().replication_connect();
+            std::string repl_host = "127.0.0.1";
+            uint16_t repl_port = Config::instance().replication_port();
+            if (const auto colon = connect.rfind(':'); colon != std::string::npos) {
+                repl_host = connect.substr(0, colon);
+                try {
+                    const int parsed = std::stoi(connect.substr(colon + 1));
+                    if (parsed > 0 && parsed <= 65535)
+                        repl_port = static_cast<uint16_t>(parsed);
+                } catch (...) {
+                    // 端口非法：保留默认值。
+                }
+            } else if (!connect.empty()) {
+                repl_host = connect;
+            }
+            auto* lsm = static_cast<LSMTreeEngine*>(db.get_storage());
+            repl_follower.start(repl_host, repl_port, [&db, lsm](const ReplicationRecord& rec) {
+                // DDL 记录：先应用再刷新 Catalog 使新表对查询可见。
+                if (lsm->apply_replication_record(rec) &&
+                    (rec.type == ReplicationRecord::Type::CreateTable ||
+                     rec.type == ReplicationRecord::Type::DropTable)) {
+                    db.reload_catalog();
+                    return;
+                }
+                if (rec.type != ReplicationRecord::Type::CreateTable &&
+                    rec.type != ReplicationRecord::Type::DropTable) {
+                    LOG_WARN("Replication record for unknown table '{}' skipped", rec.table);
+                }
+            });
+            LOG_INFO("Replica mode: streaming from {}:{} (read-only)", repl_host, repl_port);
+        } else {
+            auto* lsm = static_cast<LSMTreeEngine*>(db.get_storage());
+            lsm->set_replication_sink([&repl_hub](const ReplicationRecord& rec) { repl_hub.broadcast(rec); });
+            try {
+                repl_hub.start(Config::instance().replication_port());
+                LOG_INFO("Replication server listening on port {}", repl_hub.port());
+            } catch (const std::exception& ex) {
+                LOG_WARN("Replication server disabled: {}", ex.what());
+            }
+        }
+
         std::size_t actual_workers = reactor_cfg.worker_threads;
         if (actual_workers == 0) {
             actual_workers = std::thread::hardware_concurrency();
@@ -430,6 +480,8 @@ namespace corodb {
             g_server_running.store(false);
             g_shared_db = nullptr;
             admin.reset();
+            repl_follower.stop();
+            repl_hub.stop();
 
             {
                 std::lock_guard lock(g_server_mutex);
@@ -443,6 +495,8 @@ namespace corodb {
         }
 
         admin.reset();
+        repl_follower.stop();
+        repl_hub.stop();
         g_shared_db = nullptr;
         g_server_running.store(false);
 

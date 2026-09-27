@@ -259,6 +259,11 @@ namespace corodb {
             if (auto n = parse_int(value); n && *n >= 0) metrics_slow_query_ms_ = static_cast<uint64_t>(*n);
             return;
         }
+
+        // replication.*
+        if (try_set_str("replication.role", &Config::replication_role_)) return;
+        if (try_set_u16("replication.port", &Config::replication_port_)) return;
+        if (try_set_str("replication.connect", &Config::replication_connect_)) return;
     }
 
     /**
@@ -480,6 +485,21 @@ namespace corodb {
         ofs << "\n";
         ofs << "# 慢查询日志阈值（毫秒）：执行超过该时长的语句记录 WARN 日志，0 = 禁用。\n";
         ofs << "slow_query_ms = " << tmp.metrics_slow_query_ms_ << "\n";
+        ofs << "\n\n";
+
+        // ---- [replication] ----
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "#  WAL 日志复制（P4 主从）\n";
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "[replication]\n";
+        ofs << "# 本节点角色：primary（接受写并推送日志）| replica（只读副本，从主端拉取日志）。\n";
+        ofs << "role = " << tmp.replication_role_ << "\n";
+        ofs << "\n";
+        ofs << "# 主端复制日志监听端口（primary 角色）。\n";
+        ofs << "port = " << tmp.replication_port_ << "\n";
+        ofs << "\n";
+        ofs << "# 从端连接的主端地址 host:port（replica 角色，如 127.0.0.1:4200）。\n";
+        ofs << "connect = " << tmp.replication_connect_ << "\n";
 
         return true;
     }

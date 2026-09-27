@@ -92,6 +92,11 @@ namespace corodb {
         /** @brief 完整流水线处理一条 SQL。 */
         ProcessedQuery run(const std::string& sql, std::shared_ptr<Session> session);
 
+        /** @brief 只读模式（P4 从端副本）：拒绝一切数据变更语句。 */
+        void set_read_only(bool v) noexcept {
+            read_only_ = v;
+        }
+
     private:
         std::unique_ptr<PlanNode> build_physical_plan(const Statement& stmt);
 
@@ -133,6 +138,8 @@ namespace corodb {
         TransactionController txn_ctrl_;
         UtilityProcessor utility_;
         PlanCache plan_cache_;
+
+        bool read_only_{ false }; ///< 只读副本（P4）：拒绝数据变更语句
 
         /** @brief 轻量 SQL 标准化：折叠空白，统一大小写。 */
         static std::string normalize_sql(const std::string& sql);

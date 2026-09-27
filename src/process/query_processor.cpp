@@ -615,6 +615,22 @@ namespace corodb {
         Parser parser;
         Statement stmt = parser.parse(sql);
 
+        // P4 只读副本：拒绝一切数据变更语句（含 EXPLAIN ANALYZE 包裹的 DML）。
+        if (read_only_) {
+            auto is_write_stmt = [](const Statement& s) {
+                return std::holds_alternative<InsertStmt>(s) || std::holds_alternative<UpdateStmt>(s) ||
+                       std::holds_alternative<DeleteStmt>(s) || std::holds_alternative<CreateStmt>(s) ||
+                       std::holds_alternative<CreateIndexStmt>(s) || std::holds_alternative<DropTableStmt>(s) ||
+                       std::holds_alternative<DropIndexStmt>(s) || std::holds_alternative<AnalyzeStmt>(s) ||
+                       std::holds_alternative<BackupStmt>(s);
+            };
+            if (is_write_stmt(stmt) || (std::holds_alternative<std::shared_ptr<ExplainStmt>>(stmt) &&
+                                        is_write_stmt(std::get<std::shared_ptr<ExplainStmt>>(stmt)->inner))) {
+                throw std::runtime_error(
+                        "[Replica] Read-only replica: data modification statements are not accepted");
+            }
+        }
+
         // 0) CREATE USER: always available, even before authentication.
         if (auto* cu = std::get_if<CreateUserStmt>(&stmt)) {
             if (session->authenticated && session->auth_user != "admin") {

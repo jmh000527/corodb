@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "corodb/replication/replication.h"
 #include "corodb/storage/buffer_pool.h"
 #include "corodb/storage/storage_engine_base.h"
 #include "corodb/storage/storage_engine_common.h"
@@ -144,6 +145,19 @@ namespace corodb {
         /** @brief 将 commit_ts 写入全局提交日志（跨表原子提交点，崩溃原子恢复）。 */
         void mark_committed(uint64_t commit_ts) override;
 
+        // ---- WAL 日志复制（P4） ----
+        /// 设置复制 sink（主端）：每次变更在本地持久化后同步回调产出记录。sink 不得重入本引擎。
+        void set_replication_sink(std::function<void(const ReplicationRecord&)> sink) {
+            repl_sink_ = std::move(sink);
+        }
+
+        /// 应用一条主端复制记录（从端）：重放本地变更。未知表/记录类型跳过并返回 false。
+        bool apply_replication_record(const ReplicationRecord& record);
+
+        [[nodiscard]] bool has_replication_sink() const noexcept {
+            return static_cast<bool>(repl_sink_);
+        }
+
     private:
         std::string base_dir_;             ///< 存储基础目录
         std::size_t memtable_limit_bytes_; ///< MemTable 大小阈值（构造时取自 Config）
@@ -271,6 +285,11 @@ namespace corodb {
         /// 校验单个数据页的 CRC（v2 页脚；v1 无页 CRC 表则跳过）。损坏抛 std::runtime_error。
         void verify_page_crc(const std::string& abs_path, const storage_internal::SstFooter& footer,
                              uint32_t offset_pages, uint32_t page_no, const char* data) const;
+
+        /// 从端解析表 schema（状态缓存 → SSTable 头）；表不存在返回 false。
+        bool resolve_local_schema(const std::string& name, std::vector<Column>& cols);
+
+        std::function<void(const ReplicationRecord&)> repl_sink_; ///< 复制 sink（主端）
 
         // ---- MANIFEST（SSTable/Compaction 清单，崩溃一致性） ----
         struct ManifestLevel {

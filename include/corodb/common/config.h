@@ -47,6 +47,8 @@ namespace corodb {
         static constexpr uint64_t kDefaultSlowQueryMs = 1000;
         // [auth]（口令 KDF）
         static constexpr uint32_t kDefaultAuthPbkdf2Iterations = 100000;
+        // [replication]（P4 WAL 日志复制）
+        static constexpr uint16_t kDefaultReplicationPort = 4200;
 
         static Config& instance() {
             static Config config;
@@ -197,6 +199,16 @@ namespace corodb {
         void set_metrics_port(uint16_t v) noexcept { metrics_port_ = v; }
         void set_metrics_slow_query_ms(uint64_t v) noexcept { metrics_slow_query_ms_ = v; }
 
+        // =========================================================================
+        // [replication]
+        // =========================================================================
+        [[nodiscard]] const std::string& replication_role() const noexcept { return replication_role_; }
+        [[nodiscard]] uint16_t replication_port() const noexcept { return replication_port_; }
+        [[nodiscard]] const std::string& replication_connect() const noexcept { return replication_connect_; }
+        void set_replication_role(std::string v) noexcept { replication_role_ = std::move(v); }
+        void set_replication_port(uint16_t v) noexcept { replication_port_ = v; }
+        void set_replication_connect(std::string v) noexcept { replication_connect_ = std::move(v); }
+
     private:
         Config() = default;
         Config(const Config&) = delete;
@@ -271,6 +283,11 @@ namespace corodb {
         bool metrics_enabled_ = kDefaultMetricsEnabled;
         uint16_t metrics_port_ = kDefaultMetricsPort;
         uint64_t metrics_slow_query_ms_ = kDefaultSlowQueryMs;
+
+        // [replication]
+        std::string replication_role_ = "primary"; ///< primary | replica
+        uint16_t replication_port_ = kDefaultReplicationPort;
+        std::string replication_connect_; ///< 从端连接的主端地址 "host:port"（仅 replica 角色）
     };
 
 } // namespace corodb

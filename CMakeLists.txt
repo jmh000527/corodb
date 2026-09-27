@@ -82,6 +82,7 @@ add_library(corodb
     # 服务
     src/server/server.cpp
     src/server/admin_server.cpp
+    src/replication/replication.cpp
     src/db/database.cpp
 )
 
@@ -191,6 +192,7 @@ add_executable(corodb_tests
     tests/test_statistics.cpp
     tests/test_metrics.cpp
     tests/test_crypto.cpp
+    tests/test_replication.cpp
 )
 target_link_libraries(corodb_tests
     PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock

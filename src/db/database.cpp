@@ -121,34 +121,7 @@ namespace corodb {
         auto* lsm = static_cast<LSMTreeEngine*>(storage_.get());
         lsm->set_gc_horizon([this] { return txn_manager_.min_active_read_ts(); });
 
-        if (std::filesystem::exists(data_dir)) {
-            std::set<std::string> loaded_tables;
-            for (const auto& entry: std::filesystem::directory_iterator(data_dir)) {
-                if (!entry.is_regular_file())
-                    continue;
-
-                const auto& p = entry.path();
-                std::string filename = p.filename().string();
-                auto pos = filename.rfind(".lsm.L");
-                if (pos == std::string::npos)
-                    continue;
-
-                std::string suffix = filename.substr(pos + 6);
-                bool is_num = !suffix.empty() && std::all_of(suffix.begin(), suffix.end(), ::isdigit);
-                if (!is_num)
-                    continue;
-
-                std::string name = filename.substr(0, pos);
-                if (!name.empty() && loaded_tables.find(name) == loaded_tables.end()) {
-                    try {
-                        catalog_.register_table(std::make_shared<Table>(name, std::vector<Column>{}, storage_.get()));
-                        loaded_tables.insert(name);
-                    } catch (const std::exception& ex) {
-                        LOG_WARN("Skip table {}: {}", name, ex.what());
-                    }
-                }
-            }
-        }
+        reload_catalog();
 
         if (const uint64_t max_ts = storage_->max_observed_commit_ts(); max_ts > 0) {
             txn_manager_.bootstrap_min_next_ts(max_ts + 1);
@@ -160,7 +133,49 @@ namespace corodb {
         // Auth is opt-in: disabled until the first user is added.
     }
 
+    /**
+     * @brief 重扫数据目录，把新增的磁盘表注册进 Catalog（从端复制建表后调用）。
+     * 已注册的表跳过；注册顺序保证查询可见。
+     */
+    void Database::reload_catalog() {
+        const std::string data_dir = storage_->base_dir();
+        if (!std::filesystem::exists(data_dir))
+            return;
+        std::set<std::string> loaded_tables;
+        for (const auto& entry: std::filesystem::directory_iterator(data_dir)) {
+            if (!entry.is_regular_file())
+                continue;
+
+            const auto& p = entry.path();
+            std::string filename = p.filename().string();
+            auto pos = filename.rfind(".lsm.L");
+            if (pos == std::string::npos)
+                continue;
+
+            std::string suffix = filename.substr(pos + 6);
+            bool is_num = !suffix.empty() && std::all_of(suffix.begin(), suffix.end(), ::isdigit);
+            if (!is_num)
+                continue;
+
+            std::string name = filename.substr(0, pos);
+            if (!name.empty() && !catalog_.lookup(name) && loaded_tables.find(name) == loaded_tables.end()) {
+                try {
+                    catalog_.register_table(std::make_shared<Table>(name, std::vector<Column>{}, storage_.get()));
+                    loaded_tables.insert(name);
+                } catch (const std::exception& ex) {
+                    LOG_WARN("Skip table {}: {}", name, ex.what());
+                }
+            }
+        }
+    }
+
     Database::~Database() = default;
+
+    void Database::set_read_only(bool v) noexcept {
+        read_only_ = v;
+        if (query_processor_)
+            query_processor_->set_read_only(v);
+    }
 
     /**
      * @brief 判断查询结果是否为纯文本消息（无行集）。

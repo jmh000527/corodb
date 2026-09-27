@@ -238,6 +238,14 @@ namespace corodb {
         if (storage_internal::get_wal_sync_mode() == storage_internal::WalSyncMode::Durable)
             fsync_path(wal_path(name));
         write_manifest(); // 新表登记进清单
+        // P4 复制：产出 CreateTable 记录（从端建立同名表后重放数据）。
+        if (repl_sink_) {
+            ReplicationRecord r;
+            r.type = ReplicationRecord::Type::CreateTable;
+            r.table = name;
+            r.columns = columns;
+            repl_sink_(r);
+        }
     }
 
     /**
@@ -757,6 +765,16 @@ namespace corodb {
             wal_append_record_no_wait(wpath, 1, rec);
         }
 
+        // P4 复制：本地 WAL 已落笔 → 产出 ApplyRow 记录（从端按同序重放）。
+        if (repl_sink_) {
+            ReplicationRecord r;
+            r.type = ReplicationRecord::Type::ApplyRow;
+            r.table = name;
+            r.commit_ts = commit_ts;
+            r.row_wire = rec;
+            repl_sink_(r);
+        }
+
         // 检查内存表大小是否超过限制
         bool need_flush = state->memtable_bytes >= memtable_limit_bytes_;
         std::map<MVCCKey, MemEntry, MVCCKeyCompare> mem_snapshot;
@@ -795,6 +813,16 @@ namespace corodb {
             wal_append_record_no_wait(wpath, 12, payload);
         } else {
             wal_append_record_no_wait(wpath, 2, enc);
+        }
+
+        // P4 复制：产出 ApplyDelete 记录。
+        if (repl_sink_) {
+            ReplicationRecord r;
+            r.type = ReplicationRecord::Type::ApplyDelete;
+            r.table = name;
+            r.commit_ts = commit_ts;
+            r.row_wire = enc;
+            repl_sink_(r);
         }
 
         lock.unlock();
@@ -849,6 +877,74 @@ namespace corodb {
         wal_append_record(commit_log_path(), kWalCommitBarrier, payload);
         committed_ts_.insert(commit_ts);
         commit_log_present_ = true;
+        // P4 复制：产出 Commit 记录（同连接 FIFO 保证从端行先于提交到达）。
+        if (repl_sink_) {
+            ReplicationRecord r;
+            r.type = ReplicationRecord::Type::Commit;
+            r.commit_ts = commit_ts;
+            repl_sink_(r);
+        }
+    }
+
+    /**
+     * @brief 应用一条主端复制记录（P4 从端重放）。
+     *
+     * 引擎在从端未挂 sink，因此 apply 内部调用的写方法不会再次广播（无递归）。
+     * 未知表（未收到 CreateTable 或引导快照缺失）返回 false 由调用方告警。
+     */
+    bool LSMTreeEngine::apply_replication_record(const ReplicationRecord& rec) {
+        switch (rec.type) {
+            case ReplicationRecord::Type::CreateTable: {
+                if (table_exists(rec.table))
+                    return true; // 引导快照已包含该表：幂等跳过
+                create_table(rec.table, rec.columns);
+                return true;
+            }
+            case ReplicationRecord::Type::DropTable: {
+                if (!table_exists(rec.table))
+                    return true; // 幂等
+                drop_table(rec.table);
+                return true;
+            }
+            case ReplicationRecord::Type::Commit: {
+                mark_committed(rec.commit_ts);
+                return true;
+            }
+            case ReplicationRecord::Type::ApplyRow: {
+                std::vector<Column> cols;
+                if (!resolve_local_schema(rec.table, cols))
+                    return false;
+                Row row = decode_row(rec.row_wire, cols, "<replication>");
+                append_row(rec.table, cols, row, rec.commit_ts);
+                return true;
+            }
+            case ReplicationRecord::Type::ApplyDelete: {
+                std::vector<Column> cols;
+                if (!resolve_local_schema(rec.table, cols))
+                    return false;
+                Value key = rec.row_wire.empty() ? Value{ NullValue{} } : decode_key(rec.row_wire);
+                delete_row_by_key(rec.table, cols, key, rec.commit_ts);
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    /** @brief 从端解析表 schema：优先取已加载状态，否则从 SSTable 头读取；表不存在返回 false。 */
+    bool LSMTreeEngine::resolve_local_schema(const std::string& name, std::vector<Column>& cols) {
+        {
+            std::shared_lock lock(states_mutex_);
+            auto it = states_.find(name);
+            if (it != states_.end() && !it->second->schema.empty()) {
+                cols = it->second->schema;
+                return true;
+            }
+        }
+        if (!table_exists(name))
+            return false;
+        cols = load_schema(name);
+        return !cols.empty();
     }
 
     uint64_t LSMTreeEngine::max_observed_commit_ts() const {
@@ -1381,6 +1477,13 @@ namespace corodb {
         }
 
         write_manifest(); // 表文件已删 → 清单移除该表（崩溃后对账不再将其视为待恢复）
+        // P4 复制：产出 DropTable 记录（从端删除同名表）。
+        if (repl_sink_) {
+            ReplicationRecord r;
+            r.type = ReplicationRecord::Type::DropTable;
+            r.table = name;
+            repl_sink_(r);
+        }
         return true;
     }
 
