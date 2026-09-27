@@ -45,6 +45,8 @@ namespace corodb {
         static constexpr bool    kDefaultMetricsEnabled = true;
         static constexpr uint16_t kDefaultMetricsPort = 4100;
         static constexpr uint64_t kDefaultSlowQueryMs = 1000;
+        // [auth]（口令 KDF）
+        static constexpr uint32_t kDefaultAuthPbkdf2Iterations = 100000;
 
         static Config& instance() {
             static Config config;
@@ -145,7 +147,9 @@ namespace corodb {
         // [auth]
         // =========================================================================
         [[nodiscard]] const std::string& auth_salt() const noexcept { return auth_salt_; }
+        [[nodiscard]] uint32_t auth_pbkdf2_iterations() const noexcept { return auth_pbkdf2_iterations_; }
         void set_auth_salt(std::string v) noexcept { auth_salt_ = std::move(v); }
+        void set_auth_pbkdf2_iterations(uint32_t v) noexcept { auth_pbkdf2_iterations_ = v; }
 
         // =========================================================================
         // [statistics]
@@ -247,6 +251,7 @@ namespace corodb {
 
         // [auth]
         std::string auth_salt_ = "corodb_salt_v1";
+        uint32_t auth_pbkdf2_iterations_ = kDefaultAuthPbkdf2Iterations;
 
         // [statistics]
         std::size_t statistics_sample_target_ = kDefaultStatisticsSampleTarget;

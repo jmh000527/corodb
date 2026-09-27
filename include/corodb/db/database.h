@@ -25,7 +25,10 @@ namespace corodb {
 
     class QueryProcessor;
 
-    /** @brief 用户凭据管理器（SHA-256 密码哈希）。 */
+    /** @brief 用户凭据管理器（PBKDF2-HMAC-SHA256 加盐口令 KDF）。
+     *
+     * 存储格式：pbkdf2-sha256$<iterations>$<salt_hex>$<dk_hex>，每用户独立随机盐。
+     * 旧版 FNV-1a 口令（16 位十六进制）仍可校验，登录后应重设口令完成迁移。 */
     class UserManager {
     public:
         /** @brief 添加或更新用户。 */
@@ -38,9 +41,16 @@ namespace corodb {
         [[nodiscard]] bool has_users() const noexcept { return !users_.empty(); }
 
     private:
+        /** @brief 旧版 FNV-1a 口令哈希（16 位十六进制；仅为存量账号保留校验）。 */
+        [[nodiscard]] static std::string legacy_hash_password(const std::string& password);
+
+        /** @brief 生成 PBKDF2 存储串（随机盐 + [auth].pbkdf2_iterations 迭代）。 */
         [[nodiscard]] static std::string hash_password(const std::string& password);
 
-        std::unordered_map<std::string, std::string> users_; ///< username → hash
+        /** @brief 校验口令与存储串是否匹配（按存储格式分发）。 */
+        [[nodiscard]] static bool verify_password(const std::string& stored, const std::string& password);
+
+        std::unordered_map<std::string, std::string> users_; ///< username → 存储串
     };
 
     /** @brief 协调解析、优化、执行和存储的数据库入口。 */

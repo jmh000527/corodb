@@ -10,28 +10,96 @@
 #include <iostream>
 #include <set>
 
+#include "corodb/common/crypto.h"
 #include "corodb/common/logger.h"
 #include "corodb/process/query_processor.h"
 #include "corodb/storage/lsm_storage_engine.h"
+
+#include <random>
+#include <string_view>
 
 namespace corodb {
 
     // ---- UserManager ----
 
     std::string UserManager::hash_password(const std::string& password) {
-        // 简单加盐哈希。生产环境应使用 bcrypt / scrypt / Argon2。
+        // PBKDF2-HMAC-SHA256：每用户独立随机盐（16 字节）+ 可配迭代次数（[auth].pbkdf2_iterations）。
+        std::random_device rd;
+        std::mt19937_64 rng{ (static_cast<uint64_t>(rd()) << 32) ^ rd() };
+        std::string salt(16, '\0');
+        for (auto& c: salt)
+            c = static_cast<char>(rng() & 0xFF);
+        const std::string dk =
+                crypto::pbkdf2_hmac_sha256(password, salt, Config::instance().auth_pbkdf2_iterations(), 32);
+        return "pbkdf2-sha256$" + std::to_string(Config::instance().auth_pbkdf2_iterations()) + "$" +
+               crypto::to_hex(salt) + "$" + crypto::to_hex(dk);
+    }
+
+    std::string UserManager::legacy_hash_password(const std::string& password) {
+        // 旧版 FNV-1a 64-bit（非加密安全）：仅为存量账号保留校验，登录后应重设口令迁移。
         const std::string salt = Config::instance().auth_salt();
         std::string input = salt + password;
-        // FNV-1a 64-bit 简单哈希（非加密安全）。
         uint64_t h = 14695981039346656037ULL;
         for (unsigned char c : input) {
             h ^= c;
             h *= 1099511628211ULL;
         }
-        // 返回十六进制字符串。
         char buf[17];
         std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
         return std::string(buf);
+    }
+
+    bool UserManager::verify_password(const std::string& stored, const std::string& password) {
+        // 格式分发：pbkdf2-sha256$iter$salt_hex$dk_hex | 旧版 16 位十六进制 FNV。
+        constexpr std::string_view kPrefix = "pbkdf2-sha256$";
+        if (stored.rfind(kPrefix, 0) != 0) {
+            return crypto::constant_time_equal(stored, legacy_hash_password(password));
+        }
+        // 解析 iter$salt_hex$dk_hex。
+        const std::string body = stored.substr(kPrefix.size());
+        const auto p1 = body.find('$');
+        if (p1 == std::string::npos)
+            return false;
+        const auto p2 = body.find('$', p1 + 1);
+        if (p2 == std::string::npos)
+            return false;
+        uint32_t iterations = 0;
+        try {
+            const unsigned long long parsed = std::stoull(body.substr(0, p1));
+            if (parsed == 0 || parsed > 10'000'000ull)
+                return false;
+            iterations = static_cast<uint32_t>(parsed);
+        } catch (...) {
+            return false;
+        }
+        const std::string salt_hex = body.substr(p1 + 1, p2 - p1 - 1);
+        const std::string dk_hex = body.substr(p2 + 1);
+        // 编码长度约定：salt 16 字节 → 32 hex；dk 32 字节 → 64 hex。
+        if (salt_hex.size() != 32 || dk_hex.size() != 64)
+            return false;
+        auto hex_decode = [](const std::string& hex) {
+            auto nibble = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            std::string out;
+            out.reserve(hex.size() / 2);
+            for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+                const int hi = nibble(hex[i]);
+                const int lo = nibble(hex[i + 1]);
+                if (hi < 0 || lo < 0)
+                    return std::string();
+                out.push_back(static_cast<char>((hi << 4) | lo));
+            }
+            return out;
+        };
+        const std::string salt = hex_decode(salt_hex);
+        if (salt.empty())
+            return false;
+        const std::string dk = crypto::pbkdf2_hmac_sha256(password, salt, iterations, 32);
+        return crypto::constant_time_equal(crypto::to_hex(dk), dk_hex);
     }
 
     void UserManager::add_user(const std::string& username, const std::string& password) {
@@ -42,7 +110,7 @@ namespace corodb {
         auto it = users_.find(username);
         if (it == users_.end())
             return false;
-        return it->second == hash_password(password);
+        return verify_password(it->second, password);
     }
 
     /**

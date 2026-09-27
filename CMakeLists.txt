@@ -74,6 +74,7 @@ add_library(corodb
     # 公共
     src/common/types.cpp
     src/common/config.cpp
+    src/common/crypto.cpp
     src/common/logger.cpp
     src/common/metrics.cpp
     src/common/table_renderer.cpp
@@ -189,6 +190,7 @@ add_executable(corodb_tests
     tests/test_config.cpp
     tests/test_statistics.cpp
     tests/test_metrics.cpp
+    tests/test_crypto.cpp
 )
 target_link_libraries(corodb_tests
     PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock

@@ -213,6 +213,11 @@ namespace corodb {
 
         // auth.*
         if (try_set_str("auth.password_salt", &Config::auth_salt_)) return;
+        if (k == "auth.pbkdf2_iterations") {
+            if (auto n = parse_int(value); n && *n >= 1000 && *n <= 10'000'000ll)
+                auth_pbkdf2_iterations_ = static_cast<uint32_t>(*n);
+            return;
+        }
 
         // statistics.*
         if (try_set_size("statistics.sample_target", &Config::statistics_sample_target_)) return;
@@ -414,8 +419,10 @@ namespace corodb {
         ofs << "#  认证参数\n";
         ofs << "# ----------------------------------------------------------------------------\n";
         ofs << "[auth]\n";
-        ofs << "# 密码哈希盐值，修改后所有已有密码失效（需重新 CREATE USER）。\n";
+        ofs << "# 密码哈希盐值（旧版 FNV 口令校验用；新账号使用独立随机盐）。\n";
         ofs << "password_salt = " << tmp.auth_salt_ << "\n";
+        ofs << "# PBKDF2-HMAC-SHA256 迭代次数（1000–10000000，越高越抗暴力破解越慢）。\n";
+        ofs << "pbkdf2_iterations = " << tmp.auth_pbkdf2_iterations_ << "\n";
         ofs << "\n\n";
 
         // ---- [statistics] ----
