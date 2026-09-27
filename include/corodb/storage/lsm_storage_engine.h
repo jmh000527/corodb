@@ -240,9 +240,12 @@ namespace corodb {
 
     private:
         // Internal helpers
-        // flush_memtable_internal 接受一个 memtable 快照，在不持有 state->mutex 的情况下执行 I/O
+        // flush_memtable_internal 接受一个 memtable 快照，在不持有 state->mutex 的情况下执行 I/O。
+        // defer_compaction=true（默认）把压缩提交到线程池；false 同步压缩（checkpoint 用，
+        // 保证 checkpoint 返回后无在途后台写）。
         void flush_memtable_internal(const std::string& name, const std::vector<Column>& columns,
-                                     std::map<MVCCKey, MemEntry, MVCCKeyCompare> mem_snapshot);
+                                     std::map<MVCCKey, MemEntry, MVCCKeyCompare> mem_snapshot,
+                                     bool defer_compaction = true);
         void load_state_locked(TableState* state, const std::string& name, const std::vector<Column>& columns) const;
 
         ThreadPool* pool_{ nullptr };

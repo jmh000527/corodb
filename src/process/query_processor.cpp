@@ -7,7 +7,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <filesystem>
+#include <map>
 #include <optional>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -687,6 +691,94 @@ namespace corodb {
             ProcessedQuery q;
             q.message = "ANALYZE";
             return q;
+        }
+
+        // 1f) BACKUP — checkpoint 后对数据目录做一致性快照拷贝（P2 备份/恢复）
+        if (auto* bak = std::get_if<BackupStmt>(&stmt)) {
+            namespace fs = std::filesystem;
+            const fs::path src = storage_.base_dir();
+            const fs::path dst = bak->target_dir;
+            if (dst == src || dst.empty())
+                throw std::runtime_error("[BACKUP] Target directory must differ from the data directory");
+
+            // 目录文件快照（名字 → 字节数），用于并发写检测。
+            // WAL 文件（含全局提交日志）是 checkpoint 后的瞬态产物，不属于备份内容，排除在外。
+            auto is_wal_file = [](const std::string& fname) {
+                return fname.size() >= 4 && fname.compare(fname.size() - 4, 4, ".wal") == 0;
+            };
+            auto snapshot_files = [&is_wal_file](const fs::path& dir) {
+                std::map<std::string, uintmax_t> out;
+                std::error_code ec;
+                for (const auto& entry: fs::directory_iterator(dir, ec)) {
+                    if (ec || !entry.is_regular_file())
+                        continue;
+                    const std::string fname = entry.path().filename().string();
+                    if (is_wal_file(fname))
+                        continue;
+                    out[fname] = entry.file_size(ec);
+                }
+                return out;
+            };
+
+            constexpr int kMaxAttempts = 3;
+            for (int attempt = 1;; ++attempt) {
+                // checkpoint：全部 memtable 落盘为完整 SSTable（原子替换）+ WAL 截断。
+                storage_.checkpoint();
+                const auto before = snapshot_files(src);
+
+                fs::create_directories(dst);
+                // 拷贝全部非 WAL 文件（SSTable/MANIFEST/索引/统计）。
+                std::size_t files = 0;
+                uintmax_t bytes = 0;
+                for (const auto& entry: fs::directory_iterator(src)) {
+                    if (!entry.is_regular_file())
+                        continue;
+                    const std::string fname = entry.path().filename().string();
+                    if (is_wal_file(fname))
+                        continue;
+                    const auto target = dst / entry.path().filename();
+                    fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing);
+                    ++files;
+                    bytes += entry.file_size();
+                }
+                // 清理目标目录中不属于备份的文件：源里已消失的旧文件 + WAL 瞬态文件。
+                for (const auto& entry: fs::directory_iterator(dst)) {
+                    if (!entry.is_regular_file())
+                        continue;
+                    const std::string fname = entry.path().filename().string();
+                    const bool keep = fs::exists(src / entry.path().filename()) && !is_wal_file(fname);
+                    if (!keep) {
+                        std::error_code ec;
+                        fs::remove(entry.path(), ec);
+                    }
+                }
+
+                // 拷贝期间发生写入（文件集变化）→ 间隔重试（等在途后台任务收敛）；耗尽则拒绝。
+                const auto after = snapshot_files(src);
+                if (before == after || attempt == kMaxAttempts) {
+                    if (!(before == after)) {
+                        std::string diff;
+                        for (const auto& [fname, sz]: after) {
+                            const auto it = before.find(fname);
+                            if (it == before.end() || it->second != sz)
+                                diff += " " + fname + "(" + std::to_string(it == before.end() ? 0 : it->second) +
+                                        "->" + std::to_string(sz) + ")";
+                        }
+                        for (const auto& [fname, sz]: before) {
+                            if (!after.count(fname))
+                                diff += " " + fname + "(removed)";
+                        }
+                        throw std::runtime_error(
+                                "[BACKUP] Data directory changed during backup; retry when writes are quiesced."
+                                " Changed:" + diff);
+                    }
+                    ProcessedQuery q;
+                    q.message = "BACKUP OK (" + std::to_string(files) + " files, " +
+                                std::to_string(bytes) + " bytes) -> " + dst.string();
+                    return q;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
         }
 
         // 1d) PREPARE: parse and cache the plan (parametric if SQL contains '?').

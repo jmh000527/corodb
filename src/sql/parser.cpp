@@ -114,6 +114,8 @@ namespace corodb {
             return parse_set(); // 解析 SET TRANSACTION ...
         if (head == "ANALYZE")
             return parse_analyze(); // 解析 ANALYZE
+        if (head == "BACKUP")
+            return parse_backup(); // 解析 BACKUP TO 'dir'
         throw std::runtime_error("[Parser] Unsupported statement type: " + head);
     }
 
@@ -1629,6 +1631,23 @@ namespace corodb {
         if (peek_is_identifier()) {
             stmt.table_name = consume_identifier();
         }
+        return stmt;
+    }
+
+    BackupStmt Parser::parse_backup() {
+        consume(); // consume BACKUP
+        expect_keyword("TO");
+        BackupStmt stmt;
+        // 目标目录为单引号字符串字面量。
+        const Token tok = consume();
+        constexpr char kQuote = '\'';
+        if (tok.text.size() >= 2 && tok.text.front() == kQuote && tok.text.back() == kQuote) {
+            stmt.target_dir = tok.text.substr(1, tok.text.size() - 2);
+        } else {
+            stmt.target_dir = tok.text;
+        }
+        if (stmt.target_dir.empty())
+            throw std::runtime_error("[Parser] BACKUP requires a target directory: BACKUP TO 'dir'");
         return stmt;
     }
 

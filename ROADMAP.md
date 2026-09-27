@@ -41,7 +41,7 @@
 - [ ] TLS 传输加密。
 - [ ] 授权 / RBAC + 审计日志。
 - [x] **Prometheus 指标、健康检查、慢查询日志**：进程级 Metrics 注册表（Counter/Gauge/Histogram，Prometheus 文本暴露格式）；管理端 HTTP（仅绑定本机回环，独立 [metrics].port）：GET /metrics（查询计数/延迟直方图/连接数/事务计数/写入行数/uptime）与 GET /healthz；慢查询日志（超 [metrics].slow_query_ms 记 WARN，阈值可配、0 禁用）。
-- [ ] 备份 / 恢复工具链（一致性快照、增量、PITR）。
+- [x] 物理一致性快照：BACKUP TO 'dir'（checkpoint 后拷贝 SSTable/MANIFEST/索引/统计，排除 WAL 瞬态文件；拷贝期间文件集变化自动重试，耗尽则拒绝给出不一致备份；目标目录清理陈旧文件防幽灵表）。增量与 PITR 待做。
 
 ## P3 — SQL 能力与优化器
 

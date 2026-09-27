@@ -112,6 +112,9 @@ namespace corodb {
         /// 解析 ANALYZE 语句。
         [[nodiscard]] AnalyzeStmt parse_analyze();
 
+        /// 解析 BACKUP TO 'dir' 语句。
+        [[nodiscard]] BackupStmt parse_backup();
+
         /// 解析 SELECT 投影项列表。
         [[nodiscard]] std::vector<SelectStmt::SelectItem> parse_projections();
 

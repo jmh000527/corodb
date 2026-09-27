@@ -643,7 +643,8 @@ namespace corodb {
     }
 
     void LSMTreeEngine::flush_memtable_internal(const std::string& name, const std::vector<Column>& columns,
-                                                std::map<MVCCKey, MemEntry, MVCCKeyCompare> mem_snapshot) {
+                                                std::map<MVCCKey, MemEntry, MVCCKeyCompare> mem_snapshot,
+                                                bool defer_compaction) {
         // 注意：此函数在不持有 state->mutex 的情况下执行
         // mem_snapshot 是从 state->memtable 移动出来的快照（多版本，sorted by MVCCKey）
 
@@ -687,8 +688,10 @@ namespace corodb {
         write_sstable(base_path(name), columns, merged);
         write_manifest(); // L0 已原子替换 → 清单记录新文件集（崩溃后对账可见 flush 已完成）
 
-        if (pool_) {
+        if (pool_ && defer_compaction) {
             pool_->submit([this, name, columns]() { compact_levels(name, columns); });
+        } else if (pool_) {
+            compact_levels(name, columns); // checkpoint 路径：同步压缩，返回后无在途后台写
         }
 
         // Truncate WAL via WalWriter so the header write is fsync'd.
@@ -1709,7 +1712,7 @@ namespace corodb {
                 state->memtable.clear();
                 state->memtable_bytes = 0;
             }
-            flush_memtable_internal(name, state->schema, std::move(snapshot));
+            flush_memtable_internal(name, state->schema, std::move(snapshot), /*defer_compaction=*/false);
         }
 
         // Compact all tables through all levels.

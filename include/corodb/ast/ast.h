@@ -745,13 +745,18 @@ namespace corodb {
         std::string table_name; ///< 目标表名；空 = 所有表
     };
 
+    /** @struct BackupStmt @brief BACKUP 语句：checkpoint 后对数据目录做一致性快照拷贝。 */
+    struct BackupStmt {
+        std::string target_dir; ///< 备份目标目录（已存在则覆盖同名文件）
+    };
+
     /** @brief SQL 语句（所有支持语句类型的 variant）。 */
     using Statement = std::variant<SelectStmt, InsertStmt, UpdateStmt, DeleteStmt, CreateStmt, CreateIndexStmt,
                                    DropTableStmt, DropIndexStmt, BeginStmt, CommitStmt, RollbackStmt,
                                    SavepointStmt, ReleaseSavepointStmt,
                                    CheckpointStmt, ShowStatusStmt,
                                    PrepareStmt, ExecuteStmt, DeallocateStmt, AuthStmt, CreateUserStmt,
-                                   SetTransactionStmt, AnalyzeStmt, std::shared_ptr<ExplainStmt>>;
+                                   SetTransactionStmt, AnalyzeStmt, BackupStmt, std::shared_ptr<ExplainStmt>>;
 
     /** @brief EXPLAIN 语句 AST 节点。 */
     struct ExplainStmt {

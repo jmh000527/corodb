@@ -783,3 +783,77 @@ TEST_F(DatabaseTest, OrderByMultipleColumns) {
     EXPECT_EQ(std::get<int64_t>(recs[2].values[0]), 3);
 }
 
+
+// ============================================================================
+// BACKUP：checkpoint 后一致性快照（P2 备份/恢复）
+// ============================================================================
+
+TEST_F(DatabaseTest, BackupProducesRestorableSnapshot) {
+    ASSERT_TRUE(db->execute("CREATE TABLE bt (id INT, name TEXT)").is_success());
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_TRUE(db->execute("INSERT INTO bt VALUES (" + std::to_string(i) + ", 'v" + std::to_string(i) +
+                                "')")
+                        .is_success());
+    }
+
+    const std::filesystem::path backup_dir = std::filesystem::path(temp_dir->path()) / "snapshot";
+    auto r = db->execute("BACKUP TO '" + backup_dir.string() + "'");
+    ASSERT_TRUE(r.message.has_value());
+    EXPECT_NE(r.message->find("BACKUP OK"), std::string::npos) << *r.message;
+    EXPECT_TRUE(std::filesystem::exists(backup_dir / "bt.lsm.L0"));
+    EXPECT_TRUE(std::filesystem::exists(backup_dir / "MANIFEST"));
+
+    // 备份目录可独立打开且数据一致。
+    storage_internal::WalManager::instance().clear_all();
+    {
+        Database replica(backup_dir.string());
+        auto sel = replica.execute("SELECT COUNT(*) FROM bt");
+        ASSERT_TRUE(sel.rows.has_value());
+        std::size_t n = 0;
+        std::string count_str;
+        for (auto&& rec : *sel.rows) {
+            for (const auto& v : rec.values) {
+                if (std::holds_alternative<int64_t>(v))
+                    count_str = std::to_string(std::get<int64_t>(v));
+            }
+            ++n;
+        }
+        EXPECT_EQ(count_str, "10");
+        EXPECT_EQ(n, 1u);
+    }
+
+    // 原库继续写入不影响已生成的备份；再次 BACKUP 后快照更新。
+    ASSERT_TRUE(db->execute("INSERT INTO bt VALUES (100, 'later')").is_success());
+    {
+        storage_internal::WalManager::instance().clear_all();
+        Database replica(backup_dir.string());
+        auto sel = replica.execute("SELECT COUNT(*) FROM bt");
+        ASSERT_TRUE(sel.rows.has_value());
+        for (auto&& rec : *sel.rows) {
+            for (const auto& v : rec.values) {
+                if (std::holds_alternative<int64_t>(v))
+                    EXPECT_EQ(std::get<int64_t>(v), 10); // 备份仍是旧快照
+            }
+        }
+    }
+
+    auto r2 = db->execute("BACKUP TO '" + backup_dir.string() + "'");
+    ASSERT_TRUE(r2.message.has_value());
+    EXPECT_NE(r2.message->find("BACKUP OK"), std::string::npos);
+    {
+        storage_internal::WalManager::instance().clear_all();
+        Database replica(backup_dir.string());
+        auto sel = replica.execute("SELECT COUNT(*) FROM bt");
+        ASSERT_TRUE(sel.rows.has_value());
+        for (auto&& rec : *sel.rows) {
+            for (const auto& v : rec.values) {
+                if (std::holds_alternative<int64_t>(v))
+                    EXPECT_EQ(std::get<int64_t>(v), 11); // 新快照包含增量
+            }
+        }
+    }
+}
+
+TEST_F(DatabaseTest, BackupRejectsSameDirectory) {
+    EXPECT_THROW(db->execute("BACKUP TO '" + temp_dir->path() + "'"), std::runtime_error);
+}
