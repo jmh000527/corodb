@@ -75,10 +75,12 @@ add_library(corodb
     src/common/types.cpp
     src/common/config.cpp
     src/common/logger.cpp
+    src/common/metrics.cpp
     src/common/table_renderer.cpp
 
     # 服务
     src/server/server.cpp
+    src/server/admin_server.cpp
     src/db/database.cpp
 )
 
@@ -186,6 +188,7 @@ add_executable(corodb_tests
     tests/test_optimizer.cpp
     tests/test_config.cpp
     tests/test_statistics.cpp
+    tests/test_metrics.cpp
 )
 target_link_libraries(corodb_tests
     PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock

@@ -5,15 +5,18 @@
 
 #include "corodb/server/server.h"
 
+#include "corodb/common/metrics.h"
 #include "corodb/db/database.h"
 #include "corodb/db/session.h"
 #include "corodb/executor/executor.h"
 #include "corodb/net/port.h"
+#include "corodb/server/admin_server.h"
 #include "corodb/storage/storage_engine_common.h"
 #include "corodb/threading/reactor_server.h"
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <iostream>
 #include <mutex>
@@ -34,6 +37,35 @@ namespace corodb {
         std::mutex g_server_mutex;                   ///< 服务器状态互斥锁
 
         Database* g_shared_db{ nullptr }; ///< 共享数据库实例（线程安全）
+
+        // ---- 预注册指标（引用在首次调用时惰性初始化，进程内稳定） ----
+
+        Counter& queries_ok() {
+            return Metrics::instance().counter("corodb_queries_total", R"({result="ok"})",
+                                               "SQL statements executed successfully.");
+        }
+        Counter& queries_error() {
+            return Metrics::instance().counter("corodb_queries_total", R"({result="error"})",
+                                               "SQL statements executed successfully.");
+        }
+        Histogram& query_duration() {
+            return Metrics::instance().histogram(
+                    "corodb_query_duration_seconds",
+                    {0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0},
+                    "SQL statement execution duration in seconds.");
+        }
+        Counter& slow_queries() {
+            return Metrics::instance().counter("corodb_slow_queries_total", {},
+                                               "SQL statements exceeding the slow query threshold.");
+        }
+        Gauge& connections_active() {
+            return Metrics::instance().gauge("corodb_connections_active", {},
+                                             "Currently connected clients.");
+        }
+        Counter& connections_total() {
+            return Metrics::instance().counter("corodb_connections_total", {},
+                                               "Client connections accepted since startup.");
+        }
     } // namespace
 
     void request_server_shutdown() {
@@ -173,19 +205,37 @@ namespace corodb {
                 return "";
             }
 
+            // 观测：语句执行时长 + 结果计数 + 慢查询日志（P2）。
+            const auto start_ts = std::chrono::steady_clock::now();
+            std::string response;
             try {
                 // Database 内部已实现线程安全（读写锁）
-                return run_sql(db, line, std::move(session));
+                response = run_sql(db, line, std::move(session));
+                queries_ok().increment();
             } catch (const WriteConflictError& ex) {
+                queries_error().increment();
                 // 写写冲突是事务并发的预期行为，不打印到 stderr
                 return std::string("ERROR: ") + ex.what() + "\n@END\n";
             } catch (const std::exception& ex) {
+                queries_error().increment();
                 LOG_ERROR("Error executing query: {}", ex.what());
                 // 注意：保持 "ERROR:" 前缀（大写），客户端必须用
                 // is_error_response() 判定，避免大小写不一致（B2）。
                 // 必须追加 @END 终止标记，否则客户端 read_response 会等满 30s 超时
                 return std::string("ERROR: ") + ex.what() + "\n@END\n";
             }
+            const double elapsed_s =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start_ts).count();
+            query_duration().observe(elapsed_s);
+            const uint64_t slow_ms = Config::instance().metrics_slow_query_ms();
+            if (slow_ms > 0 && elapsed_s * 1000.0 >= static_cast<double>(slow_ms)) {
+                slow_queries().increment();
+                std::string sql_head = line.substr(0, line.find('\n'));
+                if (sql_head.size() > 200)
+                    sql_head = sql_head.substr(0, 200) + "...";
+                LOG_WARN("Slow query: {} ms, sql: {}", static_cast<uint64_t>(elapsed_s * 1000.0), sql_head);
+            }
+            return response;
         }
 
         /**
@@ -279,6 +329,42 @@ namespace corodb {
         Database db(cfg.data_dir);
         g_shared_db = &db;
 
+        // 管理端 HTTP（/metrics、/healthz；P2 观测性）。仅绑定本机回环。
+        std::unique_ptr<AdminServer> admin;
+        if (Config::instance().metrics_enabled()) {
+            const auto server_start = std::chrono::steady_clock::now();
+            auto& uptime_gauge =
+                    Metrics::instance().gauge("corodb_uptime_seconds", {}, "Server uptime in seconds.");
+            // 预注册指标：首 scrape 前即有零值序列。
+            Metrics::instance().counter("corodb_rows_written_total", {},
+                                        "Rows inserted/updated/deleted since startup.");
+            Metrics::instance().counter("corodb_txn_committed_total", {}, "Committed transactions since startup.");
+            Metrics::instance().counter("corodb_txn_aborted_total", {},
+                                        "Rolled back or aborted transactions since startup.");
+            Metrics::instance().gauge("corodb_txn_active", {}, "Currently active transactions.");
+            AdminServer::Options admin_opts;
+            admin_opts.port = Config::instance().metrics_port();
+            admin_opts.handler = [&server_start, &uptime_gauge](const std::string& path) {
+                if (path == "/healthz")
+                    return std::string("ok\n");
+                if (path == "/metrics") {
+                    uptime_gauge.set(std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::steady_clock::now() - server_start)
+                                             .count());
+                    return Metrics::instance().render_prometheus();
+                }
+                return std::string();
+            };
+            admin = std::make_unique<AdminServer>(std::move(admin_opts));
+            try {
+                admin->start();
+                LOG_INFO("Admin endpoint: http://127.0.0.1:{}/metrics", admin->port());
+            } catch (const std::exception& ex) {
+                LOG_WARN("Admin endpoint disabled: {}", ex.what());
+                admin.reset(); // 指标端点失败不阻断主服务
+            }
+        }
+
         std::size_t actual_workers = reactor_cfg.worker_threads;
         if (actual_workers == 0) {
             actual_workers = std::thread::hardware_concurrency();
@@ -304,6 +390,7 @@ namespace corodb {
             // Rollback active transactions on client disconnect to prevent
             // zombie transactions and leaked row locks.
             server.set_close_callback([&db](const ConnectionPtr& conn) {
+                connections_active().decrement();
                 auto raw = conn->user_data();
                 if (!raw)
                     return;
@@ -323,12 +410,11 @@ namespace corodb {
                 session->current_txn_id = 0;
             });
 
-            // 设置连接回调（禁用日志以减少噪音）
-            // server.set_connection_callback(
-            //     [](const ConnectionPtr& conn) {
-            //         std::println("Client connected: {}", conn->peer_address());
-            //     }
-            // );
+            // 设置连接回调（观测：连接数指标）
+            server.set_connection_callback([](const ConnectionPtr&) {
+                connections_active().increment();
+                connections_total().increment();
+            });
 
             // 启动服务器（阻塞）
             server.start();
@@ -343,6 +429,7 @@ namespace corodb {
             LOG_ERROR("Server error: {}", ex.what());
             g_server_running.store(false);
             g_shared_db = nullptr;
+            admin.reset();
 
             {
                 std::lock_guard lock(g_server_mutex);
@@ -355,6 +442,7 @@ namespace corodb {
             return 1;
         }
 
+        admin.reset();
         g_shared_db = nullptr;
         g_server_running.store(false);
 

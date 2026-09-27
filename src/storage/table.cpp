@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "corodb/common/config.h"
+#include "corodb/common/metrics.h"
 #include "corodb/storage/storage_engine.h"
 #include "corodb/storage/storage_engine_common.h"
 
@@ -664,6 +665,14 @@ namespace corodb {
     // ---------------------------------------------------------------------------
     // 统计信息持久化
     // ---------------------------------------------------------------------------
+
+    void Table::note_rows_written(std::size_t n) noexcept {
+        rows_since_analyze_ += n;
+        // 观测（P2）：行写入总量（INSERT/UPDATE/DELETE 汇总）。
+        static Counter& rows_written = Metrics::instance().counter(
+                "corodb_rows_written_total", {}, "Rows inserted/updated/deleted since startup.");
+        rows_written.increment(n);
+    }
 
     const ColumnStats* Table::column_stats(const std::string& col) const {
         return stats_.column(col);

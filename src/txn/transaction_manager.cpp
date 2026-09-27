@@ -7,7 +7,28 @@
 
 #include <limits>
 
+#include "corodb/common/metrics.h"
+
 namespace corodb {
+
+    namespace {
+        // 观测（P2）：事务计数/活跃数。惰性静态引用，进程内稳定。
+        Counter& txn_committed() {
+            static Counter& c = Metrics::instance().counter("corodb_txn_committed_total", {},
+                                                            "Committed transactions since startup.");
+            return c;
+        }
+        Counter& txn_aborted() {
+            static Counter& c = Metrics::instance().counter("corodb_txn_aborted_total", {},
+                                                            "Rolled back or aborted transactions since startup.");
+            return c;
+        }
+        Gauge& txn_active() {
+            static Gauge& g = Metrics::instance().gauge("corodb_txn_active", {},
+                                                        "Currently active transactions.");
+            return g;
+        }
+    } // namespace
 
     /**
      * @brief 开启新事务：分配全局唯一 txn_id 及读时间戳，注册为活跃事务。
@@ -18,6 +39,7 @@ namespace corodb {
         const uint64_t ts = next_ts_.fetch_add(1, std::memory_order_relaxed);
         std::unique_lock lock(mutex_);
         txns_.emplace(id, TxnRecord{ id, ts, 0, TxnState::Active });
+        txn_active().increment();
         return id;
     }
 
@@ -48,6 +70,8 @@ namespace corodb {
         // Pruned later by prune_committed() when safe to discard.
         committed_.emplace(txn_id, it->second);
         txns_.erase(it);
+        txn_active().decrement();
+        txn_committed().increment();
         return true;
     }
 
@@ -64,6 +88,8 @@ namespace corodb {
             return false;
         }
         txns_.erase(it);
+        txn_active().decrement();
+        txn_aborted().increment();
         return true;
     }
 

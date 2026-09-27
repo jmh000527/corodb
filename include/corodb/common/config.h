@@ -41,6 +41,10 @@ namespace corodb {
         static constexpr double kDefaultCpuTupleCost = 0.01;
         static constexpr double kDefaultCpuIndexTupleCost = 0.005;
         static constexpr double kDefaultCpuOperatorCost = 0.0025;
+        // [metrics]（观测性，Phase P2）
+        static constexpr bool    kDefaultMetricsEnabled = true;
+        static constexpr uint16_t kDefaultMetricsPort = 4100;
+        static constexpr uint64_t kDefaultSlowQueryMs = 1000;
 
         static Config& instance() {
             static Config config;
@@ -179,6 +183,16 @@ namespace corodb {
         void set_cpu_index_tuple_cost(double v) noexcept { cpu_index_tuple_cost_ = v; }
         void set_cpu_operator_cost(double v) noexcept { cpu_operator_cost_ = v; }
 
+        // =========================================================================
+        // [metrics]
+        // =========================================================================
+        [[nodiscard]] bool metrics_enabled() const noexcept { return metrics_enabled_; }
+        [[nodiscard]] uint16_t metrics_port() const noexcept { return metrics_port_; }
+        [[nodiscard]] uint64_t metrics_slow_query_ms() const noexcept { return metrics_slow_query_ms_; }
+        void set_metrics_enabled(bool v) noexcept { metrics_enabled_ = v; }
+        void set_metrics_port(uint16_t v) noexcept { metrics_port_ = v; }
+        void set_metrics_slow_query_ms(uint64_t v) noexcept { metrics_slow_query_ms_ = v; }
+
     private:
         Config() = default;
         Config(const Config&) = delete;
@@ -247,6 +261,11 @@ namespace corodb {
         double cpu_tuple_cost_ = kDefaultCpuTupleCost;
         double cpu_index_tuple_cost_ = kDefaultCpuIndexTupleCost;
         double cpu_operator_cost_ = kDefaultCpuOperatorCost;
+
+        // [metrics]
+        bool metrics_enabled_ = kDefaultMetricsEnabled;
+        uint16_t metrics_port_ = kDefaultMetricsPort;
+        uint64_t metrics_slow_query_ms_ = kDefaultSlowQueryMs;
     };
 
 } // namespace corodb

@@ -227,8 +227,8 @@ namespace corodb {
         /** @brief 自上次统计采集以来的写入行数（INSERT/UPDATE/DELETE 累计）。 */
         [[nodiscard]] std::size_t rows_since_analyze() const noexcept { return rows_since_analyze_; }
 
-        /** @brief 记录写入行数（写路径调用，供 auto-ANALYZE 判断统计是否陈旧）。 */
-        void note_rows_written(std::size_t n) noexcept { rows_since_analyze_ += n; }
+        /** @brief 记录写入行数（写路径调用，供 auto-ANALYZE 判断统计是否陈旧 + 行写入指标）。 */
+        void note_rows_written(std::size_t n) noexcept;
 
         /** @brief 加载持久化统计（从 {存储目录}/{name}.stats）；文件不存在则静默跳过。 */
         void load_stats();

@@ -246,6 +246,14 @@ namespace corodb {
             if (auto d = parse_double(value); d && *d > 0.0) cpu_operator_cost_ = *d;
             return;
         }
+
+        // metrics.*
+        if (k == "metrics.enabled") { metrics_enabled_ = (value == "true" || value == "1"); return; }
+        if (try_set_u16("metrics.port", &Config::metrics_port_)) return;
+        if (k == "metrics.slow_query_ms") {
+            if (auto n = parse_int(value); n && *n >= 0) metrics_slow_query_ms_ = static_cast<uint64_t>(*n);
+            return;
+        }
     }
 
     /**
@@ -450,6 +458,21 @@ namespace corodb {
         ofs << "\n";
         ofs << "# 求值一次操作符/谓词的 CPU 代价。\n";
         ofs << "cpu_operator_cost = " << tmp.cpu_operator_cost_ << "\n";
+        ofs << "\n\n";
+
+        // ---- [metrics] ----
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "#  观测性（Prometheus 指标 / 健康检查 / 慢查询日志）\n";
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "[metrics]\n";
+        ofs << "# 是否启用管理端 HTTP 服务（GET /metrics 与 /healthz，仅绑定本机回环）。\n";
+        ofs << "enabled = " << (tmp.metrics_enabled_ ? "true" : "false") << "\n";
+        ofs << "\n";
+        ofs << "# 管理端 HTTP 监听端口（Prometheus scrape 端点）。\n";
+        ofs << "port = " << tmp.metrics_port_ << "\n";
+        ofs << "\n";
+        ofs << "# 慢查询日志阈值（毫秒）：执行超过该时长的语句记录 WARN 日志，0 = 禁用。\n";
+        ofs << "slow_query_ms = " << tmp.metrics_slow_query_ms_ << "\n";
 
         return true;
     }

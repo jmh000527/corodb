@@ -40,7 +40,7 @@
 - [ ] 强制认证 + Argon2/bcrypt/scrypt 密码哈希。
 - [ ] TLS 传输加密。
 - [ ] 授权 / RBAC + 审计日志。
-- [ ] Prometheus 指标、健康检查、慢查询日志。
+- [x] **Prometheus 指标、健康检查、慢查询日志**：进程级 Metrics 注册表（Counter/Gauge/Histogram，Prometheus 文本暴露格式）；管理端 HTTP（仅绑定本机回环，独立 [metrics].port）：GET /metrics（查询计数/延迟直方图/连接数/事务计数/写入行数/uptime）与 GET /healthz；慢查询日志（超 [metrics].slow_query_ms 记 WARN，阈值可配、0 禁用）。
 - [ ] 备份 / 恢复工具链（一致性快照、增量、PITR）。
 
 ## P3 — SQL 能力与优化器
