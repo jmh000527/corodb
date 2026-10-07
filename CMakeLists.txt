@@ -70,6 +70,7 @@ add_library(corodb
     src/threading/acceptor.cpp
     src/threading/reactor_server.cpp
     src/net/network.cpp
+    src/net/conn_pool.cpp
 
     # 公共
     src/common/types.cpp

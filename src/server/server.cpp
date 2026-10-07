@@ -133,6 +133,35 @@ namespace corodb {
                 // 在工作线程中执行 SQL。同一连接的 SQL 串行执行（按到达顺序
                 // 提交到线程池，且事务语义要求顺序执行）。
                 server.post_task([&db, conn, session, line = std::move(line)]() {
+                    // P4 限流：令牌桶（每连接；[server].rate_limit_per_sec）。
+                    const uint32_t rate = Config::instance().rate_limit_per_sec();
+                    if (rate > 0) {
+                        const uint64_t now_ns = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count());
+                        // 补充令牌：按流逝时间线性补给，封顶速率值（允许小额突发）。
+                        if (session->rate_last_refill_ns != 0 &&
+                            now_ns > session->rate_last_refill_ns) {
+                            const uint64_t elapsed = now_ns - session->rate_last_refill_ns;
+                            const uint64_t gained = elapsed * rate / 1'000'000'000ull;
+                            if (gained > 0) {
+                                session->rate_tokens = static_cast<uint32_t>(
+                                        std::min<uint64_t>(rate, session->rate_tokens + gained));
+                                session->rate_last_refill_ns = now_ns;
+                            }
+                        } else {
+                            session->rate_tokens = rate; // 首语句：满桶
+                            session->rate_last_refill_ns = now_ns;
+                        }
+                        if (session->rate_tokens == 0) {
+                            conn->send(std::string("ERROR: rate limit exceeded (") +
+                                       std::to_string(rate) + " stmts/s)\n@END\n");
+                            return;
+                        }
+                        session->rate_tokens--;
+                    }
+                    session->statements_executed++;
                     std::string response = sql_proto::process_sql_line(db, line, session);
                     if (!response.empty()) {
                         conn->send(std::move(response));

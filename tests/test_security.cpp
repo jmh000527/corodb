@@ -139,3 +139,20 @@ TEST(AuditTest, DisabledAuditWritesNothing) {
     ASSERT_TRUE(db.execute("CREATE TABLE zz (a INT)").is_success());
     EXPECT_FALSE(std::filesystem::exists(audit_path));
 }
+
+// ============================================================================
+// 限流（P4）：令牌桶
+// ============================================================================
+
+TEST(RateLimitTest, ConfigRoundTrip) {
+    auto& c = Config::instance();
+    const uint32_t saved = c.rate_limit_per_sec();
+    c.set_rate_limit_per_sec(5);
+    EXPECT_EQ(c.rate_limit_per_sec(), 5u);
+    c.set_rate_limit_per_sec(saved);
+}
+
+TEST(RateLimitTest, DefaultDisabled) {
+    // 默认 0 = 禁用（不改变全局配置即可断言默认值语义）。
+    EXPECT_EQ(Config::kDefaultRateLimitPerSec, 0u);
+}

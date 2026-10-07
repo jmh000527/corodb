@@ -29,6 +29,7 @@ namespace corodb {
         static constexpr std::size_t kDefaultSstCacheEntries = 256;
         static constexpr std::size_t kDefaultPlanCacheEntries = 128;
         static constexpr uint64_t  kDefaultStatementTimeoutMs = 0; // disabled
+        static constexpr uint32_t  kDefaultRateLimitPerSec = 0;    // 0 = disabled
         static constexpr std::size_t kDefaultThreadPoolMaxQueue = 0; // unlimited
         // [statistics]（ANALYZE 采集，Phase 1）
         static constexpr std::size_t kDefaultStatisticsSampleTarget = 300;
@@ -108,6 +109,12 @@ namespace corodb {
         void set_reuse_port(bool v) noexcept { reuse_port_ = v; }
         void set_idle_timeout_sec(uint64_t v) noexcept { idle_timeout_sec_ = v; }
         void set_statement_timeout_ms(uint64_t v) noexcept { statement_timeout_ms_ = v; }
+
+        // =========================================================================
+        // [server] 限流
+        // =========================================================================
+        [[nodiscard]] uint32_t rate_limit_per_sec() const noexcept { return rate_limit_per_sec_; }
+        void set_rate_limit_per_sec(uint32_t v) noexcept { rate_limit_per_sec_ = v; }
 
         // =========================================================================
         // [connection]
@@ -269,6 +276,7 @@ namespace corodb {
         bool reuse_port_ = true;
         uint64_t idle_timeout_sec_ = 0;
         uint64_t statement_timeout_ms_ = 0;
+        uint32_t rate_limit_per_sec_ = kDefaultRateLimitPerSec;
 
         // [connection]
         std::size_t max_buffer_size_ = kDefaultMaxBufferSize;

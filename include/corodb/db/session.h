@@ -83,6 +83,11 @@ namespace corodb {
         /// 参数化预处理语句：名称 → 原始 SQL（含 ? 占位符，EXECUTE 时代入参数重新规划）。
         std::unordered_map<std::string, std::string> prepared_sql;
 
+        // ---- 每连接语句速率限制（令牌桶；[server].rate_limit_per_sec） ----
+        uint32_t rate_tokens{ 0 };         ///< 当前令牌数
+        uint64_t rate_last_refill_ns{ 0 }; ///< 上次补充时刻（steady_clock ns）
+        uint64_t statements_executed{ 0 }; ///< 本连接已执行语句数（观测）
+
         bool authenticated{ false }; ///< 是否已通过认证
         std::string auth_user;       ///< 认证用户名
         UserRole auth_role{ UserRole::ReadWrite }; ///< 认证用户的角色（P2 RBAC）

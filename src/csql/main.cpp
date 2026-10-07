@@ -4,6 +4,7 @@
 // @brief CoroDB 命令行 SQL 客户端的入口。
 
 #include "corodb/common/table_renderer.h"
+#include "corodb/net/conn_pool.h"
 #include "corodb/net/network.h"
 
 #include "corodb/net/port.h"
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 
+using corodb::ClientConnPool;
 using corodb::connect_socket;
 using corodb::read_response;
 using corodb::send_line;
@@ -40,6 +42,8 @@ int main(int argc, char** argv) {
     std::string host = "127.0.0.1";          // 默认连接本地主机
     int port = 4000;                         // 默认连接4000端口
     std::optional<std::string> one_shot_sql; // 一次性SQL命令（非交互式模式）
+    // P4 读写分离：可选只读副本 host:port，SELECT/SHOW 路由到副本。
+    std::optional<std::pair<std::string, int>> read_replica;
 
     // 解析命令行参数
     for (int i = 1; i < argc; ++i) {
@@ -48,6 +52,15 @@ int main(int argc, char** argv) {
             host = argv[++i]; // 服务器主机名
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             port = std::atoi(argv[++i]); // 服务器端口
+        } else if ((arg == "-r" || arg == "--read-replica") && i + 1 < argc) {
+            // 只读副本地址 host:port
+            const std::string spec = argv[++i];
+            const auto colon = spec.rfind(':');
+            if (colon == std::string::npos) {
+                std::println(std::cerr, "--read-replica expects host:port, got '{}'", spec);
+                return 1;
+            }
+            read_replica = {spec.substr(0, colon), std::atoi(spec.c_str() + colon + 1)};
         } else if ((arg == "-e" || arg == "--execute") && i + 1 < argc) {
             // 执行单个SQL命令
             if (one_shot_sql)
@@ -63,22 +76,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 连接到服务器
-    socket_t fd = connect_socket(host, port);
-    if (fd == INVALID_SOCKET_VAL) {
-        std::println(std::cerr, "Failed to connect to {}:{}", host, port);
-        return 1;
-    }
-    // 客户端使用阻塞 socket；发送与读取超时由网络辅助函数内部处理。
-    // read_response 内部使用 poll()/select() 实现超时，不依赖非阻塞 socket。
+    // P4 连接池：主端持久连接 + 可选只读副本（SELECT 路由）。
+    ClientConnPool pool(host, port, read_replica);
 
-    // 执行SQL命令的lambda函数
+    // 执行SQL命令的lambda函数（经连接池：SELECT 路由到副本）
     auto run_sql = [&](const std::string& sql) {
-        if (!send_line(fd, sql)) {
-            std::println(std::cerr, "Failed to send SQL");
-            return false;
-        }
-        std::string resp = read_response(fd);
+        std::string resp = pool.execute(sql);
 
         if (resp.starts_with("@TABLE\n")) {
             resp.erase(0, 7);
@@ -145,7 +148,6 @@ int main(int argc, char** argv) {
     // 非交互式模式：执行单个SQL命令后退出
     if (one_shot_sql) {
         run_sql(*one_shot_sql);
-        close_socket(fd);
         return 0;
     }
 
@@ -166,7 +168,6 @@ int main(int argc, char** argv) {
             break; // 执行SQL命令，失败则退出
     }
 
-    close_socket(fd); // 关闭连接
 #ifdef _WIN32
     WSACleanup();
 #endif

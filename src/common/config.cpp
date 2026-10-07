@@ -186,6 +186,10 @@ namespace corodb {
         if (k == "server.reuse_port") { reuse_port_ = (value == "true" || value == "1"); return; }
         if (try_set_size("server.idle_timeout_sec", &Config::idle_timeout_sec_)) return;
         if (try_set_size("server.statement_timeout_ms", &Config::statement_timeout_ms_)) return;
+        if (k == "server.rate_limit_per_sec") {
+            if (auto n = parse_int(value); n && *n >= 0) rate_limit_per_sec_ = static_cast<uint32_t>(*n);
+            return;
+        }
 
         // wal.*  (continued)
         if (try_set_str("wal.sync_mode", &Config::wal_sync_mode_)) return;
@@ -366,6 +370,9 @@ namespace corodb {
         ofs << "\n";
         ofs << "# 单条 SQL 语句执行超时（毫秒），超时后抛出异常并中止，0 = 禁用。\n";
         ofs << "statement_timeout_ms = " << tmp.statement_timeout_ms_ << "\n";
+        ofs << "\n";
+        ofs << "# 每连接语句速率限制（条/秒），超过返回限流错误，0 = 禁用。\n";
+        ofs << "rate_limit_per_sec = " << tmp.rate_limit_per_sec_ << "\n";
         ofs << "\n\n";
 
         // ---- [connection] ----
