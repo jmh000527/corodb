@@ -17,6 +17,7 @@
 
 #include "corodb/common/audit.h"
 #include "corodb/common/config.h"
+#include "corodb/common/logger.h"
 #include "corodb/db/database.h"
 #include "corodb/executor/executor.h"
 #include "corodb/plan/logical_plan.h"
@@ -996,21 +997,37 @@ namespace corodb {
                 if (ex->analyze) {
                     // EXPLAIN ANALYZE：带性能分析执行。
                     txn_ctrl_.prepare_for_statement(inner, *session);
+                    // 堆上分配 runner/stats：q.rows 生成器（render_analyze）在服务器线程
+                    // 惰性求值，必须保证它们活过本函数栈帧（与普通 SELECT 的 Keeper 同理）。
+                    auto analyze_runner = std::make_shared<CorrelatedRunner>(*this, session);
                     ExecutionContext ctx{ session, &row_locks_, &catalog_, &storage_, &txn_manager_ };
-                    CorrelatedRunner analyze_runner(*this, session);
-                    ctx.subquery_runner = &analyze_runner; // 相关子查询支持（行内 drain，栈生命周期安全）
+                    ctx.subquery_runner = analyze_runner.get();
                     if (session->statement_timeout_ms > 0) {
                         ctx.deadline = std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds(session->statement_timeout_ms);
                     }
                     auto executor = std::make_shared<Executor>(ctx);
-                    QueryStats stats;
-                    auto gen = executor->run_profiled(shared_plan.get(), stats);
-                    // Drain the generator and discard rows (stats are collected).
-                    for (const auto& _: gen) { (void)_; }
+                    auto stats = std::make_shared<QueryStats>();
+                    try {
+                        auto gen = executor->run_profiled(shared_plan.get(), *stats);
+                        // Drain the generator and discard rows (stats are collected).
+                        for (const auto& _: gen) { (void)_; }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("EXPLAIN ANALYZE execution failed: {}", e.what());
+                        ProcessedQuery q;
+                        q.message = std::string("EXPLAIN ANALYZE execution error: ") + e.what();
+                        return q;
+                    }
                     ProcessedQuery q;
-                    q.rows = ExplainPrinter::render_analyze(std::move(ltext), shared_plan.get(), stats);
-                    q.plan = shared_plan;
+                    struct Keeper {
+                        std::shared_ptr<PlanNode> plan;
+                        std::shared_ptr<Executor> exec;
+                        std::shared_ptr<QueryStats> stats;
+                        std::shared_ptr<SubqueryRunner> runner;
+                    };
+                    q.plan = std::shared_ptr<void>(std::make_shared<Keeper>(
+                            Keeper{ shared_plan, executor, stats, analyze_runner }));
+                    q.rows = ExplainPrinter::render_analyze(std::move(ltext), shared_plan.get(), *stats);
                     q.is_select = true;
                     return q;
                 }

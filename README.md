@@ -14,7 +14,7 @@
 
 </div>
 
-CoroDB 是一个从零构建的关系型数据库，采用 LSM-Tree 存储引擎、Volcano 协程执行器、MVCC 事务系统。严格 OOP 设计，模块边界清晰，代码量控制在约两万行。
+CoroDB 是一个从零构建的关系型数据库，采用 LSM-Tree 存储引擎、Volcano 协程执行器、MVCC 事务系统、代价驱动查询优化器（CBO），并具备主从复制、TLS 加密、RBAC 授权、Prometheus 监控等生产级能力。严格 OOP 设计，模块边界清晰。
 
 > 📖 **用户手册**: [USER_MANUAL.md](USER_MANUAL.md) — 安装、SQL 命令参考、架构详解
 
@@ -26,6 +26,9 @@ CoroDB 是一个从零构建的关系型数据库，采用 LSM-Tree 存储引擎
 - [核心特性](#核心特性)
 - [SQL 功能演示](#sql-功能演示)
 - [查询优化器](#查询优化器)
+- [复制与高可用](#复制与高可用)
+- [安全](#安全)
+- [可观测性](#可观测性)
 - [并发控制](#并发控制)
 - [模块详解](#模块详解)
 - [数据格式规范](#数据格式规范)
@@ -65,9 +68,12 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 ### 查询引擎
 - **Volcano 协程执行器**: C++23 `std::generator` 惰性求值，数据在算子间流水传递
 - **9 种物理算子**: SeqScan / IndexScan / Filter / Project / HashJoin / MergeJoin / NestedLoopJoin / HashAggregate / SortAggregate / OrderBy / Limit
-- **两段式优化器**: LogicalPlanner → 5 条重写规则定点迭代（最多 16 轮）→ PhysicalPlanner（JOIN 小表左置基于存储引擎行数统计）
-- **算子选择**: 等值/范围/集合索引条件（`=`/`<`/`>`/`BETWEEN`/`IN`）与多列等值合取（`a=? AND b=?` 命中复合索引）→ IndexScan 升级（大表非选择性范围按列 min/max 统计代价决策落回 SeqScan）；等值 JOIN → HashJoin / MergeJoin（预排序跳过重排）；GROUP BY 匹配排序 → SortAggregate 吸收 Sort
-- **LRU 计划缓存**: 标准化 SQL 到物理计划的缓存（默认 128 条），DDL 自动失效
+- **两段式优化器 + 统一代价模型（CBO）**: LogicalPlanner → 5 条重写规则定点迭代（最多 16 轮）→ PhysicalPlanner；每算子携带 Cost{startup,total} 与估计行数
+- **统计信息驱动**: `ANALYZE` 采集 MCV / 等高直方图 / NDV / null_frac（采样 or 全量，MLE NDV 估计），`SelectivityEstimator` 把统计转为谓词选择率；auto-ANALYZE 在统计陈旧（行数变化或写入超 10%）时自动刷新
+- **代价驱动算子选择**: IndexScan vs SeqScan+Filter（含 correlation 修正）、Hash / Merge / NestedLoop 连接代价比较、Sort vs Hash 聚合——全部按 Cost 比较，统计缺失时回退启发式
+- **索引访问**: 等值/范围/`BETWEEN`/`IN`/复合等值合取命中 IndexScan（value→主键超集索引 + 可见性重查）
+- **LRU 计划缓存**: 标准化 SQL 到物理计划的缓存（默认 128 条），DDL 自动失效；统计指纹（行数量级 + stats_ts）变化自动重规划
+- **EXPLAIN**: PostgreSQL 风格 `(cost=0.00..X rows=N)` 注解 + EXPLAIN ANALYZE 算子级耗时
 
 ### 事务系统
 - **MVCC 快照隔离**: 每行携带 `commit_ts`，查询按 `snapshot_ts` 过滤可见版本，Compaction 全层级 GC
@@ -79,20 +85,27 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 
 ### SQL 支持
 - **DDL**: CREATE/DROP TABLE, CREATE/DROP INDEX
-- **DML**: INSERT/UPDATE/DELETE
-- **查询**: SELECT / DISTINCT / INNER JOIN / LEFT JOIN / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET
+- **DML**: INSERT / UPDATE / DELETE；BOOLEAN / DATE / TIMESTAMP / DECIMAL 类型
+- **查询**: SELECT / DISTINCT / INNER|LEFT|RIGHT|FULL JOIN / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / UNION [ALL] / CTE（`WITH ... AS`）
+- **子查询**: `[NOT] IN (SELECT ...)` 与 `[NOT] EXISTS`（相关与非相关；等值相关模式自动去相关化，其余 nested-apply）
 - **聚合**: COUNT / SUM / AVG / MIN / MAX，AVG() 返回 IEEE 754 Float64
-- **表达式**: 算术（`+ - * / %`）、字符串拼接（`||`）、COALESCE / NULLIF / UPPER / LOWER / SUBSTR / TRIM / LENGTH / ABS
-- **诊断**: EXPLAIN / EXPLAIN ANALYZE（PostgreSQL 风格计划树 + 算子级耗时与行数）
-- **预处理**: PREPARE / EXECUTE / DEALLOCATE PREPARE（会话级计划注册）
+- **表达式**: 算术（`+ - * / %`）、字符串拼接（`||`）、COALESCE / NULLIF / UPPER / LOWER / SUBSTR / TRIM / LENGTH / ABS、NULL 字面量与 IS NULL
+- **诊断**: EXPLAIN / EXPLAIN ANALYZE（PostgreSQL 风格 `(cost=..rows=)` 计划树 + 算子级耗时与行数）
+- **预处理**: PREPARE / EXECUTE（`?` 参数占位）/ DEALLOCATE PREPARE
+- **统计与备份**: `ANALYZE [TABLE]`、`BACKUP TO 'dir'`（checkpoint 后一致性物理快照，并发写自动重试）
 - **管理**: CHECKPOINT（强制刷盘+全层级压缩+截断 WAL）、SHOW STATUS
-- **约束**: 写入时强制 NOT NULL / 类型匹配 / 主键唯一性（支持多列 `PRIMARY KEY` 标记的复合主键）
+- **约束**: 写入时强制 NOT NULL / 类型域校验 / 主键唯一性（支持复合主键）
 
 ### 网络与持久性
 - **Multi-Reactor 模式**: Main Reactor 接受连接 → Sub Reactor I/O 线程池（Round-Robin）处理读写 → Worker 线程池执行 SQL
 - **跨平台**: epoll 边沿触发 (Linux) / WSAPoll (Windows)
 - **WAL 组提交**: Leader-Follower 模式批量 fsync，可配置延迟与批次大小
 - **连接管理**: 非阻塞 socket + 64MB 单连接缓冲区上限（防 OOM DoS）+ 空闲超时 + 单事件批量 accept（64）
+- **WAL 日志复制（主从）**: 主端每次变更本地持久化后经 TCP FIFO 推流（行先于 COMMIT 到达，未提交数据从端不可见）；从端断线自动重连、MVCC 语义重放、只读强制
+- **TLS 加密**: OpenSSL 后端，管理端点（HTTPS）/ 复制通道 / SQL 专用端口均可启用（`[tls]` 配置节）
+- **安全**: PBKDF2-HMAC-SHA256 加盐口令（每用户独立随机盐）+ 三档 RBAC（admin/read_write/read_only）+ JSON Lines 审计日志
+- **观测性**: Prometheus `/metrics`（查询计数/延迟直方图/连接数/事务/复制滞后）+ `/healthz` + 慢查询日志
+- **限流**: 每连接令牌桶（`[server].rate_limit_per_sec`）
 
 ---
 
@@ -102,22 +115,25 @@ LSM-Tree 将随机写转化为顺序追加，写吞吐极高。写路径简单�
 corodb/
 ├── include/corodb/
 │   ├── ast/                  # AST 节点定义
-│   ├── common/               # 类型系统、配置、日志、表格渲染
-│   ├── db/                   # Database 门面、Session
+│   ├── common/               # 类型系统、配置、日志、指标、审计、加密（PBKDF2）、表格渲染
+│   ├── db/                   # Database 门面、Session、UserManager
 │   ├── executor/             # 协程执行器、表达式/布尔求值器
-│   ├── net/                  # 网络工具、平台兼容层
+│   ├── net/                  # 网络工具、TLS（OpenSSL）、平台兼容层
 │   ├── optimizer/
+│   │   ├── cost/             # 统一代价模型（Cost{startup,total} + 算子代价函数）
 │   │   ├── logical/          # 逻辑规划器 + 重写规则
-│   │   └── physical/         # 物理规划器（算子选择）
+│   │   ├── physical/         # 物理规划器（代价驱动算子选择）
+│   │   └── stats/            # 选择率估计器（MCV + 直方图 + NDV）
 │   ├── plan/                 # 逻辑/物理计划节点
 │   ├── process/              # QueryProcessor、TransactionController、ExplainPrinter
-│   ├── server/               # 服务器启动接口
+│   ├── replication/          # WAL 日志复制（主端 Hub + 从端 Follower）
+│   ├── server/               # 服务器启动、管理端 HTTP、SQL over TLS 监听
 │   ├── sql/                  # 词法分析 + 递归下降解析器
-│   ├── storage/              # LSM 引擎、Buffer Pool、Table、Catalog
+│   ├── storage/              # LSM 引擎、Buffer Pool、Table、Catalog、统计采集
 │   ├── threading/            # EventLoop、ReactorServer、Connection、ThreadPool
 │   └── txn/                  # TransactionManager、LockManager、RowLockManager
 ├── src/                      # 实现文件（镜像 include/ 布局）
-├── tests/                    # Google Test 单元测试
+├── tests/                    # Google Test 单元测试（380+ 用例）
 └── CMakeLists.txt
 ```
 
@@ -320,15 +336,16 @@ sql> SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
 ```sql
 sql> EXPLAIN SELECT * FROM employees WHERE dept = 'Engineering' ORDER BY salary DESC;
-  +-----------------------------------------------------------------------+
-  | QUERY PLAN                                                            |
-  +-----------------------------------------------------------------------+
-  | Project [id AS id, name AS name, dept AS dept, salary AS salary]      |
-  |   ->  Sort                                                            |
-  |       Sort Key: salary DESC                                           |
-  |     ->  Filter: (dept = 'Engineering')                                |
-  |       ->  Seq Scan on employees                                       |
-  +-----------------------------------------------------------------------+
+  +----------------------------------------------------------------------------------+
+  | QUERY PLAN                                                                       |
+  +----------------------------------------------------------------------------------+
+  | Project [id AS id, name AS name, dept AS dept, salary AS salary] (cost=0.00..3.17 |
+  |   rows=8)                                                                        |
+  |   ->  Sort (cost=0.00..3.15 rows=8)                                              |
+  |       Sort Key: salary DESC                                                      |
+  |     ->  Filter: (dept = 'Engineering') (cost=0.00..3.12 rows=8)                  |
+  |       ->  Seq Scan on employees (cost=0.00..3.10 rows=25)                        |
+  +----------------------------------------------------------------------------------+
 
 sql> EXPLAIN ANALYZE SELECT dept, COUNT(*) FROM employees GROUP BY dept;
   +-----------------------------+
@@ -382,23 +399,42 @@ sql> CHECKPOINT;
   CHECKPOINT
 ```
 
-`CHECKPOINT` 强制刷盘所有 MemTable → 全层级 Compaction → 截断 WAL。之后可直接拷贝 `data/` 目录做备份。
+`CHECKPOINT` 强制刷盘所有 MemTable → 全层级 Compaction → 截断 WAL。
+
+### 统计信息与在线备份
+
+```sql
+sql> ANALYZE TABLE employees;
+  ANALYZE
+
+sql> EXPLAIN SELECT * FROM employees WHERE dept = 'Engineering';
+  -- 计划现在携带基于统计的 (cost=..rows=) 估计；统计陈旧时 auto-ANALYZE 自动刷新
+
+sql> BACKUP TO 'D:/backup/snapshot1';
+  BACKUP OK (12 files, 104857 bytes) -> D:/backup/snapshot1
+```
+
+`ANALYZE` 采集每列的 MCV / 等高直方图 / NDV / null_frac（持久化为 `data/<table>.stats`，
+重启后自动加载）。`BACKUP TO` 先 checkpoint 再拷贝 SSTable/MANIFEST/索引/统计（排除 WAL
+瞬态文件），拷贝期间文件集变化自动重试，产出可直接独立打开的一致性快照。
 
 ---
 
 ## 查询优化器
 
-CoroDB 采用**两段式查询优化器**：逻辑规划 → 规则重写（固定点迭代） → 物理规划。所有重写规则以启发式方式工作，无需统计信息。
+CoroDB 采用**代价驱动的两段式查询优化器**：逻辑规划 → 规则重写（固定点迭代） → 统计信息 + 统一代价模型驱动的物理规划。每个物理节点携带 `Cost{startup, total}`（PostgreSQL 比较语义）与估计行数，`EXPLAIN` 直接展示。
 
 ### 优化流水线
 
 ```
-SQL AST ──> LogicalPlanner ──> LogicalPlan ──> RuleSet (5 rules, fixed-point) ──> PhysicalPlanner ──> PhysicalPlan
+SQL AST ──> LogicalPlanner ──> LogicalPlan ──> RuleSet (5 rules, fixed-point) ──> PhysicalPlanner（代价比较）──> PhysicalPlan
+                                                                                              ↑
+SQL ──> ANALYZE ──> ColumnStats (MCV + 直方图 + NDV + null_frac) ──> SelectivityEstimator ──────┘
 ```
 
 1. **LogicalPlanner**：将 AST 转换为逻辑计划树。SELECT 语句按 From → Join → Where → GroupBy → Having → OrderBy → Limit → Project 的顺序自底向上构建。
 2. **RuleSet**：5 条重写规则按固定顺序迭代应用，直到计划不再变化或达到 16 轮上限。
-3. **PhysicalPlanner**：将逻辑节点替换为具体物理算子，做关键算法选择。
+3. **PhysicalPlanner**：为每个候选生成代价（CostModel，参数对齐 PostgreSQL：`seq_page_cost`/`random_page_cost`/`cpu_tuple_cost` 等，`[optimizer]` 配置节可调），按代价选择算子；自底向上填 `estimated_rows` 与 `startup/total_cost`。
 
 ### 五条重写规则
 
@@ -528,7 +564,7 @@ SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id;
 
 对 INNER JOIN 交换左右子树，使估算较小的子树在左侧。
 
-**代价估算**：`Scan = 1`，`Join = max(left, right) + 1`，`Aggregate = (child + 1) / 2`，纯启发式，无需统计信息。
+**代价估算**：`Scan = 真实行数`，`Filter = 行数 × 统计选择率`（无统计 1/3），`Join = |L|·|R| / max(NDV_l, NDV_r)` 乘积模型，`Aggregate = min(输入行数, 组键 NDV 乘积)`——与 CBO 共用同一套统计。
 
 **触发条件**：INNER JOIN 且右子树估算大小 < 左子树。非内连接（LEFT/RIGHT/FULL）不重排。
 
@@ -557,22 +593,38 @@ Join (INNER)
 
 ---
 
-### 物理算子选择
+### 物理算子选择（代价驱动）
 
-物理规划器根据重写后的逻辑计划选择具体物理算子：
+物理规划器为每个候选计算 `Cost{startup, total}`，按 PostgreSQL 语义比较（total 优先，其次 startup）：
 
-**Scan 选择**：
-- `WHERE col = literal` + 该列有索引 → **IndexScan**（跳过全表扫描）
-- 否则 → **SeqScan + Filter**
+**Scan 选择**（IndexScan vs SeqScan+Filter 双候选比代价）：
+- 小表（<128 行）短路走索引；有统计时按选择率 + correlation（列物理相关性修正随机读代价）比较
+- 无统计回退启发式：等值 NDV<4 落回 SeqScan；范围覆盖率 >50% 落回 SeqScan
+- `BETWEEN` / `IN` / 复合等值合取同样走该决策
 
-**Join 选择**：
-- 等值 JOIN + 两侧 Sort 首键匹配连接键 → **Merge Join**（`left_sorted/right_sorted`，跳过重排）
-- 等值 JOIN 无排序 → **Hash Join**（构建哈希表+探测）
+**Join 选择**（Hash vs NL 代价比较，平局归 Hash）：
+- 等值 JOIN + 两侧已按连接键排序 → **Merge Join** 参与代价比较（免排序 startup，平局优先归并）
+- 等值 JOIN → **Hash Join**（右端建哈希）/ **Nested Loop** 按 `外层行数 × 内层总代价` 比较
 - 非等值 JOIN → **Nested Loop Join**
 
 **Aggregate 选择**：
-- 子节点 Sort 排序列匹配 GROUP BY → **Sort Aggregate**（吸收 Sort，O(1) 内存）
-- 否则 → **Hash Aggregate**（内存哈希表）
+- 输入已按组键排序 → Sort（流式）与 Hash 按代价比较，平局保持 Sort
+- 否则 → **Hash Aggregate**
+
+**估计行数**自底向上传播：Scan 用真实行数（或索引条件选择率），Filter 用统计选择率，Join 用乘积模型，Aggregate 用组键 NDV 乘积，Top-N 用 K 元堆——`EXPLAIN` 的 `(cost=..rows=)` 即这些值。
+
+### 统计信息（ANALYZE）
+
+`ANALYZE [TABLE]` 对每列采集：
+- **MCV**（最常用值）：频率 > 1.25 × 平均频率的值，最多 20 个
+- **等高直方图**：排除 MCV 后分 32 桶（可配），边界为真实数据值
+- **NDV**：全量精确 / 采样 MLE 估计（解 `N·(1-(1-q)^(rows/N)) = d`，均匀高基数列误差 <5%）
+- **null_frac**、**correlation**（列值序与物理序相关性，供 IndexScan 代价修正）
+
+统计持久化为 `data/<table>.stats`（自定义二进制格式，CRC 保护），重启自动加载；
+`[statistics]` 配置节可调采样目标 / MCV 个数 / 直方图桶数 / auto-ANALYZE 阈值。
+**auto-ANALYZE**：首次查询或行数/写入量变化超 10% 时，SELECT 规划前自动重采集，
+并使计划缓存失效（指纹混入 stats_ts）。
 
 ### 执行计划解读
 
@@ -671,6 +723,48 @@ sql> EXPLAIN SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id
 物理计划缓存在 LRU 缓存中（默认 128 条目，仅 SELECT 语句）。键为标准化 SQL（空白折叠 + 统一大小写）。DDL 操作（CREATE/DROP TABLE/INDEX）自动清空缓存。通过 `SHOW STATUS` 可查看当前缓存条目数。
 
 ---
+
+## 复制与高可用
+
+CoroDB 支持**异步 WAL 日志复制**（主从）与只读副本：
+
+```
+primary                          replica (role=replica)
+ ┌─────────────┐   TCP 流（FIFO）  ┌──────────────────┐
+ │ LSM 写入     │ ───────────────> │ ReplicationFollower│
+ │ → sink 广播  │  ApplyRow/Delete │ 逐帧重放（MVCC 语义）│
+ │   COMMIT...  │  Commit/DDL      │ mark_committed     │
+ └─────────────┘                  │ 只读（写语句拒绝）  │
+                                  └──────────────────┘
+```
+
+- **记录类型**：ApplyRow / ApplyDelete / Commit / CreateTable / DropTable，行与键以引擎编码传输
+- **顺序保证**：同一连接 FIFO，行先于其 COMMIT 到达——未提交数据在从端不可见，与主端崩溃恢复语义一致
+- **从端重放**：经引擎原路径写入（`mark_committed` 写本地提交日志，恢复语义正确）；DDL 触发 Catalog 刷新
+- **引导**：从端先 `BACKUP TO` 快照拷贝数据目录，再接入流复制
+- **只读强制**：副本拒绝一切数据变更语句（含 EXPLAIN 包裹的 DML）
+
+客户端读写分离：`csql -h 主机 -p 4000 -r 副机:4200`——SELECT/SHOW 路由到副本，其余走主端。
+
+## 安全
+
+- **认证**：CREATE USER 创建账号（PBKDF2-HMAC-SHA256，100k 迭代可调，每用户独立 16 字节随机盐），
+  `AUTH user 'password'` 登录；存在用户后所有命令需认证
+- **RBAC**：`CREATE USER ... [ROLE admin|read_write|read_only]`；read_only 拒绝一切数据变更
+  （含 EXPLAIN 包裹的 DML），用户管理仅 admin
+- **审计**：每条语句一行 JSON（时间戳/用户/角色/SQL 截断/status=ok|error|denied/耗时），
+  追加写入 `[audit].path`
+- **TLS**：`[tls] enabled=true` 后管理端点、复制通道走 TLS，并开启 SQL over TLS 专用端口；
+  客户端 `csql` 明文端口与 TLS 端口均可连
+
+## 可观测性
+
+- **Prometheus**：`GET http://127.0.0.1:4100/metrics` 暴露 `corodb_*` 指标——
+  查询计数（按 ok/error）、语句延迟直方图、活跃/累计连接数、事务计数（活跃/提交/中止）、
+  行写入总量、复制发送/应用条数、副本滞后 commit_ts、uptime
+- **健康检查**：`GET /healthz` 返回 `ok`
+- **慢查询日志**：执行超过 `[metrics].slow_query_ms` 的语句记录 WARN（时长 + 截断 SQL）
+- **审计**：见上；`SHOW STATUS` 提供运行中概览（活跃事务/计划缓存/表数）
 
 ## 并发控制
 
@@ -900,25 +994,27 @@ cd build && ctest -j8
 | 事务 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name`, `SET TRANSACTION ISOLATION LEVEL {READ UNCOMMITTED \| READ COMMITTED \| REPEATABLE READ \| SERIALIZABLE}` |
 | 计划 | `EXPLAIN stmt`, `EXPLAIN ANALYZE stmt` |
 | 预处理 | `PREPARE name FROM 'sql'`, `EXECUTE name`, `DEALLOCATE PREPARE [name \| ALL]` |
-| 管理 | `CREATE USER user 'pwd'`, `AUTH user 'pwd'`, `CHECKPOINT`, `SHOW STATUS` |
+| 管理 | `CREATE USER user 'pwd' [ROLE admin\|read_write\|read_only]`, `AUTH user 'pwd'`, `ANALYZE [TABLE name]`, `BACKUP TO 'dir'`, `CHECKPOINT`, `SHOW STATUS` |
 | 运算符 | `=`, `<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `+`, `-`, `*`, `/`, `%`, `\|\|` |
-| 类型 | `INT`, `INT64`, `BIGINT`, `TEXT`, `STRING`, `VARCHAR`, `FLOAT`, `DOUBLE`, `FLOAT64`, `BOOL`/`BOOLEAN`（存 0/1，`TRUE`/`FALSE` 字面量）, `DATE`/`TIMESTAMP`/`DATETIME`（ISO-8601 字符串，字典序即时间序） |
+| 类型 | `INT`, `INT64`, `BIGINT`, `TEXT`, `STRING`, `VARCHAR`, `FLOAT`, `DOUBLE`, `FLOAT64`, `DECIMAL`, `BOOL`/`BOOLEAN`（存 0/1，`TRUE`/`FALSE` 字面量）, `DATE`/`TIMESTAMP`/`DATETIME`（ISO-8601 字符串，字典序即时间序） |
 
 ### 已知限制
 
 | 特性 | 状态 |
 |------|------|
-| 子查询 | 支持 `IN / NOT IN (SELECT ...)` 与 `EXISTS / NOT EXISTS (SELECT ...)`（WHERE 中，可嵌套）；非相关先代换可命中索引，相关子查询逐外层行求值（引用外层列须带表名/别名限定） |
+| 子查询 | 支持 `IN / NOT IN (SELECT ...)` 与 `EXISTS / NOT EXISTS (SELECT ...)`（WHERE 中，可嵌套）；非相关先代换可命中索引，等值相关模式自动去相关化，其余逐外层行求值（引用外层列须带表名/别名限定） |
 | `IS NULL / IS NOT NULL` | 支持（含 `NULL` 字面量写入/更新，三值逻辑） |
 | `UNION [ALL]` | 支持（同种拼接；混合 UNION/UNION ALL 暂不支持） |
 | 嵌套事务 | `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` 已支持（写缓冲快照式；保存点后获得的行锁保持到事务结束） |
-| TLS 加密传输 | 不支持 |
+| TLS 加密传输 | 支持（`[tls]` 配置节；管理端点、复制通道、SQL 专用端口） |
+| 子查询 | 标量子查询（SELECT 列表中）、派生表（FROM 子句）、ANY/ALL/LATERAL 暂不支持 |
+| 复制拓扑 | 单主 + 只读副本（异步）；Raft 自动故障转移计划中 |
 
 ---
 
 ## 配置选项
 
-配置文件 `corodb.conf`（INI 格式）。首次启动服务器时自动生成到可执行文件同目录（`corodb_genconfig` 工具可手动预先创建，非必须）。共 9 个段、22 个配置项。
+配置文件 `corodb.conf`（INI 格式）。首次启动服务器时自动生成到可执行文件同目录（`corodb_genconfig` 工具可手动预先创建，非必须）。共 15 个段、45+ 个配置项。
 
 ### `[server]` 段
 
@@ -932,6 +1028,7 @@ cd build && ctest -j8
 | `reuse_port` | `true` | 端口复用（SO_REUSEPORT） |
 | `idle_timeout_sec` | `0` | 空闲连接超时（秒，0 = 禁用） |
 | `statement_timeout_ms` | `0` | 单条语句超时（毫秒，0 = 禁用） |
+| `rate_limit_per_sec` | `0` | 每连接语句速率限制（条/秒，令牌桶；0 = 禁用） |
 
 ### `[storage]` 段
 
@@ -992,7 +1089,62 @@ cd build && ctest -j8
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
-| `password_salt` | `corodb_salt_v1` | 密码哈希盐值 |
+| `password_salt` | `corodb_salt_v1` | 旧版 FNV 口令校验盐（新账号用独立随机盐） |
+| `pbkdf2_iterations` | `100000` | PBKDF2-HMAC-SHA256 迭代次数（1000–10000000） |
+
+### `[statistics]` 段
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `sample_target` | `300` | 采样目标行数（小表 ≤3 倍全量扫描） |
+| `max_mcv` | `20` | MCV 最大保留个数 |
+| `histogram_buckets` | `32` | 等高直方图桶数 |
+| `auto_analyze_threshold` | `0.1` | 自动 ANALYZE 触发阈值（行数/写入变化比例） |
+
+### `[optimizer]` 段
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `cost_model` | `true` | 启用代价模型（false 回退启发式阈值决策） |
+| `seq_page_cost` | `1.0` | 顺序读一页代价（基准单位） |
+| `random_page_cost` | `4.0` | 随机读一页代价 |
+| `cpu_tuple_cost` | `0.01` | 处理一行元组的 CPU 代价 |
+| `cpu_index_tuple_cost` | `0.005` | 索引项处理一行代价 |
+| `cpu_operator_cost` | `0.0025` | 一次操作符/谓词求值代价 |
+
+### `[metrics]` 段
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `enabled` | `true` | 启用管理端 HTTP（/metrics、/healthz，仅绑定回环） |
+| `port` | `4100` | 管理端监听端口 |
+| `slow_query_ms` | `1000` | 慢查询日志阈值（毫秒，0 = 禁用） |
+
+### `[replication]` 段
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `role` | `primary` | 节点角色：`primary` / `replica`（只读副本） |
+| `port` | `4200` | 主端复制日志监听端口 |
+| `connect` | （空） | 从端连接的主端地址 `host:port` |
+
+### `[tls]` 段
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `enabled` | `false` | 启用 TLS（管理端 + 复制通道 + SQL TLS 端口） |
+| `cert_path` | （空） | 服务器证书（PEM 证书链；留空需显式证书） |
+| `key_path` | （空） | 私钥（PEM） |
+| `ca_path` | （空） | 信任 CA（客户端验证用） |
+| `verify_cert` | `true` | 客户端是否校验服务器证书（自签名测试置 false） |
+| `sql_port` | `4400` | SQL over TLS 专用监听端口 |
+
+### `[audit]` 段
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `enabled` | `true` | 启用审计日志（JSON Lines，每语句一行） |
+| `path` | `audit.log` | 审计文件路径（追加写） |
 
 ---
 
@@ -1024,16 +1176,16 @@ cd build && ctest -j8
 
 **事务系统** — 四种隔离级别 + MVCC + Serializable 幻读防护、行级写写冲突检测、表级锁超时、全局锁超时、客户端断连回滚
 
-**网络与安全** — Reactor 服务器 (epoll/WSAPoll)、批量 accept、缓冲限制、空闲超时、SIGPIPE 处理、有界线程池、AUTH 密码认证 (SHA-256)、预处理语句
+**网络与安全** — Reactor 服务器 (epoll/WSAPoll)、批量 accept、缓冲限制、空闲超时、有界线程池、AUTH 认证（PBKDF2-HMAC-SHA256 加盐，每用户独立随机盐，旧哈希兼容迁移）、RBAC 三档角色（admin/read_write/read_only）+ 审计日志（JSON Lines）、TLS 传输加密（OpenSSL，管理端/复制通道/SQL 专用端口）、预处理语句、每连接限流（令牌桶）
 
-**运维** — 结构化日志 (ERROR/WARN/INFO/DEBUG)、CHECKPOINT 在线备份、SHOW STATUS 监控
+**查询优化器（CBO）** — 列统计（ANALYZE：MCV/等高直方图/NDV MLE/null_frac + .stats 持久化 + auto-ANALYZE）、选择性估计库、统一代价模型（Cost{startup,total}，PG 对齐参数）、代价驱动访问路径（IndexScan↔SeqScan，含 correlation）与连接算法（Hash/Merge/NL）、Top-N 下推、统计指纹计划缓存失效、EXPLAIN `(cost=..rows=)`
+
+**高可用与运维** — WAL 日志复制（主从流式推送 + 只读副本 + MVCC 语义重放 + 断线重连）、读写分离（csql `-r` 副本路由）、客户端连接池、CHECKPOINT 在线备份、`BACKUP TO` 一致性物理快照、Prometheus 指标（/metrics）+ 健康检查（/healthz）+ 慢查询日志、MANIFEST 崩溃一致性 + SSTable 页级 CRC32C、结构化日志
 
 ### 计划中
 
-- 基于代价的优化器（CBO）
-- 相关子查询去相关化（当前为逐行 apply，正确优先；`IN`/`EXISTS` 相关与非相关均已支持）
-- `SAVEPOINT` 嵌套事务
-- TLS 传输加密
+- 基于 Raft 共识的自动故障转移（复制已就绪，缺 leader 选举）
+- 增量备份与 PITR（全量快照 `BACKUP TO` 已就绪）
 - WAL 压缩
 - 并行查询执行
 
