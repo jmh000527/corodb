@@ -31,13 +31,18 @@ namespace corodb {
             }
         }
 
-        void respond(socket_t fd, int status, const std::string& body) {
+        void respond(socket_t fd, tls::TlsStream* stream, int status, const std::string& body) {
             const char* reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : "Bad Request");
             std::string head = "HTTP/1.1 " + std::to_string(status) + " " + reason +
                                "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " +
                                std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
-            write_all(fd, head);
-            write_all(fd, body);
+            if (stream) {
+                stream->write(head);
+                stream->write(body);
+            } else {
+                write_all(fd, head);
+                write_all(fd, body);
+            }
         }
 
     } // namespace
@@ -112,17 +117,37 @@ namespace corodb {
                     return;
                 continue;
             }
-            handle_client(fd);
+            if (opts_.tls) {
+                try {
+                    auto stream = tls::TlsStream::accept(opts_.tls, fd);
+                    handle_client(fd, stream.get());
+                } catch (...) {
+                    // TLS 握手失败：直接关闭。
+                }
+            } else {
+                handle_client(fd, nullptr);
+            }
             close_socket(fd);
         }
     }
 
-    void AdminServer::handle_client(socket_t fd) {
+    void AdminServer::handle_client(socket_t fd, tls::TlsStream* stream) {
+        auto read_some = [&](char* buf, std::size_t n) -> int {
+            if (stream)
+                return static_cast<int>(stream->read(buf, n));
+            return read_socket(fd, buf, static_cast<int>(n));
+        };
+        auto write_out = [&](const std::string& d) {
+            if (stream)
+                stream->write(d);
+            else
+                write_all(fd, d);
+        };
         // 读取请求头（直到 \r\n\r\n 或上限）；scrape 请求很小，8KB 足够。
         std::string req;
         char buf[1024];
         while (req.size() < 8192) {
-            const int n = read_socket(fd, buf, sizeof(buf));
+            const int n = read_some(buf, sizeof(buf));
             if (n <= 0)
                 break;
             req.append(buf, static_cast<std::size_t>(n));
@@ -132,14 +157,14 @@ namespace corodb {
         // 请求行：METHOD SP PATH SP VERSION
         const auto line_end = req.find("\r\n");
         if (line_end == std::string::npos) {
-            respond(fd, 400, "bad request");
+            respond(fd, stream, 400, "bad request");
             return;
         }
         const std::string line = req.substr(0, line_end);
         const auto sp1 = line.find(' ');
         const auto sp2 = line.find(' ', sp1 + 1);
         if (sp1 == std::string::npos || sp2 == std::string::npos) {
-            respond(fd, 400, "bad request");
+            respond(fd, stream, 400, "bad request");
             return;
         }
         const std::string method = line.substr(0, sp1);
@@ -149,7 +174,7 @@ namespace corodb {
             path.resize(query);
 
         if (method != "GET" && method != "HEAD") {
-            respond(fd, 404, "method not allowed");
+            respond(fd, stream, 404, "method not allowed");
             return;
         }
         std::string body;
@@ -157,10 +182,10 @@ namespace corodb {
             body = opts_.handler(path);
         }
         if (body.empty() && path != "/metrics" && path != "/healthz") {
-            respond(fd, 404, "not found");
+            respond(fd, stream, 404, "not found");
             return;
         }
-        respond(fd, 200, body);
+        respond(fd, stream, 200, body);
     }
 
 } // namespace corodb

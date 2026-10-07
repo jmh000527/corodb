@@ -83,11 +83,31 @@ add_library(corodb
     # 服务
     src/server/server.cpp
     src/server/admin_server.cpp
+    src/server/tls_sql_server.cpp
     src/replication/replication.cpp
     src/db/database.cpp
 )
 
+# TLS 后端（P2）：OpenSSL（全平台；Windows 经 vcpkg 提供）
+if(WIN32 AND NOT OPENSSL_ROOT_DIR)
+    if(EXISTS "D:/vcpkg/installed/x64-windows/include/openssl/ssl.h")
+        set(OPENSSL_ROOT_DIR "D:/vcpkg/installed/x64-windows")
+    endif()
+endif()
+find_package(OpenSSL REQUIRED)
+target_sources(corodb PRIVATE src/net/tls_openssl.cpp)
+if(WIN32 AND OPENSSL_ROOT_DIR)
+    add_custom_command(TARGET corodb POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${OPENSSL_ROOT_DIR}/bin/libssl-3-x64.dll"
+            "${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll"
+            $<TARGET_FILE_DIR:corodb>)
+endif()
+
 target_include_directories(corodb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# 链接期内存优化：测试可执行文件关闭增量链接与调试 PDB 分割压力（LNK1102 环境规避）
+set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${CMAKE_EXE_LINKER_FLAGS_DEBUG} /DEBUG:NONE")
 
 # 编译器选项（必须在 target 创建之后）
 if(MSVC)
@@ -103,6 +123,7 @@ if(WIN32)
 elseif(UNIX)
     target_link_libraries(corodb PUBLIC pthread)
 endif()
+target_link_libraries(corodb PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 # ============================================================================
 # 可执行文件
@@ -195,7 +216,16 @@ add_executable(corodb_tests
     tests/test_crypto.cpp
     tests/test_security.cpp
     tests/test_replication.cpp
+    tests/test_tls.cpp
 )
+if(WIN32 AND OPENSSL_ROOT_DIR)
+    add_custom_command(TARGET corodb_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${OPENSSL_ROOT_DIR}/bin/libssl-3-x64.dll"
+            "${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll"
+            $<TARGET_FILE_DIR:corodb_tests>)
+endif()
+
 target_link_libraries(corodb_tests
     PRIVATE corodb GTest::gtest GTest::gtest_main GTest::gmock
 )

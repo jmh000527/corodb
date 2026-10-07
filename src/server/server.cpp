@@ -12,6 +12,9 @@
 #include "corodb/net/port.h"
 #include "corodb/replication/replication.h"
 #include "corodb/server/admin_server.h"
+#include "corodb/server/sql_protocol.h"
+#include "corodb/server/tls_sql_server.h"
+#include "corodb/net/tls.h"
 #include "corodb/storage/lsm_storage_engine.h"
 #include "corodb/storage/storage_engine_common.h"
 #include "corodb/threading/reactor_server.h"
@@ -86,161 +89,6 @@ namespace corodb {
     namespace {
 
         /**
-         * @brief 执行 SQL 语句并返回格式化的结果字符串
-         * @param db 数据库实例
-         * @param sql SQL 语句
-         * @param session 当前连接的会话状态（含事务 ID 等）
-         * @return 格式化的结果字符串
-         */
-        std::string run_sql(Database& db, const std::string& sql, std::shared_ptr<Session> session) {
-            std::string res;
-            const std::string indent = "  ";
-
-            auto result = db.execute(sql, std::move(session));
-
-            if (result.message) {
-                std::istringstream iss(*result.message);
-                std::string line;
-                while (std::getline(iss, line)) {
-                    if (!line.empty()) {
-                        res += indent;
-                        res += line;
-                        res += '\n';
-                    }
-                }
-            } else if (result.rows) {
-                if (result.is_select) {
-                    res += "@TABLE\n";
-
-                    auto value_to_string = [](const Value& v) {
-                        if (std::holds_alternative<NullValue>(v))
-                            return std::string("NULL");
-                        if (std::holds_alternative<int64_t>(v))
-                            return std::to_string(std::get<int64_t>(v));
-                        if (std::holds_alternative<double>(v))
-                            return std::to_string(std::get<double>(v));
-                        return std::get<std::string>(v);
-                    };
-
-                    auto sanitize = [](std::string s) {
-                        for (char& ch: s) {
-                            if (ch == '\t' || ch == '\n' || ch == '\r')
-                                ch = ' ';
-                        }
-                        return s;
-                    };
-
-                    bool have_header = false;
-
-                    for (const auto& rec: *result.rows) {
-                        if (!have_header) {
-                            for (std::size_t i = 0; i < rec.bindings.size(); ++i) {
-                                if (i > 0)
-                                    res += '\t';
-                                const auto& b = rec.bindings[i];
-                                std::string name = b.column.empty() ? ("col" + std::to_string(i + 1)) : b.column;
-                                res += sanitize(name);
-                            }
-                            res += '\n';
-                            have_header = true;
-                        }
-
-                        for (std::size_t i = 0; i < rec.values.size(); ++i) {
-                            if (i > 0)
-                                res += '\t';
-                            res += sanitize(value_to_string(rec.values[i]));
-                        }
-                        res += '\n';
-                    }
-                } else {
-                    for (const auto& _: *result.rows) {
-                        (void)_;
-                    }
-                    res += indent;
-                    res += "OK\n";
-                }
-            }
-
-            auto start = res.find_first_not_of(" \t\r\n");
-            if (start != std::string::npos) {
-                res.erase(0, start);
-            } else {
-                res.clear();
-            }
-
-            if (!res.empty()) {
-                if (!res.starts_with("@TABLE")) {
-                    res.insert(0, indent);
-                }
-            } else {
-                res = indent + "OK\n";
-            }
-
-            res += "@END\n";
-            return res;
-        }
-
-        /**
-         * @brief 处理单行 SQL
-         */
-        std::string process_sql_line(Database& db, std::string line, std::shared_ptr<Session> session) {
-            // Trim whitespace
-            auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
-            auto start = std::find_if_not(line.begin(), line.end(), is_ws);
-            auto end = std::find_if_not(line.rbegin(), std::make_reverse_iterator(start), is_ws).base();
-
-            if (start != line.begin() || end != line.end()) {
-                line = std::string(start, end);
-            }
-
-            // Remove trailing semicolon
-            if (!line.empty() && line.back() == ';') {
-                line.pop_back();
-                start = std::find_if_not(line.begin(), line.end(), is_ws);
-                end = std::find_if_not(line.rbegin(), std::make_reverse_iterator(start), is_ws).base();
-                if (start != line.begin() || end != line.end()) {
-                    line = std::string(start, end);
-                }
-            }
-
-            if (line.empty()) {
-                return "";
-            }
-
-            // 观测：语句执行时长 + 结果计数 + 慢查询日志（P2）。
-            const auto start_ts = std::chrono::steady_clock::now();
-            std::string response;
-            try {
-                // Database 内部已实现线程安全（读写锁）
-                response = run_sql(db, line, std::move(session));
-                queries_ok().increment();
-            } catch (const WriteConflictError& ex) {
-                queries_error().increment();
-                // 写写冲突是事务并发的预期行为，不打印到 stderr
-                return std::string("ERROR: ") + ex.what() + "\n@END\n";
-            } catch (const std::exception& ex) {
-                queries_error().increment();
-                LOG_ERROR("Error executing query: {}", ex.what());
-                // 注意：保持 "ERROR:" 前缀（大写），客户端必须用
-                // is_error_response() 判定，避免大小写不一致（B2）。
-                // 必须追加 @END 终止标记，否则客户端 read_response 会等满 30s 超时
-                return std::string("ERROR: ") + ex.what() + "\n@END\n";
-            }
-            const double elapsed_s =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start_ts).count();
-            query_duration().observe(elapsed_s);
-            const uint64_t slow_ms = Config::instance().metrics_slow_query_ms();
-            if (slow_ms > 0 && elapsed_s * 1000.0 >= static_cast<double>(slow_ms)) {
-                slow_queries().increment();
-                std::string sql_head = line.substr(0, line.find('\n'));
-                if (sql_head.size() > 200)
-                    sql_head = sql_head.substr(0, 200) + "...";
-                LOG_WARN("Slow query: {} ms, sql: {}", static_cast<uint64_t>(elapsed_s * 1000.0), sql_head);
-            }
-            return response;
-        }
-
-        /**
          * @brief 消息处理回调
          *
          * 在 I/O 线程中调用，将 SQL 执行任务提交到工作线程池。
@@ -285,7 +133,7 @@ namespace corodb {
                 // 在工作线程中执行 SQL。同一连接的 SQL 串行执行（按到达顺序
                 // 提交到线程池，且事务语义要求顺序执行）。
                 server.post_task([&db, conn, session, line = std::move(line)]() {
-                    std::string response = process_sql_line(db, line, session);
+                    std::string response = sql_proto::process_sql_line(db, line, session);
                     if (!response.empty()) {
                         conn->send(std::move(response));
                     }
@@ -331,6 +179,23 @@ namespace corodb {
         Database db(cfg.data_dir);
         g_shared_db = &db;
 
+        // ---- TLS 传输加密（P2）：管理端 / 复制通道 / SQL TLS 专用端口 ----
+        std::shared_ptr<tls::TlsContext> tls_server_ctx; // 服务器角色上下文
+        std::shared_ptr<tls::TlsContext> tls_client_ctx; // 客户端角色上下文（复制从端）
+        if (Config::instance().tls_enabled()) {
+            tls::TlsConfig tcfg;
+            tcfg.cert_path = Config::instance().tls_cert_path();
+            tcfg.key_path = Config::instance().tls_key_path();
+            tcfg.ca_path = Config::instance().tls_ca_path();
+            tcfg.verify_cert = Config::instance().tls_verify_cert();
+            try {
+                tls_server_ctx = tls::TlsContext::create_server(tcfg);
+                LOG_INFO("TLS enabled (server context ok)");
+            } catch (const std::exception& ex) {
+                LOG_WARN("TLS server context failed: {}", ex.what());
+            }
+        }
+
         // 管理端 HTTP（/metrics、/healthz；P2 观测性）。仅绑定本机回环。
         std::unique_ptr<AdminServer> admin;
         if (Config::instance().metrics_enabled()) {
@@ -346,6 +211,7 @@ namespace corodb {
             Metrics::instance().gauge("corodb_txn_active", {}, "Currently active transactions.");
             AdminServer::Options admin_opts;
             admin_opts.port = Config::instance().metrics_port();
+            admin_opts.tls = tls_server_ctx;
             admin_opts.handler = [&server_start, &uptime_gauge](const std::string& path) {
                 if (path == "/healthz")
                     return std::string("ok\n");
@@ -373,6 +239,19 @@ namespace corodb {
         const std::string repl_role = Config::instance().replication_role();
         if (repl_role == "replica") {
             db.set_read_only(true);
+            if (Config::instance().tls_enabled()) {
+                tls::TlsConfig tcfg;
+                tcfg.cert_path = Config::instance().tls_cert_path();
+                tcfg.key_path = Config::instance().tls_key_path();
+                tcfg.ca_path = Config::instance().tls_ca_path();
+                tcfg.verify_cert = Config::instance().tls_verify_cert();
+                try {
+                    tls_client_ctx = tls::TlsContext::create_client(tcfg);
+                } catch (const std::exception& ex) {
+                    LOG_WARN("TLS client context failed: {}", ex.what());
+                }
+            }
+            repl_follower.set_tls(tls_client_ctx);
             // 解析 connect = "host:port"（缺省 127.0.0.1:[replication].port）。
             const std::string connect = Config::instance().replication_connect();
             std::string repl_host = "127.0.0.1";
@@ -407,11 +286,25 @@ namespace corodb {
         } else {
             auto* lsm = static_cast<LSMTreeEngine*>(db.get_storage());
             lsm->set_replication_sink([&repl_hub](const ReplicationRecord& rec) { repl_hub.broadcast(rec); });
+            repl_hub.set_tls(tls_server_ctx);
             try {
                 repl_hub.start(Config::instance().replication_port());
                 LOG_INFO("Replication server listening on port {}", repl_hub.port());
             } catch (const std::exception& ex) {
                 LOG_WARN("Replication server disabled: {}", ex.what());
+            }
+        }
+
+        // ---- SQL over TLS 专用端口（P2；线程/连接，复用文本协议） ----
+        std::unique_ptr<TlsSqlServer> tls_sql;
+        if (Config::instance().tls_enabled() && tls_server_ctx) {
+            tls_sql = std::make_unique<TlsSqlServer>(Config::instance().tls_sql_port(), tls_server_ctx, db);
+            try {
+                tls_sql->start();
+                LOG_INFO("SQL TLS listener on port {}", tls_sql->port());
+            } catch (const std::exception& ex) {
+                LOG_WARN("SQL TLS listener disabled: {}", ex.what());
+                tls_sql.reset();
             }
         }
 
@@ -480,6 +373,7 @@ namespace corodb {
             g_server_running.store(false);
             g_shared_db = nullptr;
             admin.reset();
+            tls_sql.reset();
             repl_follower.stop();
             repl_hub.stop();
 
@@ -495,6 +389,7 @@ namespace corodb {
         }
 
         admin.reset();
+        tls_sql.reset();
         repl_follower.stop();
         repl_hub.stop();
         g_shared_db = nullptr;

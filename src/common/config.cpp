@@ -264,6 +264,18 @@ namespace corodb {
         if (try_set_str("replication.role", &Config::replication_role_)) return;
         if (try_set_u16("replication.port", &Config::replication_port_)) return;
         if (try_set_str("replication.connect", &Config::replication_connect_)) return;
+
+        // audit.*
+        if (k == "audit.enabled") { audit_enabled_ = (value == "true" || value == "1"); return; }
+        if (try_set_str("audit.path", &Config::audit_path_)) return;
+
+        // tls.*
+        if (k == "tls.enabled") { tls_enabled_ = (value == "true" || value == "1"); return; }
+        if (try_set_str("tls.cert_path", &Config::tls_cert_path_)) return;
+        if (try_set_str("tls.key_path", &Config::tls_key_path_)) return;
+        if (try_set_str("tls.ca_path", &Config::tls_ca_path_)) return;
+        if (k == "tls.verify_cert") { tls_verify_cert_ = (value == "true" || value == "1"); return; }
+        if (try_set_u16("tls.sql_port", &Config::tls_sql_port_)) return;
     }
 
     /**
@@ -512,6 +524,31 @@ namespace corodb {
         ofs << "\n";
         ofs << "# 审计文件路径（追加写入）。\n";
         ofs << "path = " << tmp.audit_path_ << "\n";
+        ofs << "\n";
+
+        // ---- [tls] ----
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "#  TLS 传输加密（管理端点 / 复制通道 / SQL TLS 专用端口）\n";
+        ofs << "# ----------------------------------------------------------------------------\n";
+        ofs << "[tls]\n";
+        ofs << "# 是否启用 TLS。启用后：管理端点与复制通道走 TLS，并新增 SQL TLS 监听端口。\n";
+        ofs << "enabled = " << (tmp.tls_enabled_ ? "true" : "false") << "\n";
+        ofs << "\n";
+        ofs << "# 服务器证书：Windows 为 .pfx（私钥内含）；Linux 为 PEM 证书链。\n";
+        ofs << "# 留空时（Windows）生成运行时自签名证书，仅用于开发/测试。\n";
+        ofs << "cert_path = " << tmp.tls_cert_path_ << "\n";
+        ofs << "\n";
+        ofs << "# 私钥（Linux PEM；Windows PFX 内含可留空）。\n";
+        ofs << "key_path = " << tmp.tls_key_path_ << "\n";
+        ofs << "\n";
+        ofs << "# 信任 CA（可选，客户端验证用）。\n";
+        ofs << "ca_path = " << tmp.tls_ca_path_ << "\n";
+        ofs << "\n";
+        ofs << "# 客户端是否校验服务器证书（自签名测试场景可置 false）。\n";
+        ofs << "verify_cert = " << (tmp.tls_verify_cert_ ? "true" : "false") << "\n";
+        ofs << "\n";
+        ofs << "# SQL over TLS 专用监听端口（线程/连接模型，复用 SQL 文本协议）。\n";
+        ofs << "sql_port = " << tmp.tls_sql_port_ << "\n";
 
         return true;
     }

@@ -22,6 +22,18 @@
 
 namespace corodb {
 
+    namespace {
+        void send_all(socket_t fd, const char* data, std::size_t n) {
+            std::size_t sent = 0;
+            while (sent < n) {
+                const int k = write_socket(fd, data + sent, static_cast<int>(n - sent));
+                if (k <= 0)
+                    throw std::runtime_error("[Replication] socket send failed");
+                sent += static_cast<std::size_t>(k);
+            }
+        }
+    } // namespace
+
     // =========================================================================
     // ReplicationRecord
     // =========================================================================
@@ -265,6 +277,14 @@ namespace corodb {
             }
             auto client = std::make_shared<Client>();
             client->fd = fd;
+            if (tls_) {
+                try {
+                    client->stream = tls::TlsStream::accept(tls_, fd);
+                } catch (...) {
+                    close_socket(fd); // 握手失败：拒绝该连接
+                    continue;
+                }
+            }
             {
                 std::lock_guard lk(clients_mutex_);
                 clients_.push_back(client);
@@ -286,16 +306,16 @@ namespace corodb {
                 frame = std::move(client->outbox.front());
                 client->outbox.pop();
             }
-            std::size_t sent = 0;
-            while (sent < frame.size() && client->alive.load()) {
-                const int n = write_socket(client->fd, frame.data() + sent, frame.size() - sent);
-                if (n <= 0) {
-                    client->alive.store(false);
-                    connected_gauge_.decrement();
-                    close_socket(client->fd);
-                    return;
-                }
-                sent += static_cast<std::size_t>(n);
+            try {
+                if (client->stream)
+                    client->stream->write(frame);
+                else
+                    send_all(client->fd, frame.data(), frame.size());
+            } catch (...) {
+                client->alive.store(false);
+                connected_gauge_.decrement();
+                close_socket(client->fd);
+                return;
             }
         }
     }
@@ -364,6 +384,7 @@ namespace corodb {
         }
         if (thread_.joinable())
             thread_.join();
+        stream_.reset();
     }
 
     bool ReplicationFollower::try_connect() {
@@ -389,10 +410,27 @@ namespace corodb {
             return false;
         }
         fd_ = fd;
+        if (tls_) {
+            try {
+                stream_ = tls::TlsStream::connect(tls_, fd_, host_.empty() ? "localhost" : host_);
+            } catch (...) {
+                stream_.reset();
+                close_socket(fd_);
+                fd_ = INVALID_SOCKET_VAL;
+                return false;
+            }
+        }
         return true;
     }
 
     void ReplicationFollower::receive_loop() {
+        // 断开当前连接（TLS 流 + fd），回到重连循环。
+        auto drop_connection = [&] {
+            connected_.store(false);
+            stream_.reset();
+            close_socket(fd_);
+            fd_ = INVALID_SOCKET_VAL;
+        };
         while (running_.load()) {
             if (!connected_.load()) {
                 if (!try_connect()) {
@@ -403,55 +441,49 @@ namespace corodb {
                 }
                 connected_.store(true);
             }
-            // 读一帧：[u32 len][payload]。
-            uint32_t len = 0;
-            {
-                char len_buf[4];
+            // 按帧读取：TLS 流或原始 socket。
+            auto read_exact = [&](char* dst, std::size_t n) {
                 std::size_t got = 0;
-                while (got < 4) {
-                    const int n = read_socket(fd_, len_buf + got, 4 - got);
-                    if (n <= 0) {
-                        connected_.store(false);
-                        break;
+                while (got < n) {
+                    if (stream_) {
+                        const std::size_t k = stream_->read(dst + got, n - got);
+                        if (k == 0)
+                            return false; // 对端关闭
+                        got += k;
+                    } else {
+                        const int k = read_socket(fd_, dst + got, static_cast<int>(n - got));
+                        if (k <= 0)
+                            return false;
+                        got += static_cast<std::size_t>(k);
                     }
-                    got += static_cast<std::size_t>(n);
                 }
-                if (!connected_.load()) {
-                    close_socket(fd_);
-                    fd_ = INVALID_SOCKET_VAL;
+                return true;
+            };
+            try {
+                // 读一帧：[u32 len][payload]。
+                uint32_t len = 0;
+                if (!read_exact(reinterpret_cast<char*>(&len), 4) || len == 0 || len > (64u << 20)) {
+                    drop_connection();
                     continue;
                 }
-                std::memcpy(&len, len_buf, 4);
-            }
-            if (len == 0 || len > (64u << 20)) {
-                connected_.store(false);
-                close_socket(fd_);
-                fd_ = INVALID_SOCKET_VAL;
-                continue;
-            }
-            std::string payload(len, '\0');
-            std::size_t got = 0;
-            while (got < len) {
-                const int n = read_socket(fd_, payload.data() + got, static_cast<int>(len - got));
-                if (n <= 0) {
-                    connected_.store(false);
-                    break;
+                std::string payload(len, '\0');
+                if (!read_exact(payload.data(), len)) {
+                    drop_connection();
+                    continue;
                 }
-                got += static_cast<std::size_t>(n);
+                ReplicationRecord rec;
+                if (rec.deserialize(payload)) {
+                    apply_(rec);
+                    applied_counter_.increment();
+                    if (rec.type == ReplicationRecord::Type::Commit)
+                        applied_commit_ts_.set(static_cast<int64_t>(rec.commit_ts));
+                }
+                // 反序列化失败：跳过该帧（协议错误场景；不中断流）。
+            } catch (const tls::TlsError&) {
+                if (!running_.load())
+                    return;
+                drop_connection();
             }
-            if (!connected_.load()) {
-                close_socket(fd_);
-                fd_ = INVALID_SOCKET_VAL;
-                continue;
-            }
-            ReplicationRecord rec;
-            if (rec.deserialize(payload)) {
-                apply_(rec);
-                applied_counter_.increment();
-                if (rec.type == ReplicationRecord::Type::Commit)
-                    applied_commit_ts_.set(static_cast<int64_t>(rec.commit_ts));
-            }
-            // 反序列化失败：跳过该帧（协议错误场景；不中断流）。
         }
     }
 

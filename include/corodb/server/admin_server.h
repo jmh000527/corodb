@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "corodb/net/port.h"
+#include "corodb/net/tls.h"
 
 namespace corodb {
 
@@ -24,6 +25,7 @@ namespace corodb {
         struct Options {
             uint16_t port{ 4100 }; ///< 监听端口（0 = 由操作系统分配，port() 查询实际值）。
             Handler handler;       ///< 路径 → 响应体（200）；返回空串 → 404。
+            std::shared_ptr<tls::TlsContext> tls; ///< 非空 → 握手后走加密读写（HTTPS）。
         };
 
         explicit AdminServer(Options opt);
@@ -45,7 +47,7 @@ namespace corodb {
 
     private:
         void accept_loop();
-        void handle_client(socket_t fd);
+        void handle_client(socket_t fd, tls::TlsStream* stream);
 
         Options opts_;
         socket_t listen_fd_{ INVALID_SOCKET_VAL };

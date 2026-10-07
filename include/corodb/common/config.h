@@ -51,6 +51,10 @@ namespace corodb {
         static constexpr uint16_t kDefaultReplicationPort = 4200;
         // [audit]（审计日志）
         static constexpr bool kDefaultAuditEnabled = true;
+        // [tls]（P2 传输加密）
+        static constexpr bool    kDefaultTlsEnabled = false;
+        static constexpr bool    kDefaultTlsVerifyCert = true;
+        static constexpr uint16_t kDefaultTlsSqlPort = 4400;
 
         static Config& instance() {
             static Config config;
@@ -219,6 +223,22 @@ namespace corodb {
         void set_audit_enabled(bool v) noexcept { audit_enabled_ = v; }
         void set_audit_path(std::string v) noexcept { audit_path_ = std::move(v); }
 
+        // =========================================================================
+        // [tls]
+        // =========================================================================
+        [[nodiscard]] bool tls_enabled() const noexcept { return tls_enabled_; }
+        [[nodiscard]] const std::string& tls_cert_path() const noexcept { return tls_cert_path_; }
+        [[nodiscard]] const std::string& tls_key_path() const noexcept { return tls_key_path_; }
+        [[nodiscard]] const std::string& tls_ca_path() const noexcept { return tls_ca_path_; }
+        [[nodiscard]] bool tls_verify_cert() const noexcept { return tls_verify_cert_; }
+        [[nodiscard]] uint16_t tls_sql_port() const noexcept { return tls_sql_port_; }
+        void set_tls_enabled(bool v) noexcept { tls_enabled_ = v; }
+        void set_tls_cert_path(std::string v) noexcept { tls_cert_path_ = std::move(v); }
+        void set_tls_key_path(std::string v) noexcept { tls_key_path_ = std::move(v); }
+        void set_tls_ca_path(std::string v) noexcept { tls_ca_path_ = std::move(v); }
+        void set_tls_verify_cert(bool v) noexcept { tls_verify_cert_ = v; }
+        void set_tls_sql_port(uint16_t v) noexcept { tls_sql_port_ = v; }
+
     private:
         Config() = default;
         Config(const Config&) = delete;
@@ -302,6 +322,14 @@ namespace corodb {
         // [audit]
         bool audit_enabled_ = kDefaultAuditEnabled;
         std::string audit_path_ = "audit.log";
+
+        // [tls]
+        bool tls_enabled_ = kDefaultTlsEnabled;
+        std::string tls_cert_path_;
+        std::string tls_key_path_;
+        std::string tls_ca_path_;
+        bool tls_verify_cert_ = kDefaultTlsVerifyCert;
+        uint16_t tls_sql_port_ = kDefaultTlsSqlPort;
     };
 
 } // namespace corodb

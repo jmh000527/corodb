@@ -28,6 +28,7 @@
 
 #include "corodb/common/metrics.h"
 #include "corodb/net/port.h"
+#include "corodb/net/tls.h"
 #include "corodb/storage/table.h"
 
 namespace corodb {
@@ -93,12 +94,18 @@ namespace corodb {
         /** @brief 广播一条记录到所有在连从端。 */
         void broadcast(const ReplicationRecord& record);
 
+        /** @brief 启用 TLS：accept 后先握手再推流（须在 start 前调用）。 */
+        void set_tls(std::shared_ptr<tls::TlsContext> tls) {
+            tls_ = std::move(tls);
+        }
+
     private:
         struct Client {
             socket_t fd{ INVALID_SOCKET_VAL };
             std::queue<std::string> outbox; ///< 已封帧的待发数据
             std::mutex mutex;
             std::atomic<bool> alive{ true };
+            std::shared_ptr<tls::TlsStream> stream; ///< TLS 已握手时使用
         };
 
         void accept_loop();
@@ -111,6 +118,7 @@ namespace corodb {
         std::thread accept_thread_;
         mutable std::mutex clients_mutex_;
         std::vector<std::shared_ptr<Client>> clients_;
+        std::shared_ptr<tls::TlsContext> tls_;
 
         Counter& sent_counter_;
         Gauge& connected_gauge_;
@@ -137,6 +145,11 @@ namespace corodb {
         /** @brief 停止接收线程。 */
         void stop();
 
+        /** @brief 启用 TLS：连接成功后以客户端身份握手（须在 start 前调用）。 */
+        void set_tls(std::shared_ptr<tls::TlsContext> tls) {
+            tls_ = std::move(tls);
+        }
+
         [[nodiscard]] bool connected() const noexcept {
             return connected_.load();
         }
@@ -148,6 +161,8 @@ namespace corodb {
         std::string host_;
         uint16_t port_{ 0 };
         ApplyFn apply_;
+        std::shared_ptr<tls::TlsContext> tls_;
+        std::shared_ptr<tls::TlsStream> stream_;
         socket_t fd_{ INVALID_SOCKET_VAL };
         std::atomic<bool> running_{ false };
         std::atomic<bool> connected_{ false };
